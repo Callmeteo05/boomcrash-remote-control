@@ -1,186 +1,317 @@
-# CRT Sniper Signals
+# CRT Sniper Pro
 
-A non-repainting buy/sell dot indicator built on **Candle Range Theory**, gated by
-higher-timeframe bias, market regime, and premium/discount location, and triggered
-by a market structure shift plus a candlestick pattern.
+A graded buy/sell dot indicator built on **Candle Range Theory**, with a dedicated
+**spike engine** for Boom, Crash, GainX and PainX that trades *with* the spike and
+*against* it at the same time.
 
-Two implementations with identical logic:
+Every dot carries a 0–100 confluence score and a letter grade, so you know how much
+the setup is worth before you click. The indicator also forward-tests its own
+signals across your history and shows the resulting win rate, average R and profit
+factor live on the dashboard.
 
 | Platform | File |
 | --- | --- |
-| MetaTrader 5 | `MT5/Indicators/CRT_Sniper_Signals.mq5` |
-| TradingView | `TradingView/CRT_Sniper_Signals.pine` |
+| MetaTrader 5 | `MT5/Indicators/CRT_Sniper_Pro.mq5` |
+| TradingView | `TradingView/CRT_Sniper_Pro.pine` |
 
-On the chart you only ever see **dots, SL and TP lines, and the dashboard**. Every
-EMA, ADX, swing, gap and range used to produce a signal stays hidden.
+On the chart you only see **dots, their grade, SL/TP lines, and the dashboard**.
+Every EMA, ADX, swing, gap, channel and range used to produce a signal stays hidden.
 
 ---
 
-## The sequence the indicator runs
+## Three engines, one chart
 
-This is the CRT workflow, encoded step for step. A dot cannot print unless every
-step passed.
+| Engine | Direction | When it fires | Character |
+| --- | --- | --- | --- |
+| **CRT** | with the higher-timeframe trend | anchor candle at a key level → raid → close back inside → MSS → retest | the core engine, runs on every market |
+| **FADE** | *against* the spike, with the drift | a spike just printed and is giving back its range, and the next spike is not due | high win rate, small targets |
+| **HUNT** | *with* the spike, against the drift | a spike is statistically overdue and price sits at the far edge of the drift channel | low win rate, spike-sized targets |
 
-1. **Anchor on a higher timeframe.** The last *closed* HTF candle (H4 / D1 / W1,
-   auto-selected from your chart timeframe) becomes the anchor. With
-   `Anchor must sit on a key S/R level` on, the anchor's low must be at or below the
-   lowest low of the previous 10 HTF candles (bullish case), or its high at or above
-   the highest high (bearish case) — i.e. there is real liquidity resting there.
-2. **Mark CRT-High and CRT-Low.** The anchor candle's high and low define the range.
+FADE and HUNT only arm on spike indices. On everything else, CRT is the whole
+indicator. The engines are evaluated in that priority order on each bar, so they
+never contradict each other on the same candle.
+
+---
+
+## The CRT sequence
+
+Encoded step for step. Each step is a hard gate.
+
+1. **Anchor on a higher timeframe.** The last *closed* HTF candle (auto-mapped:
+   M15 → H4, H1/H4 → D1, D1 → W1). With `Anchor must sit on a key S/R level` on, the
+   anchor's low must be at or below the lowest low of the previous 10 HTF candles
+   for a bullish setup, or its high at or above the highest high for a bearish one —
+   there has to be real liquidity resting there.
+2. **Mark CRT-High and CRT-Low** — the anchor candle's high and low.
 3. **Wait for the raid.** The next HTF candle must trade through the CRT-Low
    (bullish setup) or the CRT-High (bearish setup).
-4. **Confirm the close.** That raiding candle must *close back inside* the range —
-   above the CRT-Low for a bullish setup, below the CRT-High for a bearish setup.
-   Only closed HTF candles are read, which is what makes the whole thing
-   non-repainting.
-5. **Drop to the lower timeframe.** Your chart timeframe becomes the execution
-   timeframe.
-6. **Look for an MSS.** A close through the last confirmed swing high (bullish) or
-   swing low (bearish), where the leg into that break is at least `1.2 × ATR`.
-   Break without displacement is not an MSS and is ignored.
-7. **Enter on the retest.** The indicator takes the most recent fair value gap left
-   by the displacement leg; if there is none, the last opposing candle before the
-   impulse (order block); if there is none, the broken MSS level itself. Price must
-   tap that zone and close a confirming candlestick pattern.
+4. **Confirm the close.** The raiding candle must *close back inside* the range.
+   Only closed HTF candles are ever read, which is what makes this non-repainting.
+5. **Drop to the lower timeframe** — your chart timeframe.
+6. **Look for an MSS.** A close through the last confirmed swing, with the leg into
+   that break at least `1.2 × ATR`. A break without displacement is not an MSS.
+7. **Enter on the retest.** Into the most recent fair value gap from the
+   displacement leg; failing that the last opposing candle before the impulse
+   (order block); failing that the broken MSS level. Price taps the zone and closes
+   a confirming candlestick pattern.
 
-## The gates on top of the sequence
+### Gates on top of the sequence
 
-A valid CRT setup still gets rejected unless all of these agree:
+- **HTF bias** — buys need the anchor timeframe reading BULLISH, sells BEARISH.
+- **Premium / discount** — buys only at or below 50 % of the CRT range, sells only
+  at or above 50 %. Optionally the HTF dealing range must agree too.
+- **EMA 50/200** on the signal timeframe — Off / Soft / Strict.
+- **Killzone** — optional Asia / London / New York filter (auto-disabled on 24/7
+  symbols).
+- **Cooldown** — a minimum bar gap per engine.
 
-- **HTF bias.** Buys need the anchor timeframe reading BULLISH, sells BEARISH.
-  Bias comes from EMA 50 vs EMA 200, price vs EMA 200, EMA separation measured in
-  ATR, and ADX. When it reads SIDEWAYS, nothing prints at all.
-- **Premium / discount.** Position inside the CRT range, 0 % at the low and 100 % at
-  the high. Buys only at or below 50 % (discount), sells only at or above 50 %
-  (premium). Optionally the HTF dealing range must agree too.
-- **EMA 50/200 on the signal timeframe.** Off / Soft (price on the right side of
-  EMA 50) / Strict (EMAs stacked *and* price on the right side).
-- **Cooldown.** A minimum bar gap between signals so one zone does not spray dots.
+So by construction: a printed BUY means trend bullish **and** price in discount; a
+printed SELL means trend bearish **and** price in premium.
 
-So by construction: a printed BUY means trend bullish + price in discount, and a
-printed SELL means trend bearish + price in premium.
-
-## How bullish / bearish / sideways is decided
+### Bullish / bearish / sideways
 
 ```
 separation = |EMA50 - EMA200|
-trending   = ADX >= 20  AND  separation >= 0.25 x ATR
+trending   = ADX >= threshold  AND  separation >= minSep x ATR
 
 BULLISH   trending AND EMA50 > EMA200 AND price > EMA200
 BEARISH   trending AND EMA50 < EMA200 AND price < EMA200
 SIDEWAYS  everything else
 ```
 
-Measuring separation in ATR rather than in points is what lets the same settings
-work on EURUSD, XAUUSD, US30 and Boom/Crash without retuning.
+Both terms are measured in ATR, not points — that is what lets one settings file
+work on EURUSD, XAUUSD, US30, BTC and Boom 1000 without retuning.
+
+---
+
+## The spike engine
+
+### What it measures
+
+The engine never assumes a fixed tick count. It measures your broker's actual feed:
+
+- **Drift baseline** — the *median* bar range over the last 50 bars. A median, not
+  an average, because spikes are outliers and would poison a mean.
+- **Spike bar** — any bar whose range is ≥ 5 × the drift baseline (tunable).
+- **Spike interval** — a rolling record of the bar gaps between the last 32 spikes,
+  giving the average interval and its standard deviation.
+- **Spike size** — the median range of the last 32 spikes. This is what sizes the
+  HUNT targets.
+- **Due-ness** — `bars since last spike ÷ average interval`. 0 % means one just
+  fired; 100 % means one is due now.
+
+All of it is causal — computed only from bars up to the one being evaluated.
+
+### FADE — trading against the spike
+
+The drift is the reliable part of these instruments, so fading a spike back into the
+drift is the higher-probability side.
+
+- Triggers 1–3 bars after a spike in the index's characteristic direction.
+- Requires the spike to have given back ≥ 35 % of its range (exhaustion).
+- **Blocked whenever due-ness ≥ 85 %** — never fade into a spike that is about to
+  fire. This is the single most important guard in the engine.
+- SL sits beyond the spike's own extreme plus a drift buffer.
+- TP1 is the pre-spike price (the level the spike launched from); TP2 continues
+  three drift-ranges further along the drift.
+
+On **Boom** that means: spike up → **SELL**. On **Crash**: spike down → **BUY**.
+
+### HUNT — trading with the spike
+
+- Only arms when due-ness is between 70 % and 250 %.
+- Price must be in the bottom 35 % of the 50-bar drift channel (Boom/GainX) or the
+  top 35 % (Crash/PainX).
+- Optionally requires a CRT raid in the spike direction as confirmation.
+- Small stop — a few drift-ranges beyond the recent extreme — because if the spike
+  does not come, the drift bleeds you slowly and you want out cheap.
+- Targets are sized off the **measured median spike**, not an R multiple:
+  TP1 at 50 % of it, TP2 at 100 %.
+
+On **Boom/GainX** that means **BUY** before the up-spike; on **Crash/PainX**,
+**SELL** before the down-spike.
+
+### Why both can run at once
+
+They are mutually exclusive in time, not in principle. Due-ness near zero means
+FADE is open and HUNT is shut; due-ness above 0.7 means HUNT is open and FADE is
+shut. The dashboard shows both windows live so you always know which one the market
+is in.
+
+---
+
+## Confluence scoring
+
+Each engine has its own weighting, all normalised to 0–100:
+
+**CRT** — HTF bias aligned (14) · 3-timeframe agreement (12) · CRT quality: sweep
+depth + reclaim strength (14) · premium/discount depth (12) · displacement size (12)
+· zone type, FVG > OB > MSS retest (10) · candlestick pattern (10) · EMA + ADX
+strength (10) · killzone (6)
+
+**HUNT** — due-ness (24) · depth in the drift channel (18) · CRT confirmation (16) ·
+spike-interval consistency (12) · pattern (10) · reward:risk (10) · spike size vs
+drift (10)
+
+**FADE** — spike size vs median (18) · exhaustion depth (20) · drift/HTF alignment
+(18) · due-ness safety margin (16) · pattern (12) · dealing-range position (8) ·
+reward:risk (8)
+
+Grades: **A+** ≥ 85 · **A** ≥ 73 · **B** ≥ 62 · **C** below. Dots below
+`Minimum confluence score` (default 62) are never printed, and A+ signals print as a
+visibly larger dot. Raise the minimum to 75 for A-and-better only.
+
+---
+
+## Live performance tracker
+
+Every printed signal is forward-tested against subsequent bars: did TP1 come before
+SL? The dashboard shows win rate, average R, profit factor, current streak, worst
+streak, and a **per-engine breakdown** so you can see whether CRT, HUNT or FADE is
+carrying the symbol.
+
+Two honest caveats: resolution is bar-by-bar, so when one bar covers both SL and TP1
+it is scored as a **loss** (deliberately pessimistic), and the sample only covers
+the bars the indicator has loaded (`Max history bars`, default 4000).
+
+---
+
+## Broker-agnostic symbol handling
+
+The symbol name is uppercased and stripped of every separator, so `Boom 1000 Index`,
+`BOOM1000`, `Boom_1000.raw`, `CRASH500m` and `GainX 800#` all resolve identically.
+
+Detection order:
+
+1. **Forced class** input, if you set one.
+2. **Name match** — BOOM/GAINX → spikes up; CRASH/PAINX → spikes down; then metals,
+   indices, crypto, synthetics, and FX by currency-code pairs.
+3. **Statistical detection** — if the name says nothing, the indicator counts large
+   up-range vs down-range bars over history and classifies the symbol as a spiker
+   when one side outnumbers the other 3:1 with at least 5 occurrences.
+
+That third step is why an unbranded or renamed spike index on an unfamiliar broker
+still gets the spike engine. The dashboard's `Class` row always tells you which
+route was used: `[name]`, `[stats]`, `[forced]` or `[unknown]`.
+
+With `Auto-tune` on, the detected class also sets displacement, max risk, ADX
+threshold, EMA separation and the session filter.
+
+---
 
 ## Multi-timeframe scaling
 
 The dashboard's **Scale in** row is the practical output of the bias gate. When a
-bullish CRT is armed on D1 and D1 bias is bullish, it reads `LONGS on H4 / H1 / M30`.
+bullish CRT is armed on D1 and D1 bias is bullish it reads `LONGS on H4 / H1 / M30`.
 
-Drop the same indicator on those lower timeframes: the D1 CRT is still the anchor
-(auto-selection maps H4 → D1 and H1 → D1), the bias gate is still bullish, so every
+Load the same indicator on those timeframes: the D1 CRT is still the anchor
+(auto-mapping sends H4 and H1 to D1), the bias gate is still bullish, so every
 pullback that produces an MSS and a clean retest prints another buy dot. One
-higher-timeframe dot becomes many lower-timeframe scale-in dots, all in one
-direction. The same holds inverted for sells.
-
-If you want the lower timeframes to keep using the *same* anchor as your D1 chart
-rather than the auto-mapped one, set `Anchor timeframe` explicitly to `D1` on each
-chart.
-
-## Stop loss and targets
-
-- **SL** — beyond the structural extreme: the lower of (lowest low of the last 6
-  bars, zone low) for buys, minus `0.30 × ATR`. Mirrored for sells. A signal whose
-  risk exceeds `4 × ATR` is dropped rather than taken at a bad price.
-- **TP1** — 2.0 R.
-- **TP2** — 3.5 R, or the opposing liquidity (CRT extreme / recent swing) when that
-  sits further away and `Push TP2 to the opposing liquidity` is on.
+higher-timeframe dot becomes many lower-timeframe scale-in dots, all one direction.
+To force the lower timeframes onto the *same* anchor as your D1 chart, set
+`Anchor timeframe` explicitly to `D1` on each.
 
 ---
 
 ## Install — MetaTrader 5
 
-1. In MT5: **File → Open Data Folder → MQL5 → Indicators**
-2. Copy `CRT_Sniper_Signals.mq5` in there.
+1. **File → Open Data Folder → MQL5 → Indicators**
+2. Copy `CRT_Sniper_Pro.mq5` in.
 3. In MetaEditor press **F7** to compile.
 4. Drag it onto a chart from the Navigator.
 
-### Reading the signals from an EA
+### EA integration
 
-Six buffers are exposed, so the EA in this repo can consume the indicator directly:
+Ten buffers are exposed so the EA in this repo can consume the indicator directly:
 
 | Buffer | Contents |
 | --- | --- |
-| 0 | Buy dot price (`EMPTY_VALUE` when no signal) |
-| 1 | Sell dot price (`EMPTY_VALUE` when no signal) |
-| 2 | Stop loss |
-| 3 | Take profit 1 |
-| 4 | Take profit 2 |
-| 5 | Direction: `+1` buy, `-1` sell, `0` none |
+| 0 | Buy dot price, A+ grade (`EMPTY_VALUE` when none) |
+| 1 | Buy dot price, standard grade |
+| 2 | Sell dot price, A+ grade |
+| 3 | Sell dot price, standard grade |
+| 4 | Stop loss |
+| 5 | Take profit 1 |
+| 6 | Take profit 2 |
+| 7 | Direction: `+1` buy, `-1` sell, `0` none |
+| 8 | Confluence score, 0–100 |
+| 9 | Engine: `0` CRT, `1` HUNT, `2` FADE |
 
 ```mql5
-int h = iCustom(_Symbol, _Period, "CRT_Sniper_Signals");
-double dir[1], sl[1], tp1[1];
-CopyBuffer(h, 5, 1, 1, dir);   // shift 1 = last closed bar
-CopyBuffer(h, 2, 1, 1, sl);
-CopyBuffer(h, 3, 1, 1, tp1);
-if(dir[0] > 0) { /* buy at market, stop sl[0], target tp1[0] */ }
+int h = iCustom(_Symbol, _Period, "CRT_Sniper_Pro");
+double dir[1], sl[1], tp1[1], score[1], mode[1];
+CopyBuffer(h, 7, 1, 1, dir);     // shift 1 = last closed bar
+CopyBuffer(h, 4, 1, 1, sl);
+CopyBuffer(h, 5, 1, 1, tp1);
+CopyBuffer(h, 8, 1, 1, score);
+CopyBuffer(h, 9, 1, 1, mode);
+
+if(dir[0] != 0 && score[0] >= 75.0)
+  {
+   // mode[0]==2 (FADE) is the high-win-rate side on spike indices
+   // mode[0]==1 (HUNT) is low win rate, large payoff - size it smaller
+  }
 ```
+
+The dashboard also prints a lot size for the configured `Account risk per trade (%)`
+using the live SL distance and the symbol's tick value.
 
 ## Install — TradingView
 
-1. Open the **Pine Editor**.
-2. Paste `CRT_Sniper_Signals.pine`, click **Add to chart**.
-3. For alerts, use **Any alert() function call** so the message carries entry, SL
-   and both targets. `CRT Buy` / `CRT Sell` alert conditions are also available.
+1. Open the **Pine Editor**, paste `CRT_Sniper_Pro.pine`, click **Add to chart**.
+2. For alerts use **Any alert() function call** — the message carries grade, score,
+   engine, pattern, entry, SL and both targets. Separate `CRT Buy` / `CRT Sell` /
+   `CRT Buy A+` / `CRT Sell A+` conditions are also available if you want to alert
+   only on premium grades.
 
 ---
 
 ## Suggested settings
 
-Defaults are tuned for FX and metals on M15–H1. Starting points elsewhere:
+Auto-tune handles these; the table is what it applies, in case you want to override.
 
-| Market | Anchor TF | Displacement | ADX trend | Max risk | Notes |
+| Market | Anchor TF | Displacement | ADX | Max risk | Sessions |
 | --- | --- | --- | --- | --- | --- |
-| FX majors, XAUUSD | auto | 1.2 | 20 | 4.0 | defaults |
-| Indices (US30, NAS100) | auto | 1.4 | 22 | 4.5 | wider legs |
-| Crypto | auto | 1.5 | 18 | 5.0 | trends persist, ADX gate can be looser |
-| **Boom 500 / 1000** | H4 or D1 | 1.6 | 18 | 6.0 | see below |
-| **Crash 500 / 1000** | H4 or D1 | 1.6 | 18 | 6.0 | see below |
+| FX majors, XAUUSD | auto | 1.2–1.3 | 20 | 4.0–4.5 | on if you want them |
+| Indices (US30, NAS100) | auto | 1.4 | 22 | 4.5 | on |
+| Crypto | auto | 1.5 | 18 | 5.0 | off |
+| Boom / Crash / GainX / PainX | H4 or D1 | 1.6 | 18 | 6.0 | off |
 
-### Boom and Crash
+### Spike indices in practice
 
-These indices drift one way and spike the other, so:
-
-- Raise `Skip signal if risk > this (x ATR)` to about `6.0`. A spike through the
-  structural low is normal and a tight cap would silently drop good setups.
-- Raise `Min displacement of the MSS leg` to about `1.6` — ordinary drift bars
-  otherwise register as displacement.
-- On **Boom**, spikes are up: bullish CRT setups are the higher-quality side.
-  On **Crash**, spikes are down, so bearish setups are.
-- Keep `Block all signals while HTF is SIDEWAYS` on. The drift phase reads as
-  sideways on ADX, which is exactly when you do not want to be taking the dots.
+- Max risk goes to `6.0 × ATR` because a spike through your structural stop is
+  normal and the default cap would silently drop good setups.
+- EMA separation drops to `0.18 × ATR`: the drift is smooth and the EMAs sit close
+  together, so the standard threshold would read SIDEWAYS almost permanently.
+- Sessions off — these run 24/7.
+- Start on **M1–M5**. The spike engine needs enough bars between spikes to measure an
+  interval; on H1 a Boom 1000 spike may be a single bar with nothing in between.
+- If HUNT prints too rarely, lower `HUNT: min spike due-ness` to 0.5. If it bleeds,
+  raise it to 1.0 and only take A+ grades.
+- If FADE gets caught by back-to-back spikes, lower `FADE: block when the next spike
+  is this due` from 0.85 to 0.6.
 
 ## Tuning
 
 | Symptom | Change |
 | --- | --- |
-| Too few signals | `Anchor must sit on a key S/R level` off, `EMA filter` → Off, displacement → 1.0 |
-| Too many signals | `EMA filter` → Strict, `Also gate on the HTF dealing-range position` on, cooldown → 5+ |
+| Too few signals | lower `Minimum confluence score`; `EMA filter` → Off; displacement → 1.0 |
+| Too many weak signals | raise minimum score to 75; `EMA filter` → Strict |
+| Only want the best | minimum score 85 — A+ dots only |
 | Dots too far from the wick | `Dot distance from the wick` → 0.3 |
 | Entries too deep in the pullback | `Retest zone source` → FVG only |
 | Stops hit by noise | `SL buffer beyond structure` → 0.5 |
+| Wrong spike direction detected | set `Force symbol class` explicitly |
 
-Turn on `Debug: draw the active CRT range` to see the anchor range the indicator is
-currently working from. It is off by default so the chart stays clean.
+Turn on `Debug: draw the active CRT range` to see the anchor range currently in use.
 
 ---
 
 ## Not yet verified
 
-The MQL5 source has not been run through MetaEditor and the Pine source has not
-been loaded into TradingView from this environment — neither toolchain is available
-here. Compile both before trading them, and backtest the settings on your own
-symbol and broker feed.
+The MQL5 source has not been run through MetaEditor and the Pine source has not been
+loaded into TradingView from this environment — neither toolchain is available here.
+Compile both before trading them, and validate the settings on your own symbol and
+broker feed. The built-in performance tracker is the fastest way to do that: load the
+indicator, let it scan your history, and read the win rate and per-engine breakdown
+off the dashboard before risking anything.

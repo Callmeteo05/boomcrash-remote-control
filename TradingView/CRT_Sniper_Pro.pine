@@ -1,0 +1,1150 @@
+//@version=5
+// =============================================================================
+//  CRT SNIPER PRO
+//  Candle Range Theory + HTF bias + spike engine + confluence grading
+//
+//  Three signal engines run side by side and every dot carries a 0-100
+//  confluence score:
+//
+//    CRT   the core sequence - anchor candle at a key level, raid of the
+//          CRT-High/Low, close back inside, then a displacement MSS on the
+//          chart timeframe and an entry on the retest into the FVG / order
+//          block that the displacement left behind.
+//
+//    FADE  on spike indices (Boom, Crash, GainX, PainX) - trade AGAINST the
+//          spike, with the drift, once the spike prints and gives back part
+//          of its range. Blocked whenever the next spike is statistically due.
+//
+//    HUNT  on the same indices - trade WITH the spike, against the drift,
+//          when a spike is overdue and price sits at the far edge of the
+//          drift channel. Small stop, spike-sized targets.
+//
+//  Everything is evaluated on closed bars only - the script does not repaint.
+// =============================================================================
+indicator("CRT Sniper Pro", overlay = true, max_lines_count = 500,
+     max_labels_count = 500, max_boxes_count = 100)
+
+// -----------------------------------------------------------------------------
+// Inputs
+// -----------------------------------------------------------------------------
+grpS = "Symbol adaptation (any broker, any symbol)"
+autoTune       = input.bool(true,  "Auto-tune thresholds to the detected symbol class", group = grpS)
+forceClass     = input.string("Auto", "Force symbol class", options = ["Auto", "Forex", "Metal", "Index", "Crypto", "Synthetic", "Spike UP (Boom/GainX)", "Spike DOWN (Crash/PainX)"], group = grpS)
+statDetect     = input.bool(true,  "Detect spikes statistically when the name is unknown", group = grpS)
+
+grpH = "Higher timeframe (CRT anchor)"
+htfIn          = input.timeframe("",    "Anchor timeframe (blank = auto)", group = grpH)
+crtValidBars   = input.int(2,     "CRT stays valid for N anchor candles", minval = 1, maxval = 2, group = grpH)
+requireKey     = input.bool(true, "Anchor must sit on a key S/R (liquidity) level", group = grpH)
+srLook         = input.int(10,    "Key level lookback (anchor candles)", minval = 3, group = grpH)
+keyTol         = input.float(0.25,"Key level tolerance (x HTF ATR)", minval = 0.0, step = 0.05, group = grpH)
+minCloseBack   = input.float(0.0, "Min close-back inside range (0..0.5)", minval = 0.0, maxval = 0.5, step = 0.05, group = grpH)
+
+grpT = "Trend / regime engine"
+emaFastLen     = input.int(50,    "EMA fast", minval = 2, group = grpT)
+emaSlowLen     = input.int(200,   "EMA slow", minval = 5, group = grpT)
+adxLen         = input.int(14,    "ADX period", minval = 2, group = grpT)
+adxTrendIn     = input.float(20.0,"ADX above this = trending", group = grpT)
+minSepIn       = input.float(0.25,"Min EMA50/200 separation (x ATR)", step = 0.05, group = grpT)
+emaFilter      = input.string("Soft", "EMA filter on the signal timeframe", options = ["Off", "Soft", "Strict"], group = grpT)
+blockInRange   = input.bool(true, "Block CRT signals while HTF is SIDEWAYS", group = grpT)
+
+grpP = "Premium / discount"
+maxBuyPD       = input.float(0.50,"Buy only when CRT position <= this", minval = 0.0, maxval = 1.0, step = 0.05, group = grpP)
+minSellPD      = input.float(0.50,"Sell only when CRT position >= this", minval = 0.0, maxval = 1.0, step = 0.05, group = grpP)
+useHtfPD       = input.bool(false,"Also gate on the HTF dealing-range position", group = grpP)
+htfMaxBuyPD    = input.float(0.60,"HTF max position for buys", minval = 0.0, maxval = 1.0, step = 0.05, group = grpP)
+htfMinSellPD   = input.float(0.40,"HTF min position for sells", minval = 0.0, maxval = 1.0, step = 0.05, group = grpP)
+
+grpL = "Lower timeframe execution"
+swingLen       = input.int(3,     "Swing (pivot) strength", minval = 1, group = grpL)
+legLook        = input.int(12,    "Displacement leg lookback (bars)", minval = 3, group = grpL)
+dispIn         = input.float(1.20,"Min displacement of the MSS leg (x ATR)", step = 0.1, group = grpL)
+zoneMode       = input.string("FVG then OB", "Retest zone source", options = ["FVG then OB", "FVG only", "OB only"], group = grpL)
+allowMssRetest = input.bool(true, "Fall back to a retest of the MSS level", group = grpL)
+requirePattern = input.bool(true, "Require a candlestick pattern at the retest", group = grpL)
+setupExpiry    = input.int(24,    "Cancel setup if no entry within N bars", minval = 2, group = grpL)
+invalidATR     = input.float(0.35,"Zone invalidation buffer (x ATR)", step = 0.05, group = grpL)
+multiEntry     = input.bool(false,"Allow several entries from one zone", group = grpL)
+cooldownBars   = input.int(3,     "Min bars between signals of the same engine", minval = 0, group = grpL)
+
+grpK = "SPIKE ENGINE (Boom / Crash / GainX / PainX)"
+tradeSpikes    = input.bool(true, "HUNT: trade WITH the spike (against the drift)", group = grpK)
+tradeFades     = input.bool(true, "FADE: trade AGAINST the spike (with the drift)", group = grpK)
+spikeMultIn    = input.float(5.0, "Spike bar = range >= this x median drift range", step = 0.5, group = grpK)
+driftWin       = input.int(50,    "Median drift-range window (bars)", minval = 10, group = grpK)
+driftChanLook  = input.int(50,    "Drift channel lookback (bars)", minval = 10, group = grpK)
+huntMinDue     = input.float(0.70,"HUNT: min spike due-ness (1.0 = average interval)", step = 0.05, group = grpK)
+huntMaxDue     = input.float(2.50,"HUNT: max due-ness", step = 0.1, group = grpK)
+huntMaxPos     = input.float(0.35,"HUNT: max position in the drift channel", minval = 0.05, maxval = 1.0, step = 0.05, group = grpK)
+huntNeedCrt    = input.bool(true, "HUNT: require a CRT raid in the spike direction", group = grpK)
+huntSlDrift    = input.float(3.0, "HUNT: stop distance beyond structure (x drift range)", step = 0.5, group = grpK)
+spikeTp1Frac   = input.float(0.50,"HUNT: TP1 as a fraction of the median spike", step = 0.05, group = grpK)
+spikeTp2Frac   = input.float(1.00,"HUNT: TP2 as a fraction of the median spike", step = 0.05, group = grpK)
+fadeWindowN    = input.int(3,     "FADE: enter within N bars of the spike", minval = 1, group = grpK)
+fadeMinExhaust = input.float(0.35,"FADE: min give-back of the spike range", step = 0.05, group = grpK)
+fadeBlockDue   = input.float(0.85,"FADE: block when the next spike is this due", step = 0.05, group = grpK)
+fadeSlBuf      = input.float(0.50,"FADE: stop beyond the spike extreme (x drift range)", step = 0.1, group = grpK)
+fadeTp2Drift   = input.float(3.0, "FADE: TP2 beyond the pre-spike level (x drift range)", step = 0.5, group = grpK)
+minSpikes      = input.int(3,     "Min spikes observed before the engine arms", minval = 1, group = grpK)
+
+grpQ = "Signal quality & grading"
+minScore       = input.int(62,    "Minimum confluence score to print a dot", minval = 0, maxval = 100, group = grpQ)
+premiumScore   = input.int(85,    "Score at or above this prints the large A+ dot", minval = 0, maxval = 100, group = grpQ)
+showScore      = input.bool(true, "Print the grade + score next to each dot", group = grpQ)
+showLastGrades = input.int(30,    "Score labels for the last N signals", minval = 1, maxval = 100, group = grpQ)
+
+grpZ = "Sessions / killzones (GMT)"
+useSessionsIn  = input.bool(false,"Only signal inside the selected killzones", group = grpZ)
+useAsia        = input.bool(true, "Asian killzone", group = grpZ)
+asiaStart      = input.int(0,     "Asia start (GMT hour)", minval = 0, maxval = 23, group = grpZ)
+asiaEnd        = input.int(4,     "Asia end (GMT hour)", minval = 0, maxval = 24, group = grpZ)
+useLondon      = input.bool(true, "London killzone", group = grpZ)
+lonStart       = input.int(7,     "London start (GMT hour)", minval = 0, maxval = 23, group = grpZ)
+lonEnd         = input.int(10,    "London end (GMT hour)", minval = 0, maxval = 24, group = grpZ)
+useNY          = input.bool(true, "New York killzone", group = grpZ)
+nyStart        = input.int(12,    "New York start (GMT hour)", minval = 0, maxval = 23, group = grpZ)
+nyEnd          = input.int(15,    "New York end (GMT hour)", minval = 0, maxval = 24, group = grpZ)
+
+grpR = "Risk : stop loss & targets"
+atrLen         = input.int(14,    "ATR period", minval = 2, group = grpR)
+slLook         = input.int(6,     "Structural SL lookback (bars)", minval = 2, group = grpR)
+slBufATR       = input.float(0.30,"SL buffer beyond structure (x ATR)", step = 0.05, group = grpR)
+maxRiskIn      = input.float(4.0, "Skip signal if risk > this (x ATR, 0 = off)", step = 0.5, group = grpR)
+rr1            = input.float(2.0, "Take profit 1 (R multiple)", step = 0.1, group = grpR)
+rr2            = input.float(3.5, "Take profit 2 (R multiple)", step = 0.1, group = grpR)
+useLiqTP       = input.bool(true, "Push TP2 to the opposing liquidity if further", group = grpR)
+liqLook        = input.int(30,    "Opposing liquidity lookback (bars)", minval = 5, group = grpR)
+
+grpF = "Performance tracker"
+trackStats     = input.bool(true, "Forward-test every printed signal on history", group = grpF)
+
+grpD = "Display"
+dotOffATR      = input.float(0.55,"Dot distance from the wick (x ATR)", step = 0.05, group = grpD)
+showSLTP       = input.bool(true, "Draw SL / TP lines", group = grpD)
+showLast       = input.int(6,     "Draw SL/TP for the last N signals", minval = 1, maxval = 40, group = grpD)
+projectBars    = input.int(28,    "SL/TP line length (bars)", minval = 4, group = grpD)
+buyCol         = input.color(#2196f3, "Buy dot", group = grpD)
+sellCol        = input.color(#ff5252, "Sell dot", group = grpD)
+slCol          = input.color(#e53935, "SL", group = grpD)
+tp1Col         = input.color(#26a69a, "TP1", group = grpD)
+tp2Col         = input.color(#66bb6a, "TP2", group = grpD)
+showCrtBox     = input.bool(false,"Debug: draw the active CRT range", group = grpD)
+showPanel      = input.bool(true, "Show dashboard", group = grpD)
+panelCompact   = input.bool(false,"Compact dashboard (hide performance block)", group = grpD)
+panelPos       = input.string("Top right", "Dashboard position", options = ["Top right", "Top left", "Bottom right", "Bottom left"], group = grpD)
+
+// -----------------------------------------------------------------------------
+// Broker-agnostic symbol normalisation and classification
+// -----------------------------------------------------------------------------
+// class codes: 0 auto/unknown, 1 fx, 2 metal, 3 index, 4 crypto,
+//              5 synthetic, 6 spike up, 7 spike down
+normSym(s) =>
+    string up  = str.upper(s)
+    string out = ""
+    for i = 0 to str.length(up) - 1
+        ch = str.substring(up, i, i + 1)
+        if str.contains("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", ch)
+            out := out + ch
+    out
+
+countCcy(s) =>
+    int n = 0
+    n := n + (str.contains(s, "USD") ? 1 : 0)
+    n := n + (str.contains(s, "EUR") ? 1 : 0)
+    n := n + (str.contains(s, "GBP") ? 1 : 0)
+    n := n + (str.contains(s, "JPY") ? 1 : 0)
+    n := n + (str.contains(s, "CHF") ? 1 : 0)
+    n := n + (str.contains(s, "AUD") ? 1 : 0)
+    n := n + (str.contains(s, "NZD") ? 1 : 0)
+    n := n + (str.contains(s, "CAD") ? 1 : 0)
+    n
+
+classifyByName(nm) =>
+    int cls = 0
+    if str.contains(nm, "BOOM") or str.contains(nm, "GAINX")
+        cls := 6
+    else if str.contains(nm, "CRASH") or str.contains(nm, "PAINX")
+        cls := 7
+    else if str.contains(nm, "VOLATILITY") or str.contains(nm, "JUMP") or str.contains(nm, "STEPINDEX") or str.contains(nm, "RANGEBREAK")
+        cls := 5
+    else if str.contains(nm, "XAU") or str.contains(nm, "XAG") or str.contains(nm, "XPT") or str.contains(nm, "GOLD") or str.contains(nm, "SILVER")
+        cls := 2
+    else if str.contains(nm, "BTC") or str.contains(nm, "ETH") or str.contains(nm, "XRP") or str.contains(nm, "LTC") or str.contains(nm, "SOL") or str.contains(nm, "DOGE") or str.contains(nm, "ADA") or str.contains(nm, "BNB")
+        cls := 4
+    else if str.contains(nm, "US30") or str.contains(nm, "DJ30") or str.contains(nm, "NAS") or str.contains(nm, "USTEC") or str.contains(nm, "NDX") or str.contains(nm, "SPX") or str.contains(nm, "US500") or str.contains(nm, "GER") or str.contains(nm, "DAX") or str.contains(nm, "UK100") or str.contains(nm, "JP225") or str.contains(nm, "HK50")
+        cls := 3
+    else if countCcy(nm) >= 2
+        cls := 1
+    cls
+
+forcedClass = forceClass == "Forex" ? 1 : forceClass == "Metal" ? 2 : forceClass == "Index" ? 3 : forceClass == "Crypto" ? 4 : forceClass == "Synthetic" ? 5 : forceClass == "Spike UP (Boom/GainX)" ? 6 : forceClass == "Spike DOWN (Crash/PainX)" ? 7 : 0
+
+// the name scan runs once, on the first bar only
+var int    nameCls  = 0
+var int    symClass = 0
+var int    spikeDir = 0
+var string classHow = "name"
+if barstate.isfirst
+    nameCls  := classifyByName(normSym(syminfo.ticker))
+    symClass := forcedClass != 0 ? forcedClass : nameCls
+    spikeDir := symClass == 6 ? 1 : symClass == 7 ? -1 : 0
+    classHow := forcedClass != 0 ? "forced" : nameCls != 0 ? "name" : "unknown"
+
+// -----------------------------------------------------------------------------
+// Auto-tuned working thresholds
+// -----------------------------------------------------------------------------
+isSpikeSym = spikeDir != 0
+dispATR   = not autoTune ? dispIn    : symClass == 3 ? 1.40 : symClass == 4 ? 1.50 : symClass == 2 ? 1.30 : symClass == 5 ? 1.40 : isSpikeSym ? 1.60 : dispIn
+maxRisk   = not autoTune ? maxRiskIn : symClass == 3 ? 4.5  : symClass == 4 ? 5.0  : symClass == 2 ? 4.5  : symClass == 5 ? 5.0  : isSpikeSym ? 6.0  : maxRiskIn
+adxTrend  = not autoTune ? adxTrendIn: symClass == 3 ? 22.0 : symClass == 4 ? 18.0 : symClass == 5 ? 18.0 : isSpikeSym ? 18.0 : adxTrendIn
+minSepATR = not autoTune ? minSepIn  : isSpikeSym ? 0.18 : minSepIn
+spikeMult = spikeMultIn
+useSessions = not autoTune ? useSessionsIn : (symClass == 4 or symClass == 5 or isSpikeSym) ? false : useSessionsIn
+
+// -----------------------------------------------------------------------------
+// Anchor timeframe resolution
+// -----------------------------------------------------------------------------
+chartSec = timeframe.in_seconds()
+autoTf   = chartSec <= 300   ? "60"  :
+     chartSec <= 1800  ? "240" :
+     chartSec <= 14400 ? "D"   :
+     chartSec <= 86400 ? "W"   : "M"
+htf = htfIn == "" ? autoTf : htfIn
+
+midTf = chartSec <= 300 ? "15" : chartSec <= 1800 ? "60" : chartSec <= 14400 ? "240" : "D"
+
+// -----------------------------------------------------------------------------
+// Higher timeframe data - only CLOSED anchor candles are referenced
+// -----------------------------------------------------------------------------
+htfPack() =>
+    e50  = ta.ema(close, emaFastLen)
+    e200 = ta.ema(close, emaSlowLen)
+    atrH = ta.atr(atrLen)
+    [_dp, _dm, adxH] = ta.dmi(adxLen, adxLen)
+    loSr = ta.lowest(low,   srLook)
+    hiSr = ta.highest(high, srLook)
+    [high[1], low[1], close[1], time[1],
+     high[2], low[2], close[2], time[2],
+     high[3], low[3], close[3],
+     e50[1], e200[1], atrH[1], atrH[2], atrH[3], adxH[1],
+     loSr[3], hiSr[3], loSr[4], hiSr[4], loSr[1], hiSr[1]]
+
+[h1, l1, c1, t1, h2, l2, c2, t2, h3, l3, c3, hE50, hE200, hAtr1, hAtr2, hAtr3,
+ hAdx, loP1, hiP1, loP2, hiP2, hRangeLo, hRangeHi] =
+     request.security(syminfo.tickerid, htf, htfPack(), lookahead = barmerge.lookahead_off)
+
+biasPack() =>
+    e50  = ta.ema(close, emaFastLen)
+    e200 = ta.ema(close, emaSlowLen)
+    atrX = ta.atr(atrLen)
+    [_p, _m, adxX] = ta.dmi(adxLen, adxLen)
+    [e50[1], e200[1], close[1], adxX[1], atrX[1]]
+
+[mE50, mE200, mClose, mAdx, mAtr] = request.security(syminfo.tickerid, midTf, biasPack(), lookahead = barmerge.lookahead_off)
+[r1E50, r1E200, r1Close, r1Adx, r1Atr] = request.security(syminfo.tickerid, "15",  biasPack(), lookahead = barmerge.lookahead_off)
+[r2E50, r2E200, r2Close, r2Adx, r2Atr] = request.security(syminfo.tickerid, "60",  biasPack(), lookahead = barmerge.lookahead_off)
+[r3E50, r3E200, r3Close, r3Adx, r3Atr] = request.security(syminfo.tickerid, "240", biasPack(), lookahead = barmerge.lookahead_off)
+[r4E50, r4E200, r4Close, r4Adx, r4Atr] = request.security(syminfo.tickerid, "D",   biasPack(), lookahead = barmerge.lookahead_off)
+
+// -----------------------------------------------------------------------------
+// Regime classifier : 1 bullish, -1 bearish, 0 sideways
+// -----------------------------------------------------------------------------
+regime(e50, e200, price, adx, a) =>
+    int res = 0
+    if not na(e50) and not na(e200) and not na(a) and a > 0 and not na(adx)
+        sep      = math.abs(e50 - e200)
+        trending = adx >= adxTrend and sep >= minSepATR * a
+        res := not trending ? 0 :
+             e50 > e200 and price > e200 ?  1 :
+             e50 < e200 and price < e200 ? -1 : 0
+    res
+
+// -----------------------------------------------------------------------------
+// Chart timeframe indicators (all ta.* calls stay unconditional)
+// -----------------------------------------------------------------------------
+atrv  = ta.atr(atrLen)
+emaF  = ta.ema(close, emaFastLen)
+emaS  = ta.ema(close, emaSlowLen)
+[_dip, _dim, adxC] = ta.dmi(adxLen, adxLen)
+
+legLowV  = ta.lowest(low,   legLook)
+legHighV = ta.highest(high, legLook)
+slLowV   = ta.lowest(low,   slLook)
+slHighV  = ta.highest(high, slLook)
+liqLowV  = ta.lowest(low,   liqLook)
+liqHighV = ta.highest(high, liqLook)
+chanHi   = ta.highest(high, driftChanLook)
+chanLo   = ta.lowest(low,   driftChanLook)
+hunt10Lo = ta.lowest(low,   10)
+hunt10Hi = ta.highest(high, 10)
+driftRng = ta.percentile_nearest_rank(high - low, driftWin, 50)
+
+htfBias  = regime(hE50, hE200, c1, hAdx, hAtr1)
+midBias  = regime(mE50, mE200, mClose, mAdx, mAtr)
+chartReg = regime(emaF, emaS, close, adxC, atrv)
+rib1 = regime(r1E50, r1E200, r1Close, r1Adx, r1Atr)
+rib2 = regime(r2E50, r2E200, r2Close, r2Adx, r2Atr)
+rib3 = regime(r3E50, r3E200, r3Close, r3Adx, r3Atr)
+rib4 = regime(r4E50, r4E200, r4Close, r4Adx, r4Atr)
+
+// -----------------------------------------------------------------------------
+// Sessions
+// -----------------------------------------------------------------------------
+gmtHour = hour(time, "GMT")
+inKill = not useSessions or
+     (useAsia   and gmtHour >= asiaStart and gmtHour < asiaEnd) or
+     (useLondon and gmtHour >= lonStart  and gmtHour < lonEnd)  or
+     (useNY     and gmtHour >= nyStart   and gmtHour < nyEnd)
+
+// -----------------------------------------------------------------------------
+// CRT detection on the anchor timeframe
+// -----------------------------------------------------------------------------
+crtCheck(aHi, aLo, rHi, rLo, rCl, atrA, loPrior, hiPrior, bias) =>
+    int dir = 0
+    float qual = 0.0
+    if not na(aHi) and not na(aLo) and not na(rCl) and not na(atrA) and atrA > 0 and aHi > aLo
+        aRng = aHi - aLo
+        tol  = keyTol * atrA
+        back = math.max(0.0, math.min(0.5, minCloseBack)) * aRng
+        bool bull = rLo < aLo and rCl > aLo + back and rCl < aHi
+        bool bear = rHi > aHi and rCl < aHi - back and rCl > aLo
+        if requireKey
+            bull := bull and not na(loPrior) and aLo <= loPrior + tol
+            bear := bear and not na(hiPrior) and aHi >= hiPrior - tol
+        if bull and bear
+            bull := bias ==  1
+            bear := bias == -1
+        dir := bull ? 1 : bear ? -1 : 0
+        if dir != 0
+            sweep   = (bull ? aLo - rLo : rHi - aHi) / atrA
+            reclaim = (bull ? rCl - aLo : aHi - rCl) / aRng
+            qual := math.max(0.0, math.min(1.0, 0.5 * math.min(sweep / 0.8, 1.0) + 0.5 * math.min(reclaim / 0.5, 1.0)))
+    [dir, qual]
+
+[d1, q1] = crtCheck(h2, l2, h1, l1, c1, hAtr2, loP1, hiP1, htfBias)
+[d2r, q2r] = crtCheck(h3, l3, h2, l2, c2, hAtr3, loP2, hiP2, htfBias)
+d2 = crtValidBars >= 2 ? d2r : 0
+q2 = crtValidBars >= 2 ? q2r : 0.0
+
+crtDir      = d1 != 0 ? d1 : d2
+crtQual     = d1 != 0 ? q1 : q2
+crtHi       = d1 != 0 ? h2 : h3
+crtLo       = d1 != 0 ? l2 : l3
+crtRaidTime = d1 != 0 ? t1 : t2
+haveCrt     = crtDir != 0 and not na(crtHi) and not na(crtLo) and crtHi > crtLo
+
+// -----------------------------------------------------------------------------
+// Candlestick patterns
+// -----------------------------------------------------------------------------
+bullPattern(a) =>
+    string p = ""
+    body = math.abs(close - open)
+    rng  = high - low
+    up   = high - math.max(open, close)
+    dn   = math.min(open, close) - low
+    if rng > 0 and a > 0
+        if close > open and close[1] < open[1] and close >= open[1] and open <= close[1] and body > 0.30 * a
+            p := "Bull Engulf"
+        else if dn >= 2.0 * body and up <= 0.60 * body and close >= low + 0.60 * rng
+            p := "Hammer"
+        else if close[1] < open[1] and open < close[1] and close > (open[1] + close[1]) * 0.5 and close < open[1]
+            p := "Piercing"
+        else if close[2] < open[2] and math.abs(close[2] - open[2]) > 0.40 * a and
+             math.abs(close[1] - open[1]) < 0.35 * math.abs(close[2] - open[2]) and
+             close > open and close > (open[2] + close[2]) * 0.5
+            p := "Morning Star"
+        else if math.abs(low - low[1]) <= 0.12 * a and close > open and close[1] < open[1] and body > 0.25 * a
+            p := "Tweezer Btm"
+        else if high[1] < high[2] and low[1] > low[2] and close > high[1] and close > open
+            p := "IB Break Up"
+        else if dn >= 0.55 * rng and close > (high + low) * 0.5 and rng > 0.50 * a
+            p := "Rejection"
+    p
+
+bearPattern(a) =>
+    string p = ""
+    body = math.abs(close - open)
+    rng  = high - low
+    up   = high - math.max(open, close)
+    dn   = math.min(open, close) - low
+    if rng > 0 and a > 0
+        if close < open and close[1] > open[1] and close <= open[1] and open >= close[1] and body > 0.30 * a
+            p := "Bear Engulf"
+        else if up >= 2.0 * body and dn <= 0.60 * body and close <= high - 0.60 * rng
+            p := "Shooting Star"
+        else if close[1] > open[1] and open > close[1] and close < (open[1] + close[1]) * 0.5 and close > open[1]
+            p := "Dark Cloud"
+        else if close[2] > open[2] and math.abs(close[2] - open[2]) > 0.40 * a and
+             math.abs(close[1] - open[1]) < 0.35 * math.abs(close[2] - open[2]) and
+             close < open and close < (open[2] + close[2]) * 0.5
+            p := "Evening Star"
+        else if math.abs(high - high[1]) <= 0.12 * a and close < open and close[1] > open[1] and body > 0.25 * a
+            p := "Tweezer Top"
+        else if high[1] < high[2] and low[1] > low[2] and close < low[1] and close < open
+            p := "IB Break Dn"
+        else if up >= 0.55 * rng and close < (high + low) * 0.5 and rng > 0.50 * a
+            p := "Rejection"
+    p
+
+patStrength(p) =>
+    p == "Bull Engulf" or p == "Bear Engulf"   ? 10 :
+     p == "Morning Star" or p == "Evening Star" ? 10 :
+     p == "Hammer" or p == "Shooting Star"      ? 8  :
+     p == "Piercing" or p == "Dark Cloud"       ? 8  :
+     p == "Tweezer Btm" or p == "Tweezer Top"   ? 6  :
+     p == "IB Break Up" or p == "IB Break Dn"   ? 6  :
+     p == "Rejection"                           ? 5  : 2
+
+// -----------------------------------------------------------------------------
+// Chart timeframe swing structure
+// -----------------------------------------------------------------------------
+ph = ta.pivothigh(high, swingLen, swingLen)
+pl = ta.pivotlow(low,  swingLen, swingLen)
+
+var float swHigh    = na
+var int   swHighBar = na
+var float swLow     = na
+var int   swLowBar  = na
+
+if not na(ph)
+    swHigh    := ph
+    swHighBar := bar_index - swingLen
+if not na(pl)
+    swLow    := pl
+    swLowBar := bar_index - swingLen
+
+// -----------------------------------------------------------------------------
+// Retest zones
+// -----------------------------------------------------------------------------
+buildBullZone(a, mssLvl) =>
+    float zHi = na
+    float zLo = na
+    string kind = ""
+    if zoneMode != "OB only"
+        for k = 0 to legLook
+            if low[k] > high[k + 2] and low[k] < close
+                zHi  := low[k]
+                zLo  := high[k + 2]
+                kind := "FVG"
+                break
+    if na(zHi) and zoneMode != "FVG only"
+        for k = 1 to legLook
+            if close[k] < open[k] and math.max(open[k], close[k]) < close
+                zLo  := low[k]
+                zHi  := math.max(open[k], close[k])
+                kind := "Order Block"
+                break
+    if na(zHi) and allowMssRetest and not na(mssLvl)
+        zLo  := mssLvl - invalidATR * a
+        zHi  := mssLvl + 0.15 * a
+        kind := "MSS Retest"
+    [zHi, zLo, kind]
+
+buildBearZone(a, mssLvl) =>
+    float zHi = na
+    float zLo = na
+    string kind = ""
+    if zoneMode != "OB only"
+        for k = 0 to legLook
+            if high[k] < low[k + 2] and high[k] > close
+                zLo  := high[k]
+                zHi  := low[k + 2]
+                kind := "FVG"
+                break
+    if na(zHi) and zoneMode != "FVG only"
+        for k = 1 to legLook
+            if close[k] > open[k] and math.min(open[k], close[k]) > close
+                zHi  := high[k]
+                zLo  := math.min(open[k], close[k])
+                kind := "Order Block"
+                break
+    if na(zHi) and allowMssRetest and not na(mssLvl)
+        zHi  := mssLvl + invalidATR * a
+        zLo  := mssLvl - 0.15 * a
+        kind := "MSS Retest"
+    [zHi, zLo, kind]
+
+[bullZH, bullZL, bullZK] = buildBullZone(atrv, swHigh)
+[bearZH, bearZL, bearZK] = buildBearZone(atrv, swLow)
+
+// -----------------------------------------------------------------------------
+// Confluence scoring
+// -----------------------------------------------------------------------------
+gradeOf(sc) => sc >= premiumScore ? "A+" : sc >= 73 ? "A" : sc >= 62 ? "B" : "C"
+
+cl01(v) => math.max(0.0, math.min(1.0, v))
+
+scoreCRT(biasAligned, mtfAgree, cq, pdDepth, dispMult, zoneKind, pat, emaAligned, adx, inSess) =>
+    float s = 0.0
+    s := s + (biasAligned ? 14.0 : 0.0)
+    s := s + 12.0 * cl01(mtfAgree / 3.0)
+    s := s + 14.0 * cl01(cq)
+    s := s + 12.0 * cl01(pdDepth)
+    s := s + 12.0 * cl01((dispMult - dispATR) / 1.2)
+    s := s + (zoneKind == "FVG" ? 10.0 : zoneKind == "Order Block" ? 7.0 : 4.0)
+    s := s + patStrength(pat)
+    s := s + (emaAligned ? 5.0 : 0.0) + 5.0 * cl01((adx - adxTrend) / 15.0)
+    s := s + (inSess ? 6.0 : 0.0)
+    int(math.round(math.max(0.0, math.min(100.0, s))))
+
+scoreHunt(dueness, chanPos, crtOk, pat, rrToTp1, spikeVsDrift, consistency) =>
+    float s = 0.0
+    s := s + 24.0 * cl01(dueness / 1.5)
+    s := s + 18.0 * cl01(1.0 - chanPos / math.max(0.05, huntMaxPos))
+    s := s + (crtOk ? 16.0 : 0.0)
+    s := s + 12.0 * cl01(consistency)
+    s := s + patStrength(pat)
+    s := s + 10.0 * cl01(rrToTp1 / 3.0)
+    s := s + 10.0 * cl01(spikeVsDrift / 8.0)
+    int(math.round(math.max(0.0, math.min(100.0, s))))
+
+scoreFade(spikeVsMedian, exhaust, htfReg, driftReg, dueness, pat, pdPos, rrToTp1) =>
+    float s = 0.0
+    s := s + 18.0 * cl01(spikeVsMedian)
+    s := s + 20.0 * cl01(exhaust / 0.60)
+    s := s + (htfReg == driftReg ? 18.0 : htfReg == 0 ? 8.0 : 0.0)
+    s := s + 16.0 * cl01(1.0 - dueness / math.max(0.05, fadeBlockDue))
+    s := s + patStrength(pat) * 1.2
+    s := s + 8.0 * cl01(pdPos)
+    s := s + 8.0 * cl01(rrToTp1 / 2.0)
+    int(math.round(math.max(0.0, math.min(100.0, s))))
+
+// -----------------------------------------------------------------------------
+// Spike engine state
+// -----------------------------------------------------------------------------
+var int   lastSpikeBar   = na
+var int   lastSpikeDir   = 0
+var float lastSpikeHigh  = na
+var float lastSpikeLow   = na
+var float lastSpikeRange = na
+var float preSpikeClose  = na
+var array<float> spikeSizes = array.new_float()
+var array<int>   spikeGaps  = array.new_int()
+var int   spikeSeen = 0
+var int   upSpikes  = 0
+var int   dnSpikes  = 0
+var float avgGap    = 0.0
+var float medSpike  = 0.0
+var float gapConsist = 0.0
+
+// -----------------------------------------------------------------------------
+// Core state machine
+// -----------------------------------------------------------------------------
+var int    stRaid     = 0
+var int    stDir      = 0
+var float  stCrtHi    = na
+var float  stCrtLo    = na
+var float  stCrtQual  = 0.0
+var bool   stMss      = false
+var float  stMssLvl   = na
+var int    stMssBar   = na
+var float  stDisp     = 0.0
+var bool   stZone     = false
+var float  stZoneHi   = na
+var float  stZoneLo   = na
+var string stZoneKind = ""
+var int    lastSigCrt  = -100000
+var int    lastSigHunt = -100000
+var int    lastSigFade = -100000
+
+var float  lastEntry = na
+var float  lastSL    = na
+var float  lastTP1   = na
+var float  lastTP2   = na
+var int    lastDir   = 0
+var int    lastMode  = 0
+var int    lastScore = 0
+var string lastPat   = ""
+var string lastGrade = ""
+
+// forward performance tracking
+var array<float> opEntry = array.new_float()
+var array<float> opSL    = array.new_float()
+var array<float> opTP1   = array.new_float()
+var array<int>   opDir   = array.new_int()
+var array<int>   opMode  = array.new_int()
+var array<int>   opBar   = array.new_int()
+var int   nWin = 0
+var int   nLoss = 0
+var float sumWinR = 0.0
+var float sumLossR = 0.0
+var int   streak = 0
+var int   worstStreak = 0
+var array<int> modeWin  = array.new_int(3, 0)
+var array<int> modeLoss = array.new_int(3, 0)
+
+// per-bar outputs
+bool   buyPrem  = false
+bool   buyStd   = false
+bool   sellPrem = false
+bool   sellStd  = false
+float  sigSL    = na
+float  sigTP1   = na
+float  sigTP2   = na
+int    sigScore = 0
+int    sigMode  = -1
+int    sigDir   = 0
+
+// these persist so the dashboard still reads them on the forming bar
+var bool  huntOpen = false
+var bool  fadeOpen = false
+var float duenessV = 0.0
+var int   barsSinceSpike = -1
+
+if barstate.isconfirmed and not na(atrv) and atrv > 0
+    huntOpen := false
+    fadeOpen := false
+
+    // -------------------------------------------------------------------------
+    // 1. resolve open forward-tests
+    // -------------------------------------------------------------------------
+    if trackStats
+        int ti = array.size(opEntry) - 1
+        while ti >= 0
+            if array.get(opBar, ti) < bar_index
+                e = array.get(opEntry, ti)
+                s = array.get(opSL, ti)
+                t = array.get(opTP1, ti)
+                d = array.get(opDir, ti)
+                m = array.get(opMode, ti)
+                risk = math.abs(e - s)
+                bool hitSL = d > 0 ? low <= s : high >= s
+                bool hitTP = d > 0 ? high >= t : low <= t
+                bool doClose = false
+                if risk <= 0
+                    doClose := true
+                else if hitSL
+                    // conservative: a bar covering both levels counts as a loss
+                    nLoss := nLoss + 1
+                    sumLossR := sumLossR + 1.0
+                    array.set(modeLoss, m, array.get(modeLoss, m) + 1)
+                    streak := streak < 0 ? streak - 1 : -1
+                    worstStreak := streak < worstStreak ? streak : worstStreak
+                    doClose := true
+                else if hitTP
+                    nWin := nWin + 1
+                    sumWinR := sumWinR + math.abs(t - e) / risk
+                    array.set(modeWin, m, array.get(modeWin, m) + 1)
+                    streak := streak > 0 ? streak + 1 : 1
+                    doClose := true
+                if doClose
+                    array.remove(opEntry, ti)
+                    array.remove(opSL, ti)
+                    array.remove(opTP1, ti)
+                    array.remove(opDir, ti)
+                    array.remove(opMode, ti)
+                    array.remove(opBar, ti)
+            ti := ti - 1
+
+    // -------------------------------------------------------------------------
+    // 2. spike detection and statistics
+    // -------------------------------------------------------------------------
+    if not na(driftRng) and driftRng > 0 and (high - low) >= spikeMult * driftRng
+        sd = (high - open) >= (open - low) ? 1 : -1
+        if sd > 0
+            upSpikes := upSpikes + 1
+        else
+            dnSpikes := dnSpikes + 1
+
+        // statistical classification once the sample is decisive
+        if statDetect and forcedClass == 0 and nameCls == 0
+            if upSpikes >= 5 and upSpikes >= 3 * math.max(1, dnSpikes)
+                symClass := 6
+                spikeDir := 1
+                classHow := "stats"
+            else if dnSpikes >= 5 and dnSpikes >= 3 * math.max(1, upSpikes)
+                symClass := 7
+                spikeDir := -1
+                classHow := "stats"
+
+        if spikeDir != 0
+            if not na(lastSpikeBar)
+                gap = bar_index - lastSpikeBar
+                if gap > 0
+                    array.push(spikeGaps, gap)
+                    if array.size(spikeGaps) > 32
+                        array.shift(spikeGaps)
+            array.push(spikeSizes, high - low)
+            if array.size(spikeSizes) > 32
+                array.shift(spikeSizes)
+
+            lastSpikeBar   := bar_index
+            lastSpikeDir   := sd
+            lastSpikeHigh  := high
+            lastSpikeLow   := low
+            lastSpikeRange := high - low
+            preSpikeClose  := close[1]
+            spikeSeen      := spikeSeen + 1
+
+            if array.size(spikeGaps) > 0
+                avgGap := array.avg(spikeGaps)
+                sd2 = array.size(spikeGaps) > 1 ? array.stdev(spikeGaps) : 0.0
+                gapConsist := avgGap > 0 ? cl01(1.0 - sd2 / avgGap) : 0.0
+            if array.size(spikeSizes) > 0
+                medSpike := array.median(spikeSizes)
+
+    barsSinceSpike := na(lastSpikeBar) ? -1 : bar_index - lastSpikeBar
+    duenessV := avgGap > 0 and barsSinceSpike >= 0 ? barsSinceSpike / avgGap : 0.0
+
+    // -------------------------------------------------------------------------
+    // 3. CRT state
+    // -------------------------------------------------------------------------
+    if not haveCrt
+        stRaid := 0
+        stDir := 0
+        stMss := false
+        stZone := false
+        stMssLvl := na
+        stZoneKind := ""
+    else if crtRaidTime != stRaid or crtDir != stDir
+        stRaid := crtRaidTime
+        stDir := crtDir
+        stCrtHi := crtHi
+        stCrtLo := crtLo
+        stCrtQual := crtQual
+        stMss := false
+        stZone := false
+        stMssLvl := na
+        stMssBar := na
+        stZoneKind := ""
+
+    // -------------------------------------------------------------------------
+    // ENGINE A : spike FADE (against the spike, with the drift)
+    // -------------------------------------------------------------------------
+    if spikeDir != 0 and tradeFades and spikeSeen >= minSpikes and not na(lastSpikeBar) and
+         barsSinceSpike >= 1 and barsSinceSpike <= fadeWindowN and lastSpikeDir == spikeDir and
+         duenessV < fadeBlockDue and driftRng > 0
+        fadeOpen := true
+        fdir    = -spikeDir
+        exhaust = lastSpikeRange > 0 ? (spikeDir > 0 ? (lastSpikeHigh - close) / lastSpikeRange : (close - lastSpikeLow) / lastSpikeRange) : 0.0
+        pat     = fdir > 0 ? bullPattern(atrv) : bearPattern(atrv)
+        patTxt  = pat == "" ? "Zone Tap" : pat
+        patOk   = not requirePattern or patStrength(patTxt) > 2
+
+        if exhaust >= fadeMinExhaust and patOk and inKill and bar_index - lastSigFade >= cooldownBars
+            entry = close
+            sl    = fdir > 0 ? lastSpikeLow - fadeSlBuf * driftRng : lastSpikeHigh + fadeSlBuf * driftRng
+            risk  = math.abs(entry - sl)
+            if risk > 0
+                tp1 = fdir > 0 ? (preSpikeClose > entry + 0.3 * driftRng ? preSpikeClose : entry + 2.0 * driftRng)
+                     : (preSpikeClose < entry - 0.3 * driftRng ? preSpikeClose : entry - 2.0 * driftRng)
+                tp2 = fdir > 0 ? tp1 + fadeTp2Drift * driftRng : tp1 - fadeTp2Drift * driftRng
+                rr  = math.abs(tp1 - entry) / risk
+                driftReg = spikeDir > 0 ? -1 : 1
+                htfPDv = hRangeHi > hRangeLo ? cl01((close - hRangeLo) / (hRangeHi - hRangeLo)) : 0.5
+                pdPos  = spikeDir > 0 ? htfPDv : 1.0 - htfPDv
+                sc = scoreFade(cl01(lastSpikeRange / math.max(medSpike, 1e-10)), exhaust, htfBias, driftReg, duenessV, patTxt, pdPos, rr)
+                if sc >= minScore
+                    sigDir := fdir
+                    sigMode := 2
+                    sigScore := sc
+                    sigSL := sl
+                    sigTP1 := tp1
+                    sigTP2 := tp2
+                    lastEntry := entry
+                    lastPat := patTxt
+
+    // -------------------------------------------------------------------------
+    // ENGINE B : spike HUNT (with the spike, against the drift)
+    // -------------------------------------------------------------------------
+    if sigMode < 0 and spikeDir != 0 and tradeSpikes and spikeSeen >= minSpikes and
+         medSpike > 0 and driftRng > 0 and duenessV >= huntMinDue and duenessV <= huntMaxDue
+        chanPosRaw = chanHi > chanLo ? (close - chanLo) / (chanHi - chanLo) : 0.5
+        chanPos    = spikeDir > 0 ? chanPosRaw : 1.0 - chanPosRaw
+        crtOk      = not huntNeedCrt or (stDir == spikeDir and stCrtQual > 0)
+
+        if chanPos <= huntMaxPos and crtOk and inKill and bar_index - lastSigHunt >= cooldownBars
+            huntOpen := true
+            pat    = spikeDir > 0 ? bullPattern(atrv) : bearPattern(atrv)
+            patTxt = pat == "" ? "Zone Tap" : pat
+            patOk  = not requirePattern or patStrength(patTxt) > 2
+            if patOk
+                entry = close
+                sl    = spikeDir > 0 ? math.min(hunt10Lo, entry) - huntSlDrift * driftRng
+                     : math.max(hunt10Hi, entry) + huntSlDrift * driftRng
+                risk  = math.abs(entry - sl)
+                if risk > 0
+                    tp1 = entry + spikeDir * spikeTp1Frac * medSpike
+                    tp2 = entry + spikeDir * spikeTp2Frac * medSpike
+                    rr  = math.abs(tp1 - entry) / risk
+                    sc  = scoreHunt(duenessV, chanPos, stDir == spikeDir, patTxt, rr, medSpike / math.max(driftRng, 1e-10), gapConsist)
+                    if sc >= minScore and rr >= 1.0
+                        sigDir := spikeDir
+                        sigMode := 1
+                        sigScore := sc
+                        sigSL := sl
+                        sigTP1 := tp1
+                        sigTP2 := tp2
+                        lastEntry := entry
+                        lastPat := patTxt
+
+    // -------------------------------------------------------------------------
+    // ENGINE C : the core CRT / MSS / retest engine
+    // -------------------------------------------------------------------------
+    crtRng = nz(stCrtHi - stCrtLo, 0.0)
+    if sigMode < 0 and stDir != 0 and crtRng > 0
+        if not stMss
+            if stDir == 1 and not na(swHigh) and not na(swHighBar) and swHighBar < bar_index and
+                 close > swHigh and (close - legLowV) / atrv >= dispATR
+                stMss      := true
+                stMssLvl   := swHigh
+                stMssBar   := bar_index
+                stDisp     := (close - legLowV) / atrv
+                stZoneHi   := bullZH
+                stZoneLo   := bullZL
+                stZoneKind := bullZK
+                stZone     := not na(bullZH) and not na(bullZL) and bullZH > bullZL
+            else if stDir == -1 and not na(swLow) and not na(swLowBar) and swLowBar < bar_index and
+                 close < swLow and (legHighV - close) / atrv >= dispATR
+                stMss      := true
+                stMssLvl   := swLow
+                stMssBar   := bar_index
+                stDisp     := (legHighV - close) / atrv
+                stZoneHi   := bearZH
+                stZoneLo   := bearZL
+                stZoneKind := bearZK
+                stZone     := not na(bearZH) and not na(bearZL) and bearZH > bearZL
+        else
+            expired    = bar_index - stMssBar > setupExpiry
+            invalidBuy = stDir ==  1 and close < stZoneLo - invalidATR * atrv
+            invalidSel = stDir == -1 and close > stZoneHi + invalidATR * atrv
+
+            if not stZone or expired or invalidBuy or invalidSel
+                stMss := false
+                stZone := false
+                stMssLvl := na
+                stZoneKind := ""
+            else
+                pd       = (close - stCrtLo) / crtRng
+                htfPD    = hRangeHi > hRangeLo ? (close - hRangeLo) / (hRangeHi - hRangeLo) : 0.5
+                wantBuy  = stDir == 1
+                wantSell = stDir == -1
+
+                bool ok = true
+                if blockInRange and htfBias == 0
+                    ok := false
+                if wantBuy and htfBias != 1
+                    ok := false
+                if wantSell and htfBias != -1
+                    ok := false
+                if wantBuy and pd > maxBuyPD
+                    ok := false
+                if wantSell and pd < minSellPD
+                    ok := false
+                if useHtfPD and wantBuy and htfPD > htfMaxBuyPD
+                    ok := false
+                if useHtfPD and wantSell and htfPD < htfMinSellPD
+                    ok := false
+                if not inKill
+                    ok := false
+                if bar_index - lastSigCrt < cooldownBars
+                    ok := false
+
+                emaAligned = wantBuy ? (emaF > emaS and close > emaF) : (emaF < emaS and close < emaF)
+                if emaFilter == "Soft"
+                    if wantBuy and close < emaF
+                        ok := false
+                    if wantSell and close > emaF
+                        ok := false
+                if emaFilter == "Strict" and not emaAligned
+                    ok := false
+
+                tapped = wantBuy ? (low <= stZoneHi and close > stZoneLo) : (high >= stZoneLo and close < stZoneHi)
+                if not tapped
+                    ok := false
+
+                string pat = ""
+                if ok
+                    pat := wantBuy ? bullPattern(atrv) : bearPattern(atrv)
+                    if requirePattern and pat == ""
+                        ok := false
+                    if pat == ""
+                        pat := "Zone Tap"
+
+                if ok
+                    entry = close
+                    sl    = wantBuy ? math.min(slLowV, stZoneLo) - slBufATR * atrv
+                         : math.max(slHighV, stZoneHi) + slBufATR * atrv
+                    risk  = math.abs(entry - sl)
+                    if risk > 0 and (maxRisk <= 0 or risk <= maxRisk * atrv)
+                        float tp1 = na
+                        float tp2 = na
+                        if wantBuy
+                            tp1 := entry + risk * rr1
+                            tp2 := entry + risk * rr2
+                            liq = math.max(stCrtHi, liqHighV)
+                            tp2 := useLiqTP and liq > tp1 ? liq : tp2
+                        else
+                            tp1 := entry - risk * rr1
+                            tp2 := entry - risk * rr2
+                            liq = math.min(stCrtLo, liqLowV)
+                            tp2 := useLiqTP and liq < tp1 ? liq : tp2
+
+                        want = wantBuy ? 1 : -1
+                        mtfAgree = (htfBias == want ? 1 : 0) + (midBias == want ? 1 : 0) + (chartReg == want ? 1 : 0)
+                        pdDepth = wantBuy ? cl01((maxBuyPD - pd) / math.max(maxBuyPD, 0.01))
+                             : cl01((pd - minSellPD) / math.max(1.0 - minSellPD, 0.01))
+                        sc = scoreCRT(htfBias == want, mtfAgree, stCrtQual, pdDepth, stDisp, stZoneKind, pat, emaAligned, adxC, inKill)
+
+                        if sc >= minScore
+                            sigDir := want
+                            sigMode := 0
+                            sigScore := sc
+                            sigSL := sl
+                            sigTP1 := tp1
+                            sigTP2 := tp2
+                            lastEntry := entry
+                            lastPat := pat
+                            if not multiEntry
+                                stMss := false
+                                stZone := false
+                                stMssLvl := na
+                                stZoneKind := ""
+
+    // -------------------------------------------------------------------------
+    // 4. publish
+    // -------------------------------------------------------------------------
+    if sigMode >= 0 and sigDir != 0
+        prem = sigScore >= premiumScore
+        buyPrem  := sigDir > 0 and prem
+        buyStd   := sigDir > 0 and not prem
+        sellPrem := sigDir < 0 and prem
+        sellStd  := sigDir < 0 and not prem
+
+        lastSL    := sigSL
+        lastTP1   := sigTP1
+        lastTP2   := sigTP2
+        lastDir   := sigDir
+        lastMode  := sigMode
+        lastScore := sigScore
+        lastGrade := gradeOf(sigScore)
+
+        if sigMode == 0
+            lastSigCrt := bar_index
+        else if sigMode == 1
+            lastSigHunt := bar_index
+        else
+            lastSigFade := bar_index
+
+        if trackStats
+            array.push(opEntry, lastEntry)
+            array.push(opSL, sigSL)
+            array.push(opTP1, sigTP1)
+            array.push(opDir, sigDir)
+            array.push(opMode, sigMode)
+            array.push(opBar, bar_index)
+
+// -----------------------------------------------------------------------------
+// The dots
+// -----------------------------------------------------------------------------
+dotOff = nz(atrv, 0.0) * dotOffATR
+plotshape(buyPrem  ? low  - dotOff : na, title = "Buy A+",  style = shape.circle, location = location.absolute, color = buyCol,  size = size.small)
+plotshape(buyStd   ? low  - dotOff : na, title = "Buy",     style = shape.circle, location = location.absolute, color = color.new(buyCol, 35),  size = size.tiny)
+plotshape(sellPrem ? high + dotOff : na, title = "Sell A+", style = shape.circle, location = location.absolute, color = sellCol, size = size.small)
+plotshape(sellStd  ? high + dotOff : na, title = "Sell",    style = shape.circle, location = location.absolute, color = color.new(sellCol, 35), size = size.tiny)
+
+anySig = buyPrem or buyStd or sellPrem or sellStd
+
+// -----------------------------------------------------------------------------
+// SL / TP levels and grade tags
+// -----------------------------------------------------------------------------
+var array<line>  drawnLines  = array.new_line()
+var array<label> drawnLabels = array.new_label()
+var array<label> gradeLabels = array.new_label()
+
+pushLine(l) =>
+    array.push(drawnLines, l)
+    if array.size(drawnLines) > showLast * 3
+        line.delete(array.shift(drawnLines))
+
+pushLabel(lb) =>
+    array.push(drawnLabels, lb)
+    if array.size(drawnLabels) > showLast * 3
+        label.delete(array.shift(drawnLabels))
+
+pushGrade(lb) =>
+    array.push(gradeLabels, lb)
+    if array.size(gradeLabels) > showLastGrades
+        label.delete(array.shift(gradeLabels))
+
+levelLine(price, col, sty) =>
+    line.new(bar_index, price, bar_index + projectBars, price, xloc = xloc.bar_index, color = col, style = sty, width = 1)
+
+levelTag(price, txt, col) =>
+    label.new(bar_index + projectBars, price, txt, xloc = xloc.bar_index, style = label.style_label_left,
+         color = color.new(col, 85), textcolor = col, size = size.tiny)
+
+if showSLTP and anySig
+    pushLine(levelLine(sigSL,  slCol,  line.style_dotted))
+    pushLine(levelLine(sigTP1, tp1Col, line.style_dotted))
+    pushLine(levelLine(sigTP2, tp2Col, line.style_dashed))
+    pushLabel(levelTag(sigSL,  "SL "  + str.tostring(sigSL,  format.mintick), slCol))
+    pushLabel(levelTag(sigTP1, "TP1 " + str.tostring(sigTP1, format.mintick), tp1Col))
+    pushLabel(levelTag(sigTP2, "TP2 " + str.tostring(sigTP2, format.mintick), tp2Col))
+
+if showScore and anySig
+    up = sigDir > 0
+    pushGrade(label.new(bar_index, up ? low - dotOff * 1.9 : high + dotOff * 1.9,
+         gradeOf(sigScore) + " " + str.tostring(sigScore),
+         style = up ? label.style_label_up : label.style_label_down,
+         color = color.new(up ? buyCol : sellCol, 80),
+         textcolor = up ? buyCol : sellCol, size = size.tiny))
+
+// -----------------------------------------------------------------------------
+// Optional CRT range box (debug)
+// -----------------------------------------------------------------------------
+var box crtBox = na
+if showCrtBox and barstate.islast
+    if not na(crtBox)
+        box.delete(crtBox)
+    if haveCrt
+        crtBox := box.new(bar_index - 40, crtHi, bar_index + 10, crtLo,
+             border_color = crtDir == 1 ? buyCol : sellCol, border_style = line.style_dotted,
+             bgcolor = color.new(crtDir == 1 ? buyCol : sellCol, 94))
+
+// -----------------------------------------------------------------------------
+// Dashboard
+// -----------------------------------------------------------------------------
+regName(r)  => r == 1 ? "BULLISH" : r == -1 ? "BEARISH" : "SIDEWAYS"
+regShort(r) => r == 1 ? "UP" : r == -1 ? "DN" : "--"
+regColor(r) => r == 1 ? buyCol : r == -1 ? sellCol : color.new(#ffb300, 0)
+modeName(m) => m == 1 ? "Hunt" : m == 2 ? "Fade" : "CRT"
+
+className(c) =>
+    c == 1 ? "FOREX" : c == 2 ? "METAL" : c == 3 ? "INDEX" : c == 4 ? "CRYPTO" :
+     c == 5 ? "SYNTHETIC" : c == 6 ? "SPIKE-UP (Boom/GainX)" : c == 7 ? "SPIKE-DOWN (Crash/PainX)" : "AUTO"
+
+scaleHint(tf) =>
+    tf == "M"   ? "W1 / D1 / H4"  :
+     tf == "W"   ? "D1 / H4 / H1"  :
+     tf == "D"   ? "H4 / H1 / M30" :
+     tf == "240" ? "H1 / M30 / M15":
+     tf == "60"  ? "M15 / M5"      : "M5 / M1"
+
+dashRow(t, i, k, v, vc) =>
+    table.cell(t, 0, i, k, text_color = color.new(#8d93a8, 0), text_size = size.small,
+         bgcolor = color.new(#10121a, 8), text_halign = text.align_left)
+    table.cell(t, 1, i, v, text_color = vc, text_size = size.small,
+         bgcolor = color.new(#10121a, 8), text_halign = text.align_left)
+
+var table dash = na
+
+if showPanel and barstate.islast
+    if na(dash)
+        dash := table.new(position.top_right, 2, 32, border_width = 1)
+    table.set_position(dash, panelPos == "Top right" ? position.top_right :
+         panelPos == "Top left"     ? position.top_left :
+         panelPos == "Bottom right" ? position.bottom_right : position.bottom_left)
+    table.clear(dash, 0, 0, 1, 31)
+
+    fg  = color.new(#d8dbe6, 0)
+    dim = color.new(#8d93a8, 0)
+    ok  = color.new(#4caf50, 0)
+    warn = color.new(#ffb300, 0)
+
+    pd     = haveCrt ? (close - crtLo) / (crtHi - crtLo) : 0.5
+    pdTxt  = pd < 0.45 ? "DISCOUNT" : pd > 0.55 ? "PREMIUM" : "EQUILIBRIUM"
+    pdCol  = pd < 0.45 ? buyCol : pd > 0.55 ? sellCol : warn
+    crtTxt = not haveCrt ? "SEARCHING" : crtDir == 1 ? "BULLISH CRT ARMED" : "BEARISH CRT ARMED"
+    crtC   = not haveCrt ? dim : crtDir == 1 ? buyCol : sellCol
+    phase  = not haveCrt ? "waiting for a CRT raid" :
+         not stMss ? "raid confirmed - waiting MSS" :
+         stZone    ? "MSS ok - waiting retest (" + stZoneKind + ")" : "MSS ok - no valid zone"
+
+    int r = 0
+    dashRow(dash, r, "C R T   S N I P E R   P R O", syminfo.ticker + "  " + timeframe.period, color.white)
+    r += 1
+    dashRow(dash, r, "Class", className(symClass) + "  [" + classHow + "]", spikeDir != 0 ? warn : fg)
+    r += 1
+    dashRow(dash, r, "HTF anchor", htf, fg)
+    r += 1
+    dashRow(dash, r, "HTF bias", regName(htfBias) + "  (ADX " + str.tostring(hAdx, "#.#") + ")", regColor(htfBias))
+    r += 1
+    dashRow(dash, r, "Mid " + midTf, regName(midBias), regColor(midBias))
+    r += 1
+    dashRow(dash, r, "Chart trend", regName(chartReg) + "  (ADX " + str.tostring(adxC, "#.#") + ")", regColor(chartReg))
+    r += 1
+    dashRow(dash, r, "MTF ribbon", "M15 " + regShort(rib1) + " | H1 " + regShort(rib2) + " | H4 " + regShort(rib3) + " | D1 " + regShort(rib4), fg)
+    r += 1
+    dashRow(dash, r, "EMA " + str.tostring(emaFastLen) + "/" + str.tostring(emaSlowLen), emaF > emaS ? "BULL STACK" : "BEAR STACK", emaF > emaS ? buyCol : sellCol)
+    r += 1
+    dashRow(dash, r, "CRT state", crtTxt, crtC)
+    r += 1
+    dashRow(dash, r, "CRT range", haveCrt ? str.tostring(crtHi, format.mintick) + " / " + str.tostring(crtLo, format.mintick) : "-", fg)
+    r += 1
+    dashRow(dash, r, "Location", pdTxt + "  " + str.tostring(pd * 100, "#") + "%", pdCol)
+    r += 1
+    dashRow(dash, r, "Setup", phase, dim)
+    r += 1
+
+    if spikeDir != 0
+        dashRow(dash, r, "S P I K E   E N G I N E", spikeDir > 0 ? "spikes UP / drift DOWN" : "spikes DOWN / drift UP", warn)
+        r += 1
+        dashRow(dash, r, "Observed", str.tostring(spikeSeen) + " spikes, every ~" + str.tostring(avgGap, "#") + " bars", fg)
+        r += 1
+        dashRow(dash, r, "Median size", str.tostring(medSpike, format.mintick) + "   (drift " + str.tostring(driftRng, format.mintick) + ")", fg)
+        r += 1
+        dashRow(dash, r, "Last spike", barsSinceSpike < 0 ? "-" : str.tostring(barsSinceSpike) + " bars ago", fg)
+        r += 1
+        dashRow(dash, r, "Due-ness", str.tostring(duenessV * 100, "#") + "%  " + (duenessV >= fadeBlockDue ? "[SPIKE DUE]" : "[SAFE TO FADE]"), duenessV >= fadeBlockDue ? sellCol : ok)
+        r += 1
+        dashRow(dash, r, "Windows", "Hunt " + (huntOpen ? "OPEN" : "closed") + "  |  Fade " + (fadeOpen ? "OPEN" : "closed"), huntOpen or fadeOpen ? ok : dim)
+        r += 1
+
+    sigTxt = lastDir == 0 ? "-" : (lastDir == 1 ? "BUY " : "SELL ") + str.tostring(lastEntry, format.mintick) + "   " + lastGrade + " " + str.tostring(lastScore) + "  (" + modeName(lastMode) + ")"
+    dashRow(dash, r, "Last signal", sigTxt, lastDir == 0 ? dim : lastDir == 1 ? buyCol : sellCol)
+    r += 1
+    dashRow(dash, r, "Pattern", lastDir == 0 ? "-" : lastPat, fg)
+    r += 1
+    dashRow(dash, r, "SL / TP1", lastDir == 0 ? "-" : str.tostring(lastSL, format.mintick) + " / " + str.tostring(lastTP1, format.mintick), fg)
+    r += 1
+    riskV = lastDir == 0 ? na : math.abs(lastEntry - lastSL)
+    rrTxt = lastDir == 0 or na(riskV) or riskV <= 0 ? "-" : str.tostring(lastTP2, format.mintick) + "   1:" + str.tostring(math.abs(lastTP2 - lastEntry) / riskV, "#.#")
+    dashRow(dash, r, "TP2 / R:R", rrTxt, fg)
+    r += 1
+
+    canScale = haveCrt and ((crtDir == 1 and htfBias == 1) or (crtDir == -1 and htfBias == -1))
+    dashRow(dash, r, "Scale in", canScale ? (crtDir == 1 ? "LONGS on " : "SHORTS on ") + scaleHint(htf) : "-", canScale ? (crtDir == 1 ? buyCol : sellCol) : dim)
+    r += 1
+
+    if trackStats and not panelCompact
+        tot = nWin + nLoss
+        dashRow(dash, r, "P E R F O R M A N C E", str.tostring(tot) + " closed", color.white)
+        r += 1
+        if tot > 0
+            wr   = 100.0 * nWin / tot
+            avgR = (sumWinR - sumLossR) / tot
+            pf   = sumLossR > 0 ? sumWinR / sumLossR : (sumWinR > 0 ? 99.0 : 0.0)
+            dashRow(dash, r, "Win rate", str.tostring(wr, "#") + "%   (" + str.tostring(nWin) + "W / " + str.tostring(nLoss) + "L)", wr >= 55 ? ok : wr >= 45 ? warn : sellCol)
+            r += 1
+            dashRow(dash, r, "Avg R", (avgR > 0 ? "+" : "") + str.tostring(avgR, "#.##") + "     PF " + str.tostring(pf, "#.##"), avgR > 0 ? ok : sellCol)
+            r += 1
+            dashRow(dash, r, "Streak", (streak > 0 ? "+" : "") + str.tostring(streak) + "      worst " + str.tostring(worstStreak), fg)
+            r += 1
+            dashRow(dash, r, "By engine",
+                 "CRT " + str.tostring(array.get(modeWin, 0)) + "/" + str.tostring(array.get(modeWin, 0) + array.get(modeLoss, 0)) +
+                 " | Hunt " + str.tostring(array.get(modeWin, 1)) + "/" + str.tostring(array.get(modeWin, 1) + array.get(modeLoss, 1)) +
+                 " | Fade " + str.tostring(array.get(modeWin, 2)) + "/" + str.tostring(array.get(modeWin, 2) + array.get(modeLoss, 2)), fg)
+            r += 1
+        else
+            dashRow(dash, r, "Win rate", "collecting...", dim)
+            r += 1
+
+    dashRow(dash, r, "ATR / min score", str.tostring(atrv, format.mintick) + "  /  " + str.tostring(minScore), dim)
+
+// -----------------------------------------------------------------------------
+// Alerts
+// -----------------------------------------------------------------------------
+alertcondition(buyPrem or buyStd,   "CRT Buy",  "CRT BUY signal")
+alertcondition(sellPrem or sellStd, "CRT Sell", "CRT SELL signal")
+alertcondition(buyPrem,             "CRT Buy A+",  "CRT premium BUY signal")
+alertcondition(sellPrem,            "CRT Sell A+", "CRT premium SELL signal")
+
+if anySig
+    alert((sigDir > 0 ? "BUY " : "SELL ") + syminfo.ticker + " " + timeframe.period +
+         "  " + gradeOf(sigScore) + " " + str.tostring(sigScore) + " (" + modeName(sigMode) + ", " + lastPat + ")" +
+         "  @ " + str.tostring(lastEntry, format.mintick) +
+         "  SL " + str.tostring(sigSL, format.mintick) +
+         "  TP1 " + str.tostring(sigTP1, format.mintick) +
+         "  TP2 " + str.tostring(sigTP2, format.mintick), alert.freq_once_per_bar_close)
