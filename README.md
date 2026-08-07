@@ -33,6 +33,71 @@ never contradict each other on the same candle.
 
 ---
 
+## Scalp, day trade, swing
+
+One `Trading style` input reshapes the whole indicator. On **Auto** it reads your
+chart timeframe: M1–M5 → Scalp, M6–H1 → Intraday, H2 and above → Swing. Set it
+explicitly to override.
+
+| | Scalp | Intraday | Swing |
+| --- | --- | --- | --- |
+| Chart | M1 – M5 | M15 – H1 | H4 – D1 |
+| CRT anchor | one rung **down** (M5 → M30) | standard (M15 → H4) | one rung **up** (H4 → W1) |
+| TP1 / TP2 | 1.2R / 2.0R | 2.0R / 3.5R | 2.5R / 5.0R |
+| SL buffer | 0.20 × ATR | 0.30 × ATR | 0.50 × ATR |
+| Setup expiry | 8 bars | 24 bars | 60 bars |
+| Cooldown | 2 bars | 3 bars | 6 bars |
+| Min score | 68 | 62 | 62 |
+| Liquidity TP | off — take the money | on | on |
+| Cost gate | TP1 ≥ 6 × spread | ≥ 4 × spread | ≥ 3 × spread |
+
+The differences are not cosmetic:
+
+- **The anchor moves with the style.** A scalper anchoring CRT on the daily would
+  wait days for a setup; a swing trader anchoring on H1 would get chopped to pieces.
+  Shifting the anchor a rung in each direction is what makes the same sequence fit
+  three horizons.
+- **Targets match holding time.** Scalp takes 1.2R and disables the liquidity
+  stretch, because reaching for a distant pool is how a scalp turns into a loss.
+  Swing pushes to 5R and keeps it, because that stretch is the whole point of
+  holding for days.
+- **Patience matches horizon.** An 8-bar expiry on a scalp kills a stale setup fast.
+  60 bars on swing lets a daily retest breathe.
+- **Stops widen with the timeframe** — 0.20 × ATR would be inside the noise on D1;
+  0.50 × ATR would be an unacceptable scalping cost.
+
+### The cost gate
+
+New, and the reason "it can scalp" is now an honest claim rather than a marketing
+one. Before any dot prints, the indicator checks:
+
+```
+|TP1 - entry|  >=  minTpSpreadX  x  current spread
+```
+
+Scalping on M1 with a 1.2R target means the target may only be a few points wide.
+If your broker's spread is a meaningful fraction of that, the setup has no edge left
+no matter how good the structure looks. Signals that fail this test are dropped and
+counted — the dashboard's `Cost gate` row shows how many, so you can see whether
+your broker's spread is quietly deleting your scalping signals.
+
+One honest limitation: MT5 does not expose historical spread, so the gate is
+evaluated with the **live** spread and applied to history too. Set
+`Override: TP1 must be >= this x spread` manually if you want to test against a
+different assumption. On TradingView there is no spread data at all, so you enter
+`Assumed spread in ticks` yourself; leave it at 0 to disable the gate.
+
+### Spike engines and style
+
+HUNT and FADE now require **at least 5 bars between spikes on average**, measured
+from your feed. On an H4 Boom chart a spike is a single candle with nothing around
+it — there is no interval to model and no exhaustion to read, so the spike engines
+switch themselves off and CRT carries the chart. The dashboard says so directly.
+
+Practically: **scalp and intraday the spike indices, swing them only with CRT.**
+
+---
+
 ## The CRT sequence
 
 Encoded step for step. Each step is a hard gate.

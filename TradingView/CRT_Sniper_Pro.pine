@@ -27,6 +27,11 @@ indicator("CRT Sniper Pro", overlay = true, max_lines_count = 500,
 // -----------------------------------------------------------------------------
 // Inputs
 // -----------------------------------------------------------------------------
+grpY = "Trading style"
+tradeStyle     = input.string("Auto", "Trading style", options = ["Auto", "Scalp", "Intraday", "Swing"], group = grpY)
+styleTune      = input.bool(true,  "Let the style set targets, expiry, cooldown, stops", group = grpY)
+assumedSpread  = input.float(0.0,  "Assumed spread in ticks (0 = no cost gate)", minval = 0.0, step = 0.1, group = grpY)
+
 grpS = "Symbol adaptation (any broker, any symbol)"
 autoTune       = input.bool(true,  "Auto-tune thresholds to the detected symbol class", group = grpS)
 forceClass     = input.string("Auto", "Force symbol class", options = ["Auto", "Forex", "Metal", "Index", "Crypto", "Synthetic", "Spike UP (Boom/GainX)", "Spike DOWN (Crash/PainX)"], group = grpS)
@@ -203,13 +208,41 @@ spikeMult = spikeMultIn
 useSessions = not autoTune ? useSessionsIn : (symClass == 4 or symClass == 5 or isSpikeSym) ? false : useSessionsIn
 
 // -----------------------------------------------------------------------------
-// Anchor timeframe resolution
+// Trading style : targets, patience and cost tolerance
 // -----------------------------------------------------------------------------
 chartSec = timeframe.in_seconds()
-autoTf   = chartSec <= 300   ? "60"  :
+styleAuto = chartSec <= 300 ? "Scalp" : chartSec <= 3600 ? "Intraday" : "Swing"
+tStyle     = tradeStyle == "Auto" ? styleAuto : tradeStyle
+isScalp   = tStyle == "Scalp"
+isSwing   = tStyle == "Swing"
+
+rr1V      = not styleTune ? rr1 : isScalp ? 1.2 : isSwing ? 2.5 : 2.0
+rr2V      = not styleTune ? rr2 : isScalp ? 2.0 : isSwing ? 5.0 : 3.5
+slBufV    = not styleTune ? slBufATR : isScalp ? 0.20 : isSwing ? 0.50 : 0.30
+expiryV   = not styleTune ? setupExpiry : isScalp ? 8 : isSwing ? 60 : 24
+cooldownV = not styleTune ? cooldownBars : isScalp ? 2 : isSwing ? 6 : 3
+minScoreV = not styleTune ? minScore : isScalp ? math.max(minScore, 68) : minScore
+liqTPV    = not styleTune ? useLiqTP : (isScalp ? false : true)
+minTpSprdX = isScalp ? 6.0 : isSwing ? 3.0 : 4.0
+dispATRs  = isScalp ? math.min(dispATR, 1.00) : isSwing ? math.max(dispATR, 1.30) : dispATR
+maxRiskS  = isSwing ? math.max(maxRisk, 5.0) : maxRisk
+
+// -----------------------------------------------------------------------------
+// Anchor timeframe resolution - scalp pulls it one rung down, swing one up
+// -----------------------------------------------------------------------------
+autoTfBase = chartSec <= 300   ? "60"  :
      chartSec <= 1800  ? "240" :
      chartSec <= 14400 ? "D"   :
      chartSec <= 86400 ? "W"   : "M"
+
+ladder(t) => t == "15" ? 0 : t == "30" ? 1 : t == "60" ? 2 : t == "240" ? 3 : t == "D" ? 4 : t == "W" ? 5 : 6
+ladderAt(i) =>
+    j = math.max(0, math.min(6, i))
+    j == 0 ? "15" : j == 1 ? "30" : j == 2 ? "60" : j == 3 ? "240" : j == 4 ? "D" : j == 5 ? "W" : "M"
+ladderSec(t) => t == "15" ? 900 : t == "30" ? 1800 : t == "60" ? 3600 : t == "240" ? 14400 : t == "D" ? 86400 : t == "W" ? 604800 : 2592000
+
+shifted  = ladderAt(ladder(autoTfBase) + (isScalp ? -1 : isSwing ? 1 : 0))
+autoTf   = ladderSec(shifted) <= chartSec ? autoTfBase : shifted
 htf = htfIn == "" ? autoTf : htfIn
 
 midTf = chartSec <= 300 ? "15" : chartSec <= 1800 ? "60" : chartSec <= 14400 ? "240" : "D"
@@ -481,7 +514,7 @@ scoreCRT(biasAligned, mtfAgree, cq, pdDepth, dispMult, zoneKind, pat, emaAligned
     s := s + 12.0 * cl01(mtfAgree / 3.0)
     s := s + 14.0 * cl01(cq)
     s := s + 12.0 * cl01(pdDepth)
-    s := s + 12.0 * cl01((dispMult - dispATR) / 1.2)
+    s := s + 12.0 * cl01((dispMult - dispATRs) / 1.2)
     s := s + (zoneKind == "FVG" ? 10.0 : zoneKind == "Order Block" ? 7.0 : 4.0)
     s := s + patStrength(pat)
     s := s + (emaAligned ? 5.0 : 0.0) + 5.0 * cl01((adx - adxTrend) / 15.0)
@@ -571,6 +604,7 @@ var float sumWinR = 0.0
 var float sumLossR = 0.0
 var int   streak = 0
 var int   worstStreak = 0
+var int   spreadReject = 0
 var array<int> modeWin  = array.new_int(3, 0)
 var array<int> modeLoss = array.new_int(3, 0)
 
@@ -713,7 +747,7 @@ if barstate.isconfirmed and not na(atrv) and atrv > 0
     // ENGINE A : spike FADE (against the spike, with the drift)
     // -------------------------------------------------------------------------
     if spikeDir != 0 and tradeFades and spikeSeen >= minSpikes and not na(lastSpikeBar) and
-         barsSinceSpike >= 1 and barsSinceSpike <= fadeWindowN and lastSpikeDir == spikeDir and
+         avgGap >= 5 and barsSinceSpike >= 1 and barsSinceSpike <= fadeWindowN and lastSpikeDir == spikeDir and
          duenessV < fadeBlockDue and driftRng > 0
         fadeOpen := true
         fdir    = -spikeDir
@@ -722,7 +756,7 @@ if barstate.isconfirmed and not na(atrv) and atrv > 0
         patTxt  = pat == "" ? "Zone Tap" : pat
         patOk   = not requirePattern or patStrength(patTxt) > 2
 
-        if exhaust >= fadeMinExhaust and patOk and inKill and bar_index - lastSigFade >= cooldownBars
+        if exhaust >= fadeMinExhaust and patOk and inKill and bar_index - lastSigFade >= cooldownV
             entry = close
             sl    = fdir > 0 ? lastSpikeLow - fadeSlBuf * driftRng : lastSpikeHigh + fadeSlBuf * driftRng
             risk  = math.abs(entry - sl)
@@ -735,7 +769,7 @@ if barstate.isconfirmed and not na(atrv) and atrv > 0
                 htfPDv = hRangeHi > hRangeLo ? cl01((close - hRangeLo) / (hRangeHi - hRangeLo)) : 0.5
                 pdPos  = spikeDir > 0 ? htfPDv : 1.0 - htfPDv
                 sc = scoreFade(cl01(lastSpikeRange / math.max(medSpike, 1e-10)), exhaust, htfBias, driftReg, duenessV, patTxt, pdPos, rr)
-                if sc >= minScore
+                if sc >= minScoreV
                     sigDir := fdir
                     sigMode := 2
                     sigScore := sc
@@ -749,12 +783,13 @@ if barstate.isconfirmed and not na(atrv) and atrv > 0
     // ENGINE B : spike HUNT (with the spike, against the drift)
     // -------------------------------------------------------------------------
     if sigMode < 0 and spikeDir != 0 and tradeSpikes and spikeSeen >= minSpikes and
-         medSpike > 0 and driftRng > 0 and duenessV >= huntMinDue and duenessV <= huntMaxDue
+         medSpike > 0 and driftRng > 0 and avgGap >= 5 and
+         duenessV >= huntMinDue and duenessV <= huntMaxDue
         chanPosRaw = chanHi > chanLo ? (close - chanLo) / (chanHi - chanLo) : 0.5
         chanPos    = spikeDir > 0 ? chanPosRaw : 1.0 - chanPosRaw
         crtOk      = not huntNeedCrt or (stDir == spikeDir and stCrtQual > 0)
 
-        if chanPos <= huntMaxPos and crtOk and inKill and bar_index - lastSigHunt >= cooldownBars
+        if chanPos <= huntMaxPos and crtOk and inKill and bar_index - lastSigHunt >= cooldownV
             huntOpen := true
             pat    = spikeDir > 0 ? bullPattern(atrv) : bearPattern(atrv)
             patTxt = pat == "" ? "Zone Tap" : pat
@@ -769,7 +804,7 @@ if barstate.isconfirmed and not na(atrv) and atrv > 0
                     tp2 = entry + spikeDir * spikeTp2Frac * medSpike
                     rr  = math.abs(tp1 - entry) / risk
                     sc  = scoreHunt(duenessV, chanPos, stDir == spikeDir, patTxt, rr, medSpike / math.max(driftRng, 1e-10), gapConsist)
-                    if sc >= minScore and rr >= 1.0
+                    if sc >= minScoreV and rr >= 1.0
                         sigDir := spikeDir
                         sigMode := 1
                         sigScore := sc
@@ -786,7 +821,7 @@ if barstate.isconfirmed and not na(atrv) and atrv > 0
     if sigMode < 0 and stDir != 0 and crtRng > 0
         if not stMss
             if stDir == 1 and not na(swHigh) and not na(swHighBar) and swHighBar < bar_index and
-                 close > swHigh and (close - legLowV) / atrv >= dispATR
+                 close > swHigh and (close - legLowV) / atrv >= dispATRs
                 stMss      := true
                 stMssLvl   := swHigh
                 stMssBar   := bar_index
@@ -796,7 +831,7 @@ if barstate.isconfirmed and not na(atrv) and atrv > 0
                 stZoneKind := bullZK
                 stZone     := not na(bullZH) and not na(bullZL) and bullZH > bullZL
             else if stDir == -1 and not na(swLow) and not na(swLowBar) and swLowBar < bar_index and
-                 close < swLow and (legHighV - close) / atrv >= dispATR
+                 close < swLow and (legHighV - close) / atrv >= dispATRs
                 stMss      := true
                 stMssLvl   := swLow
                 stMssBar   := bar_index
@@ -806,7 +841,7 @@ if barstate.isconfirmed and not na(atrv) and atrv > 0
                 stZoneKind := bearZK
                 stZone     := not na(bearZH) and not na(bearZL) and bearZH > bearZL
         else
-            expired    = bar_index - stMssBar > setupExpiry
+            expired    = bar_index - stMssBar > expiryV
             invalidBuy = stDir ==  1 and close < stZoneLo - invalidATR * atrv
             invalidSel = stDir == -1 and close > stZoneHi + invalidATR * atrv
 
@@ -838,7 +873,7 @@ if barstate.isconfirmed and not na(atrv) and atrv > 0
                     ok := false
                 if not inKill
                     ok := false
-                if bar_index - lastSigCrt < cooldownBars
+                if bar_index - lastSigCrt < cooldownV
                     ok := false
 
                 emaAligned = wantBuy ? (emaF > emaS and close > emaF) : (emaF < emaS and close < emaF)
@@ -864,22 +899,22 @@ if barstate.isconfirmed and not na(atrv) and atrv > 0
 
                 if ok
                     entry = close
-                    sl    = wantBuy ? math.min(slLowV, stZoneLo) - slBufATR * atrv
-                         : math.max(slHighV, stZoneHi) + slBufATR * atrv
+                    sl    = wantBuy ? math.min(slLowV, stZoneLo) - slBufV * atrv
+                         : math.max(slHighV, stZoneHi) + slBufV * atrv
                     risk  = math.abs(entry - sl)
-                    if risk > 0 and (maxRisk <= 0 or risk <= maxRisk * atrv)
+                    if risk > 0 and (maxRiskS <= 0 or risk <= maxRiskS * atrv)
                         float tp1 = na
                         float tp2 = na
                         if wantBuy
-                            tp1 := entry + risk * rr1
-                            tp2 := entry + risk * rr2
+                            tp1 := entry + risk * rr1V
+                            tp2 := entry + risk * rr2V
                             liq = math.max(stCrtHi, liqHighV)
-                            tp2 := useLiqTP and liq > tp1 ? liq : tp2
+                            tp2 := liqTPV and liq > tp1 ? liq : tp2
                         else
-                            tp1 := entry - risk * rr1
-                            tp2 := entry - risk * rr2
+                            tp1 := entry - risk * rr1V
+                            tp2 := entry - risk * rr2V
                             liq = math.min(stCrtLo, liqLowV)
-                            tp2 := useLiqTP and liq < tp1 ? liq : tp2
+                            tp2 := liqTPV and liq < tp1 ? liq : tp2
 
                         want = wantBuy ? 1 : -1
                         mtfAgree = (htfBias == want ? 1 : 0) + (midBias == want ? 1 : 0) + (chartReg == want ? 1 : 0)
@@ -887,7 +922,7 @@ if barstate.isconfirmed and not na(atrv) and atrv > 0
                              : cl01((pd - minSellPD) / math.max(1.0 - minSellPD, 0.01))
                         sc = scoreCRT(htfBias == want, mtfAgree, stCrtQual, pdDepth, stDisp, stZoneKind, pat, emaAligned, adxC, inKill)
 
-                        if sc >= minScore
+                        if sc >= minScoreV
                             sigDir := want
                             sigMode := 0
                             sigScore := sc
@@ -903,7 +938,17 @@ if barstate.isconfirmed and not na(atrv) and atrv > 0
                                 stZoneKind := ""
 
     // -------------------------------------------------------------------------
-    // 4. publish
+    // 4. cost gate : a target the spread eats is not a signal
+    // -------------------------------------------------------------------------
+    if sigMode >= 0 and sigDir != 0 and assumedSpread > 0
+        sprd = assumedSpread * syminfo.mintick
+        if math.abs(sigTP1 - lastEntry) < minTpSprdX * sprd
+            spreadReject := spreadReject + 1
+            sigMode := -1
+            sigDir  := 0
+
+    // -------------------------------------------------------------------------
+    // 5. publish
     // -------------------------------------------------------------------------
     if sigMode >= 0 and sigDir != 0
         prem = sigScore >= premiumScore
@@ -1032,11 +1077,11 @@ var table dash = na
 
 if showPanel and barstate.islast
     if na(dash)
-        dash := table.new(position.top_right, 2, 32, border_width = 1)
+        dash := table.new(position.top_right, 2, 36, border_width = 1)
     table.set_position(dash, panelPos == "Top right" ? position.top_right :
          panelPos == "Top left"     ? position.top_left :
          panelPos == "Bottom right" ? position.bottom_right : position.bottom_left)
-    table.clear(dash, 0, 0, 1, 31)
+    table.clear(dash, 0, 0, 1, 35)
 
     fg  = color.new(#d8dbe6, 0)
     dim = color.new(#8d93a8, 0)
@@ -1056,6 +1101,8 @@ if showPanel and barstate.islast
     dashRow(dash, r, "C R T   S N I P E R   P R O", syminfo.ticker + "  " + timeframe.period, color.white)
     r += 1
     dashRow(dash, r, "Class", className(symClass) + "  [" + classHow + "]", spikeDir != 0 ? warn : fg)
+    r += 1
+    dashRow(dash, r, "Style", str.upper(tStyle) + "   TP " + str.tostring(rr1V, "#.#") + "R / " + str.tostring(rr2V, "#.#") + "R", color.new(#ffd54f, 0))
     r += 1
     dashRow(dash, r, "HTF anchor", htf, fg)
     r += 1
@@ -1082,6 +1129,8 @@ if showPanel and barstate.islast
         dashRow(dash, r, "S P I K E   E N G I N E", spikeDir > 0 ? "spikes UP / drift DOWN" : "spikes DOWN / drift UP", warn)
         r += 1
         dashRow(dash, r, "Observed", str.tostring(spikeSeen) + " spikes, every ~" + str.tostring(avgGap, "#") + " bars", fg)
+        r += 1
+        dashRow(dash, r, "Interval CV", str.tostring(gapConsist, "#.##") + "  " + (gapConsist < 0.25 ? "[RANDOM - turn HUNT off]" : gapConsist < 0.50 ? "[weak timing edge]" : "[timing edge real]"), gapConsist < 0.25 ? sellCol : gapConsist < 0.50 ? warn : ok)
         r += 1
         dashRow(dash, r, "Median size", str.tostring(medSpike, format.mintick) + "   (drift " + str.tostring(driftRng, format.mintick) + ")", fg)
         r += 1
@@ -1131,7 +1180,9 @@ if showPanel and barstate.islast
             dashRow(dash, r, "Win rate", "collecting...", dim)
             r += 1
 
-    dashRow(dash, r, "ATR / min score", str.tostring(atrv, format.mintick) + "  /  " + str.tostring(minScore), dim)
+    dashRow(dash, r, "ATR / min score", str.tostring(atrv, format.mintick) + "  /  " + str.tostring(minScoreV), dim)
+    r += 1
+    dashRow(dash, r, "Cost gate", assumedSpread <= 0 ? "off" : "TP1 >= " + str.tostring(minTpSprdX, "#.#") + " x spread   " + str.tostring(spreadReject) + " rejected", assumedSpread > 0 and spreadReject > 0 ? warn : dim)
 
 // -----------------------------------------------------------------------------
 // Alerts

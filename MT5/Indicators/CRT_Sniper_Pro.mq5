@@ -85,9 +85,22 @@ enum ENUM_SPIKEDIR
    SPD_DOWN = 2   // Spikes down (Crash / PainX)
   };
 
+enum ENUM_STYLE
+  {
+   STY_AUTO  = 0, // Auto (from chart timeframe)
+   STY_SCALP = 1, // Scalp
+   STY_INTRA = 2, // Intraday / day trade
+   STY_SWING = 3  // Swing
+  };
+
 //+------------------------------------------------------------------+
 //| Inputs                                                           |
 //+------------------------------------------------------------------+
+input group "=== Trading style ==="
+input ENUM_STYLE      InpTradeStyle       = STY_AUTO;       // Trading style
+input bool            InpStyleTune        = true;           // Let the style set targets, expiry, cooldown, stops
+input double          InpMinTpSpreadX     = 0.0;            // Override: TP1 must be >= this x spread (0 = use style)
+
 input group "=== Symbol adaptation (any broker, any symbol) ==="
 input bool            InpAutoTune         = true;           // Auto-tune thresholds to the detected symbol class
 input ENUM_SYMCLASS   InpForceClass       = SC_AUTO;        // Force symbol class
@@ -250,6 +263,22 @@ double   g_mEmaFv[], g_mEmaSv[], g_mAtrv[], g_mAdxv[];
 //+------------------------------------------------------------------+
 double g_dispATR, g_maxRiskATR, g_adxTrend, g_spikeMult, g_minSepATR;
 bool   g_useSessions;
+
+//--- style-driven working parameters
+int    g_style      = STY_INTRA;
+double g_rr1        = 2.0;
+double g_rr2        = 3.5;
+double g_slBuf      = 0.30;
+double g_minTpSprdX = 4.0;
+int    g_expiry     = 24;
+int    g_cooldown   = 3;
+int    g_minScore   = 62;
+bool   g_liqTP      = true;
+
+//--- health / diagnostics
+int    g_htfAvail     = 0;
+bool   g_htfOk        = true;
+int    g_spreadReject = 0;
 
 //+------------------------------------------------------------------+
 //| Symbol profile                                                   |
@@ -442,6 +471,53 @@ ENUM_TIMEFRAMES ResolveHTF(const ENUM_TIMEFRAMES chart)
       case PERIOD_W1: case PERIOD_MN1: return PERIOD_MN1;
      }
    return PERIOD_D1;
+  }
+
+//--- anchor ladder used to shift the CRT anchor by trading style
+int LadderIndex(const ENUM_TIMEFRAMES tf)
+  {
+   ENUM_TIMEFRAMES lad[7] = {PERIOD_M15, PERIOD_M30, PERIOD_H1, PERIOD_H4,
+                             PERIOD_D1, PERIOD_W1, PERIOD_MN1};
+   for(int i = 0; i < 7; i++)
+      if(lad[i] == tf) return i;
+   return 4;
+  }
+
+ENUM_TIMEFRAMES LadderAt(int i)
+  {
+   ENUM_TIMEFRAMES lad[7] = {PERIOD_M15, PERIOD_M30, PERIOD_H1, PERIOD_H4,
+                             PERIOD_D1, PERIOD_W1, PERIOD_MN1};
+   if(i < 0) i = 0;
+   if(i > 6) i = 6;
+   return lad[i];
+  }
+
+int AutoStyle(const ENUM_TIMEFRAMES chart)
+  {
+   int s = PeriodSeconds(chart);
+   if(s <= 300)  return STY_SCALP;   // M1 .. M5
+   if(s <= 3600) return STY_INTRA;   // M6 .. H1
+   return STY_SWING;                 // H2 and above
+  }
+
+string StyleName(const int st)
+  {
+   if(st == STY_SCALP) return "SCALP";
+   if(st == STY_SWING) return "SWING";
+   return "INTRADAY";
+  }
+
+//--- scalping pulls the anchor one rung down, swing pushes it one rung up
+ENUM_TIMEFRAMES ResolveHTFStyled(const ENUM_TIMEFRAMES chart, const int st)
+  {
+   ENUM_TIMEFRAMES base = ResolveHTF(chart);
+   int idx = LadderIndex(base);
+   if(st == STY_SCALP) idx--;
+   if(st == STY_SWING) idx++;
+   ENUM_TIMEFRAMES tf = LadderAt(idx);
+   if(PeriodSeconds(tf) <= PeriodSeconds(chart))
+      tf = base;
+   return tf;
   }
 
 ENUM_TIMEFRAMES PickLadder(const double secs)
@@ -716,6 +792,69 @@ void AutoTune()
          g_minSepATR = 0.18; g_useSessions = false;
          break;
      }
+  }
+
+//+------------------------------------------------------------------+
+//| Trading style : targets, patience and cost tolerance             |
+//| Runs after AutoTune - it may tighten what AutoTune set.          |
+//+------------------------------------------------------------------+
+void ApplyStyle()
+  {
+   g_rr1       = InpRR1;
+   g_rr2       = InpRR2;
+   g_slBuf     = InpSlBufATR;
+   g_expiry    = InpSetupExpiry;
+   g_cooldown  = InpCooldownBars;
+   g_minScore  = InpMinScore;
+   g_liqTP     = InpUseLiquidityTP;
+   g_minTpSprdX = 4.0;
+
+   if(InpStyleTune)
+     {
+      switch(g_style)
+        {
+         case STY_SCALP:
+            // fast in, fast out - costs dominate, so demand a wide TP/spread ratio
+            g_rr1 = 1.2; g_rr2 = 2.0;
+            g_slBuf = 0.20; g_expiry = 8; g_cooldown = 2;
+            g_liqTP = false;
+            g_minTpSprdX = 6.0;
+            g_minScore = MathMax(InpMinScore, 68);
+            g_dispATR = MathMin(g_dispATR, 1.00);
+            break;
+
+         case STY_INTRA:
+            g_rr1 = 2.0; g_rr2 = 3.5;
+            g_slBuf = 0.30; g_expiry = 24; g_cooldown = 3;
+            g_liqTP = true;
+            g_minTpSprdX = 4.0;
+            break;
+
+         case STY_SWING:
+            // wide stops, long patience, targets that justify holding
+            g_rr1 = 2.5; g_rr2 = 5.0;
+            g_slBuf = 0.50; g_expiry = 60; g_cooldown = 6;
+            g_liqTP = true;
+            g_minTpSprdX = 3.0;
+            g_maxRiskATR = MathMax(g_maxRiskATR, 5.0);
+            g_dispATR = MathMax(g_dispATR, 1.30);
+            break;
+        }
+     }
+
+   if(InpMinTpSpreadX > 0.0)
+      g_minTpSprdX = InpMinTpSpreadX;
+  }
+
+//--- current spread in price terms (historical spread is not available,
+//--- so the viability gate is evaluated with the live spread)
+double SpreadPrice()
+  {
+   double sp = (double)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) *
+               SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   if(sp <= 0.0)
+      sp = SymbolInfoDouble(_Symbol, SYMBOL_ASK) - SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   return MathMax(sp, 0.0);
   }
 
 //+------------------------------------------------------------------+
@@ -1331,9 +1470,12 @@ void BuildRows()
    AddRow(StringFormat("Market      : %s  %s", _Symbol, TfName((ENUM_TIMEFRAMES)_Period)), InpPanelText);
    AddRow(StringFormat("Class       : %s  [%s]", ClassName(g_symClass), g_classHow),
           (g_spikeDir != 0 ? clrOrange : InpPanelText));
+   AddRow(StringFormat("Style       : %s   TP %.1fR / %.1fR", StyleName(g_style), g_rr1, g_rr2), clrGold);
    AddRow(SEP, dimc);
 
    AddRow(StringFormat("HTF anchor  : %s", TfName(g_htf)), InpPanelText);
+   if(!g_htfOk)
+      AddRow(StringFormat("HTF history : %d / %d bars  INSUFFICIENT", g_htfAvail, InpEmaSlow + 10), clrRed);
    AddRow(StringFormat("HTF bias    : %s  (ADX %.1f)", RegName(g_dHtfReg), g_dHtfAdx), RegColor(g_dHtfReg));
    AddRow(StringFormat("Mid %-7s : %s", TfName(g_mtf), RegName(g_dMidReg)), RegColor(g_dMidReg));
    AddRow(StringFormat("Chart trend : %s  (ADX %.1f)", RegName(g_dLtfReg), g_dLtfAdx), RegColor(g_dLtfReg));
@@ -1366,6 +1508,12 @@ void BuildRows()
                           (g_spikeDir > 0 ? "UP" : "DOWN"),
                           (g_spikeDir > 0 ? "DOWN" : "UP")), clrOrange);
       AddRow(StringFormat("Observed    : %d spikes, every ~%.0f bars", g_spikeSeen, g_avgGap), InpPanelText);
+      AddRow(StringFormat("Interval CV : %.2f  %s", g_gapConsistency,
+                          (g_gapConsistency < 0.25 ? "[RANDOM - turn HUNT off]"
+                           : (g_gapConsistency < 0.50 ? "[weak timing edge]" : "[timing edge real]"))),
+             (g_gapConsistency < 0.25 ? clrOrangeRed : (g_gapConsistency < 0.50 ? clrGoldenrod : clrLimeGreen)));
+      if(g_avgGap > 0.0 && g_avgGap < 5.0)
+         AddRow("Resolution  : too few bars between spikes - drop a TF", clrOrangeRed);
       AddRow(StringFormat("Median size : %s   (drift %s)",
                           DoubleToString(g_medSpike, _Digits), DoubleToString(g_dDrift, _Digits)), InpPanelText);
       AddRow(StringFormat("Last spike  : %d bars ago", g_dBarsSinceSpike), InpPanelText);
@@ -1433,9 +1581,13 @@ void BuildRows()
      }
 
    AddRow(SEP, dimc);
-   AddRow(StringFormat("ATR/Spread  : %s / %d   min score %d",
+   double sprdNow = SpreadPrice();
+   AddRow(StringFormat("ATR/Spread  : %s / %s   min score %d",
                        DoubleToString(g_dAtr, _Digits),
-                       (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD), InpMinScore), dimc);
+                       DoubleToString(sprdNow, _Digits), g_minScore), dimc);
+   AddRow(StringFormat("Cost gate   : TP1 >= %.1f x spread   %d rejected",
+                       g_minTpSprdX, g_spreadReject),
+          (g_spreadReject > 0 ? clrGoldenrod : dimc));
   }
 
 void DrawPanel()
@@ -1504,9 +1656,11 @@ void FireAlert(const datetime t, const int dir, const int mode, const int score,
 //+------------------------------------------------------------------+
 int OnInit()
   {
-   g_htf = (InpHTF == PERIOD_CURRENT ? ResolveHTF((ENUM_TIMEFRAMES)_Period) : InpHTF);
+   g_style = (InpTradeStyle == STY_AUTO ? AutoStyle((ENUM_TIMEFRAMES)_Period) : InpTradeStyle);
+
+   g_htf = (InpHTF == PERIOD_CURRENT ? ResolveHTFStyled((ENUM_TIMEFRAMES)_Period, g_style) : InpHTF);
    if(PeriodSeconds(g_htf) <= PeriodSeconds(_Period))
-      g_htf = ResolveHTF((ENUM_TIMEFRAMES)_Period);
+      g_htf = ResolveHTFStyled((ENUM_TIMEFRAMES)_Period, g_style);
    g_mtf = PickLadder(MathSqrt((double)PeriodSeconds(_Period) * (double)PeriodSeconds(g_htf)));
    if(PeriodSeconds(g_mtf) <= PeriodSeconds(_Period)) g_mtf = (ENUM_TIMEFRAMES)_Period;
    if(PeriodSeconds(g_mtf) >= PeriodSeconds(g_htf))   g_mtf = g_htf;
@@ -1586,6 +1740,7 @@ int OnInit()
    g_nominal  = nn;
    g_classHow = "name";
    AutoTune();
+   ApplyStyle();
 
    return INIT_SUCCEEDED;
   }
@@ -1630,6 +1785,8 @@ bool LoadSeries(const int rates_total, const int calcFrom)
    htfNeed = MathMin(htfNeed, 6000);
 
    if(CopyRates(_Symbol, g_htf, 0, htfNeed, g_hr) <= 0)   return false;
+   g_htfAvail = ArraySize(g_hr);
+   g_htfOk    = (g_htfAvail >= InpEmaSlow + 10);
    if(CopyBuffer(g_hEmaFH, 0, 0, htfNeed, g_hEmaFv) <= 0) return false;
    if(CopyBuffer(g_hEmaSH, 0, 0, htfNeed, g_hEmaSv) <= 0) return false;
    if(CopyBuffer(g_hAtrH,  0, 0, htfNeed, g_hAtrv)  <= 0) return false;
@@ -1803,6 +1960,8 @@ int OnCalculate(const int rates_total,
       ResetAll();
       ProfileSymbol(rates_total, open, high, low, close);
       AutoTune();
+      ApplyStyle();
+      g_spreadReject = 0;
       g_lastProc = calcFrom - 1;
      }
 
@@ -1900,6 +2059,7 @@ int OnCalculate(const int rates_total,
       //--------------------------------------------------------------
       bool fadeWindow = false;
       if(g_spikeDir != 0 && InpTradeFades && g_spikeSeen >= InpMinSpikesToTrade &&
+         g_avgGap >= 5.0 &&
          g_lastSpikeBar >= 0 && barsSince >= 1 && barsSince <= InpFadeWindow &&
          g_lastSpikeDir == g_spikeDir && dueness < InpFadeBlockDueness && drift > 0.0)
         {
@@ -1917,7 +2077,7 @@ int OnCalculate(const int rates_total,
          bool patOk = (!InpRequirePattern || PatternStrength(pat) > 2);
 
          if(exhaust >= InpFadeMinExhaust && patOk && inSess &&
-            i - g_lastSigBarMode[MODE_FADE] >= InpCooldownBars)
+            i - g_lastSigBarMode[MODE_FADE] >= g_cooldown)
            {
             double entry = close[i];
             double sl = (fdir > 0 ? g_lastSpikeLow - InpFadeSlBuf * drift
@@ -1941,7 +2101,7 @@ int OnCalculate(const int rates_total,
                double pdPos = (g_spikeDir > 0 ? Clamp(htfPD, 0, 1) : Clamp(1.0 - htfPD, 0, 1));
                int sc = ScoreFade(Clamp(spikeRng / MathMax(g_medSpike, 1e-12), 0, 1),
                                   exhaust, bias, driftReg, dueness, pat, pdPos, rr);
-               if(sc >= InpMinScore)
+               if(sc >= g_minScore)
                  {
                   sigDir = fdir; sigMode = MODE_FADE; sigScore = sc;
                   sigEntry = entry; sigSL = sl; sigTP1 = tp1; sigTP2 = tp2; sigPat = pat;
@@ -1956,6 +2116,7 @@ int OnCalculate(const int rates_total,
       bool huntWindow = false;
       if(sigMode < 0 && g_spikeDir != 0 && InpTradeSpikes &&
          g_spikeSeen >= InpMinSpikesToTrade && g_medSpike > 0.0 && drift > 0.0 &&
+         g_avgGap >= 5.0 &&
          dueness >= InpHuntMinDueness && dueness <= InpHuntMaxDueness)
         {
          double chHi = HighestOf(high, i - InpDriftChanLook + 1, i, rates_total);
@@ -1967,7 +2128,7 @@ int OnCalculate(const int rates_total,
          bool crtOk = (!InpHuntNeedCrt || (g_stDir == g_spikeDir && g_stCrtQual > 0.0));
 
          if(chanPos <= InpHuntMaxPos && crtOk && inSess &&
-            i - g_lastSigBarMode[MODE_HUNT] >= InpCooldownBars)
+            i - g_lastSigBarMode[MODE_HUNT] >= g_cooldown)
            {
             huntWindow = true;
             string pat = (g_spikeDir > 0 ? BullishPattern(open, high, low, close, i, atr)
@@ -1992,7 +2153,7 @@ int OnCalculate(const int rates_total,
                   double rr  = MathAbs(tp1 - entry) / risk;
                   int sc = ScoreHunt(dueness, chanPos, (g_stDir == g_spikeDir), pat, rr,
                                      g_medSpike / MathMax(drift, 1e-12));
-                  if(sc >= InpMinScore && rr >= 1.0)
+                  if(sc >= g_minScore && rr >= 1.0)
                     {
                      sigDir = g_spikeDir; sigMode = MODE_HUNT; sigScore = sc;
                      sigEntry = entry; sigSL = sl; sigTP1 = tp1; sigTP2 = tp2; sigPat = pat;
@@ -2038,7 +2199,7 @@ int OnCalculate(const int rates_total,
               }
             else
               {
-               bool dead = (!g_stZone) || (i - g_stMssBar > InpSetupExpiry) ||
+               bool dead = (!g_stZone) || (i - g_stMssBar > g_expiry) ||
                            (g_stDir > 0 && close[i] < g_stZoneLo - InpInvalidATR * atr) ||
                            (g_stDir < 0 && close[i] > g_stZoneHi + InpInvalidATR * atr);
                if(dead)
@@ -2060,7 +2221,7 @@ int OnCalculate(const int rates_total,
                   if(InpUseHtfPD && wantBuy  && htfPD > InpHtfMaxBuyPD)  ok = false;
                   if(InpUseHtfPD && wantSell && htfPD < InpHtfMinSellPD) ok = false;
                   if(!inSess) ok = false;
-                  if(i - g_lastSigBarMode[MODE_CRT] < InpCooldownBars) ok = false;
+                  if(i - g_lastSigBarMode[MODE_CRT] < g_cooldown) ok = false;
 
                   bool emaAligned = (wantBuy ? (emaF > emaS && close[i] > emaF)
                                      : (emaF < emaS && close[i] < emaF));
@@ -2090,9 +2251,9 @@ int OnCalculate(const int rates_total,
                     {
                      double entry = close[i], sl;
                      if(wantBuy)
-                        sl = MathMin(LowestOf(low, i - InpSlLookback + 1, i, rates_total), g_stZoneLo) - InpSlBufATR * atr;
+                        sl = MathMin(LowestOf(low, i - InpSlLookback + 1, i, rates_total), g_stZoneLo) - g_slBuf * atr;
                      else
-                        sl = MathMax(HighestOf(high, i - InpSlLookback + 1, i, rates_total), g_stZoneHi) + InpSlBufATR * atr;
+                        sl = MathMax(HighestOf(high, i - InpSlLookback + 1, i, rates_total), g_stZoneHi) + g_slBuf * atr;
 
                      double risk = MathAbs(entry - sl);
                      if(risk > 0.0 && (g_maxRiskATR <= 0.0 || risk <= g_maxRiskATR * atr))
@@ -2100,9 +2261,9 @@ int OnCalculate(const int rates_total,
                         double tp1, tp2;
                         if(wantBuy)
                           {
-                           tp1 = entry + risk * InpRR1;
-                           tp2 = entry + risk * InpRR2;
-                           if(InpUseLiquidityTP)
+                           tp1 = entry + risk * g_rr1;
+                           tp2 = entry + risk * g_rr2;
+                           if(g_liqTP)
                              {
                               double liq = MathMax(g_stCrtHi, HighestOf(high, i - InpLiqLookback + 1, i, rates_total));
                               if(liq > tp1) tp2 = liq;
@@ -2110,9 +2271,9 @@ int OnCalculate(const int rates_total,
                           }
                         else
                           {
-                           tp1 = entry - risk * InpRR1;
-                           tp2 = entry - risk * InpRR2;
-                           if(InpUseLiquidityTP)
+                           tp1 = entry - risk * g_rr1;
+                           tp2 = entry - risk * g_rr2;
+                           if(g_liqTP)
                              {
                               double liq = MathMin(g_stCrtLo, LowestOf(low, i - InpLiqLookback + 1, i, rates_total));
                               if(liq < tp1) tp2 = liq;
@@ -2130,13 +2291,13 @@ int OnCalculate(const int rates_total,
 
                         int sc = ScoreCRT(bias == want, mtfAgree, g_stCrtQual, pdDepth, g_stDisp,
                                           g_stZoneKind, pat, emaAligned, adx, inSess);
-                        if(sc >= InpMinScore)
+                        if(sc >= g_minScore)
                           {
                            sigDir = (wantBuy ? 1 : -1); sigMode = MODE_CRT; sigScore = sc;
                            sigEntry = entry; sigSL = sl; sigTP1 = tp1; sigTP2 = tp2; sigPat = pat;
                           }
 
-                        if(!InpMultiEntry && sc >= InpMinScore)
+                        if(!InpMultiEntry && sc >= g_minScore)
                           {
                            g_stMss = false; g_stZone = false; g_stMssLvl = 0.0; g_stZoneKind = "";
                           }
@@ -2144,6 +2305,18 @@ int OnCalculate(const int rates_total,
                     }
                  }
               }
+           }
+        }
+
+      //--- spread viability : a target the spread eats is not a signal ---
+      if(sigMode >= 0 && sigDir != 0 && g_minTpSprdX > 0.0)
+        {
+         double sprd = SpreadPrice();
+         if(sprd > 0.0 && MathAbs(sigTP1 - sigEntry) < g_minTpSprdX * sprd)
+           {
+            g_spreadReject++;
+            sigMode = -1;
+            sigDir  = 0;
            }
         }
 
