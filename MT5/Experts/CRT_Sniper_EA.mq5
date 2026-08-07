@@ -18,6 +18,13 @@
 
 #define M_SWEEP 0
 #define M_TPB   1
+#define M_SMC   2   // BOS/CHoCH -> displacement -> retest of FVG or order block
+#define M_FADE  3   // spike fade  : against the spike, with the drift
+#define M_HUNT  4   // spike hunt  : with the spike, against the drift
+
+#define ST_RANGE 0
+#define ST_BULL  1
+#define ST_BEAR  2
 
 #define TR_RANGE 0
 #define TR_UP    1
@@ -43,6 +50,36 @@ input group "=== Styles (all three can run at once) ==="
 input bool   InpScalp           = true;    // Scalp   (M5,  anchor H1)
 input bool   InpIntraday        = true;    // Intraday(M15, anchor H4)
 input bool   InpSwing           = true;    // Swing   (H4,  anchor D1)
+
+input group "=== Structure / SMC ==="
+input bool   InpUseSMC          = true;    // BOS/CHoCH -> retest of the FVG or order block
+input int    InpSwingLen        = 3;       // Swing strength (bars each side)
+input double InpDispATR         = 1.0;     // Displacement needed to call it a real break (x ATR)
+input int    InpZoneLookback    = 12;      // How far back to look for the FVG / order block
+input double InpZoneTolATR      = 0.20;    // Tolerance when price taps the zone (x ATR)
+input int    InpZoneExpiry      = 30;      // Zone stays armed for N bars
+input double InpMaxBuyPD        = 0.50;    // Buy only below this point of the dealing range
+input double InpMinSellPD       = 0.50;    // Sell only above this point of the dealing range
+input bool   InpAllowCHoCH      = true;    // Allow reversal entries on a change of character
+
+input group "=== SPIKE ENGINE (Boom / Crash / GainX / PainX) ==="
+input bool   InpUseSpike        = true;    // Enable the spike models on spike indices
+input bool   InpSpikeFade       = true;    // FADE : trade against the spike, with the drift
+input bool   InpSpikeHunt       = false;   // HUNT : trade with the spike (low win rate, big payoff)
+input double InpSpikeMult       = 5.0;     // A spike is a bar this many x the median drift range
+input int    InpDriftWin        = 50;      // Median drift-range window (bars)
+input int    InpSpikeScanBars   = 1500;    // History scanned to measure the spike rhythm
+input int    InpMinSpikes       = 5;       // Minimum spikes observed before the engine arms
+input int    InpFadeWindow      = 3;       // FADE : enter within N bars of the spike
+input double InpFadeExhaust     = 0.35;    // FADE : spike must give back this fraction
+input double InpFadeBlockDue    = 0.85;    // FADE : blocked when the next spike is this due
+input double InpFadeSlBuf       = 0.50;    // FADE : stop beyond the spike extreme (x drift)
+input double InpHuntMinDue      = 0.70;    // HUNT : minimum due-ness
+input double InpHuntMaxDue      = 2.50;    // HUNT : maximum due-ness
+input double InpHuntMaxPos      = 0.35;    // HUNT : max position in the drift channel
+input double InpHuntSlDrift     = 3.0;     // HUNT : stop distance (x drift range)
+input double InpSpikeTP1        = 0.50;    // HUNT : TP1 as a fraction of the median spike
+input double InpSpikeTP2        = 1.00;    // HUNT : TP2 as a fraction of the median spike
 
 input group "=== Signal quality ==="
 input int    InpMinScore        = 70;      // Minimum quality 0-100
@@ -127,6 +164,21 @@ struct Slot
    datetime        lastBar;
    datetime        lastSigTime;
    datetime        newsDone;      // event already traded on this slot
+
+   //--- market structure, carried forward bar to bar
+   int             stState;       // ST_RANGE / ST_BULL / ST_BEAR
+   double          swHigh, swLow;
+   int             swHighBar, swLowBar;
+   double          protLow, protHigh;   // breaking these is a CHoCH
+   double          legLo, legHi;        // the current dealing range
+   int             structBar;
+
+   //--- an armed SMC zone waiting for price to come back
+   bool            zoneOn;
+   int             zoneDir;
+   double          zoneLo, zoneHi;
+   int             zoneBar;
+   string          zoneKind;
   };
 Slot g_slot[];
 int  g_slots = 0;
@@ -171,7 +223,18 @@ string StyleName(const int s)
    return "Intraday";
   }
 
-string ModelName(const int m) { return (m == M_SWEEP ? "Liquidity sweep" : "Trend pullback"); }
+string ModelName(const int m)
+  {
+   switch(m)
+     {
+      case M_SWEEP: return "Liquidity sweep";
+      case M_TPB:   return "Trend pullback";
+      case M_SMC:   return "Structure + zone";
+      case M_FADE:  return "Spike fade";
+      case M_HUNT:  return "Spike hunt";
+     }
+   return "?";
+  }
 
 double Clamp01(const double v) { return (v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v)); }
 
@@ -462,6 +525,341 @@ int CandleStrength(const string p)
   }
 
 //+------------------------------------------------------------------+
+//| Market structure                                                 |
+//|                                                                  |
+//| Verified in tools/verify_structure_smc.py. The important idea is |
+//| the PROTECTED low: in a bull leg, breaking some minor swing low  |
+//| is only a pullback. Only the low that produced the last break of |
+//| structure counts, and breaking that is a change of character.    |
+//| Treating every fractal as structural makes the read flip on      |
+//| every pullback, which is the classic way this goes wrong.        |
+//+------------------------------------------------------------------+
+void UpdateStructure(Slot &s, const double &o[], const double &h[],
+                     const double &l[], const double &c[], const double atr,
+                     int &evType, int &evDir)
+  {
+   evType = 0;                       // 0 none, 1 BOS, 2 CHoCH
+   evDir  = 0;
+
+   //--- confirm the swing that sits InpSwingLen bars back
+   int k = 1 + InpSwingLen;
+   bool isHigh = true, isLow = true;
+   for(int j = k - InpSwingLen; j <= k + InpSwingLen; j++)
+     {
+      if(j == k) continue;
+      if(h[j] >= h[k]) isHigh = false;
+      if(l[j] <= l[k]) isLow  = false;
+     }
+   if(isHigh) { s.swHigh = h[k]; s.swHighBar = k; }
+   if(isLow)  { s.swLow  = l[k]; s.swLowBar  = k; }
+
+   //--- the dealing range extends with the leg
+   if(s.stState == ST_BULL && s.legHi > 0.0) s.legHi = MathMax(s.legHi, h[1]);
+   if(s.stState == ST_BEAR && s.legLo > 0.0) s.legLo = MathMin(s.legLo, l[1]);
+
+   double disp = InpDispATR * atr;
+
+   if(s.stState == ST_BULL)
+     {
+      if(s.protLow > 0.0 && c[1] < s.protLow)
+        {
+         evType = 2; evDir = -1;
+         s.stState = ST_BEAR;
+         s.legHi = (s.legHi > 0.0 ? s.legHi : h[1]);
+         s.legLo = l[1];
+         s.protHigh = s.legHi;
+         s.protLow = 0.0;
+         s.swLow = 0.0;
+        }
+      else
+         if(s.swHigh > 0.0 && c[1] > s.swHigh && (c[1] - s.swHigh) >= disp)
+           {
+            evType = 1; evDir = 1;
+            if(s.swLow > 0.0) { s.protLow = s.swLow; s.legLo = s.swLow; }
+            s.legHi = h[1];
+            s.swHigh = 0.0;
+           }
+     }
+   else
+      if(s.stState == ST_BEAR)
+        {
+         if(s.protHigh > 0.0 && c[1] > s.protHigh)
+           {
+            evType = 2; evDir = 1;
+            s.stState = ST_BULL;
+            s.legLo = (s.legLo > 0.0 ? s.legLo : l[1]);
+            s.legHi = h[1];
+            s.protLow = s.legLo;
+            s.protHigh = 0.0;
+            s.swHigh = 0.0;
+           }
+         else
+            if(s.swLow > 0.0 && c[1] < s.swLow && (s.swLow - c[1]) >= disp)
+              {
+               evType = 1; evDir = -1;
+               if(s.swHigh > 0.0) { s.protHigh = s.swHigh; s.legHi = s.swHigh; }
+               s.legLo = l[1];
+               s.swLow = 0.0;
+              }
+        }
+      else
+        {
+         if(s.swHigh > 0.0 && c[1] > s.swHigh && (c[1] - s.swHigh) >= disp)
+           {
+            evType = 1; evDir = 1;
+            s.stState = ST_BULL;
+            s.legLo = (s.swLow > 0.0 ? s.swLow : l[1]);
+            s.legHi = h[1];
+            s.protLow = s.legLo;
+            s.swHigh = 0.0;
+           }
+         else
+            if(s.swLow > 0.0 && c[1] < s.swLow && (s.swLow - c[1]) >= disp)
+              {
+               evType = 1; evDir = -1;
+               s.stState = ST_BEAR;
+               s.legHi = (s.swHigh > 0.0 ? s.swHigh : h[1]);
+               s.legLo = l[1];
+               s.protHigh = s.legHi;
+               s.swLow = 0.0;
+              }
+        }
+  }
+
+//--- 0 = at the origin of the leg (deep discount), 1 = at its extreme
+double RangePosition(Slot &s, const double price)
+  {
+   if(s.legHi <= 0.0 || s.legLo <= 0.0) return 0.5;
+   double span = s.legHi - s.legLo;
+   return (span > 0.0 ? (price - s.legLo) / span : 0.5);
+  }
+
+//+------------------------------------------------------------------+
+//| SMC zones : the imbalance or order block left by displacement    |
+//| Only zones price can still return to are accepted.               |
+//+------------------------------------------------------------------+
+bool FindZone(const double &o[], const double &h[], const double &l[], const double &c[],
+              const bool bullish, double &zLo, double &zHi, string &kind)
+  {
+   //--- fair value gap first: the cleanest evidence of displacement
+   for(int k = 1; k <= InpZoneLookback; k++)
+     {
+      if(k + 2 >= ArraySize(h)) break;
+      if(bullish && l[k] > h[k+2])
+        {
+         zLo = h[k+2]; zHi = l[k];
+         if(zHi <= c[1] && zHi > zLo) { kind = "FVG"; return true; }
+        }
+      if(!bullish && h[k] < l[k+2])
+        {
+         zHi = l[k+2]; zLo = h[k];
+         if(zLo >= c[1] && zHi > zLo) { kind = "FVG"; return true; }
+        }
+     }
+   //--- otherwise the last opposing candle before the impulse
+   for(int k = 2; k <= InpZoneLookback; k++)
+     {
+      if(k >= ArraySize(c)) break;
+      if(bullish && c[k] < o[k])
+        {
+         double top = MathMax(o[k], c[k]);
+         if(top <= c[1]) { zLo = l[k]; zHi = top; kind = "order block"; return true; }
+        }
+      if(!bullish && c[k] > o[k])
+        {
+         double bot = MathMin(o[k], c[k]);
+         if(bot >= c[1]) { zHi = h[k]; zLo = bot; kind = "order block"; return true; }
+        }
+     }
+   return false;
+  }
+
+//+------------------------------------------------------------------+
+//| Spike engine : measures the feed, never trusts the symbol name   |
+//+------------------------------------------------------------------+
+struct SpikeState
+  {
+   string   sym;
+   int      dir;            // +1 spikes up (Boom/GainX), -1 spikes down (Crash/PainX)
+   int      seen;
+   double   medSpike;
+   double   avgGap;
+   double   drift;
+   int      barsSince;
+   double   lastHigh, lastLow, lastRange, preClose;
+   int      lastDir;
+   datetime updated;
+  };
+SpikeState g_spike[];
+
+int SpikeIndexOf(const string sym)
+  {
+   for(int i = 0; i < ArraySize(g_spike); i++)
+      if(g_spike[i].sym == sym) return i;
+   int n = ArraySize(g_spike);
+   ArrayResize(g_spike, n + 1);
+   g_spike[n].sym = sym; g_spike[n].dir = 0; g_spike[n].seen = 0;
+   g_spike[n].medSpike = 0.0; g_spike[n].avgGap = 0.0; g_spike[n].drift = 0.0;
+   g_spike[n].barsSince = -1; g_spike[n].updated = 0;
+   return n;
+  }
+
+double MedianOf(double &a[], const int n)
+  {
+   if(n <= 0) return 0.0;
+   double tmp[];
+   ArrayResize(tmp, n);
+   ArrayCopy(tmp, a, 0, 0, n);
+   ArraySort(tmp);
+   return tmp[n / 2];
+  }
+
+//--- rebuilt from history once per bar of the measuring timeframe
+void UpdateSpikeState(const string sym, const ENUM_TIMEFRAMES tf)
+  {
+   int idx = SpikeIndexOf(sym);
+   if(TimeCurrent() - g_spike[idx].updated < PeriodSeconds(tf)) return;
+   g_spike[idx].updated = TimeCurrent();
+
+   int need = MathMin(InpSpikeScanBars, 5000);
+   double o[], h[], l[], c[];
+   ArraySetAsSeries(o, false); ArraySetAsSeries(h, false);
+   ArraySetAsSeries(l, false); ArraySetAsSeries(c, false);
+   if(CopyOpen(sym, tf, 0, need, o) < InpDriftWin + 50) return;
+   if(CopyHigh(sym, tf, 0, need, h) < InpDriftWin + 50) return;
+   if(CopyLow(sym, tf, 0, need, l)  < InpDriftWin + 50) return;
+   if(CopyClose(sym, tf, 0, need, c) < InpDriftWin + 50) return;
+   int n = ArraySize(c);
+
+   double rng[];
+   ArrayResize(rng, n);
+   for(int i = 0; i < n; i++) rng[i] = h[i] - l[i];
+
+   double sizes[], win[];
+   ArrayResize(sizes, 0);
+   ArrayResize(win, InpDriftWin);
+   int up = 0, dn = 0, gapSum = 0, gapN = 0, last = -1, lastIdx = -1;
+   double lastDrift = 0.0;
+
+   for(int i = InpDriftWin; i < n - 1; i++)
+     {
+      for(int j = 0; j < InpDriftWin; j++) win[j] = rng[i - InpDriftWin + j];
+      double drift = MedianOf(win, InpDriftWin);
+      lastDrift = drift;
+      if(drift <= 0.0) continue;
+      if(rng[i] < InpSpikeMult * drift) continue;
+
+      int d = ((h[i] - o[i]) >= (o[i] - l[i]) ? 1 : -1);
+      if(d > 0) up++; else dn++;
+      int ns = ArraySize(sizes);
+      ArrayResize(sizes, ns + 1);
+      sizes[ns] = rng[i];
+      if(last >= 0) { gapSum += (i - last); gapN++; }
+      last = i;
+      lastIdx = i;
+     }
+
+   int dir = 0;
+   if(up >= InpMinSpikes && up >= 3 * MathMax(1, dn))      dir = 1;
+   else if(dn >= InpMinSpikes && dn >= 3 * MathMax(1, up)) dir = -1;
+
+   g_spike[idx].dir      = dir;
+   g_spike[idx].seen     = up + dn;
+   g_spike[idx].medSpike = MedianOf(sizes, ArraySize(sizes));
+   g_spike[idx].avgGap   = (gapN > 0 ? (double)gapSum / gapN : 0.0);
+   g_spike[idx].drift    = lastDrift;
+   if(lastIdx >= 0)
+     {
+      g_spike[idx].barsSince = (n - 1) - lastIdx;
+      g_spike[idx].lastHigh  = h[lastIdx];
+      g_spike[idx].lastLow   = l[lastIdx];
+      g_spike[idx].lastRange = rng[lastIdx];
+      g_spike[idx].preClose  = (lastIdx > 0 ? c[lastIdx - 1] : c[lastIdx]);
+      g_spike[idx].lastDir   = ((h[lastIdx] - o[lastIdx]) >= (o[lastIdx] - l[lastIdx]) ? 1 : -1);
+     }
+   else
+      g_spike[idx].barsSince = -1;
+  }
+
+//+------------------------------------------------------------------+
+//| Spike models : FADE rides the drift, HUNT rides the spike        |
+//+------------------------------------------------------------------+
+bool SpikeSignal(Slot &s, const double &o[], const double &h[], const double &l[],
+                 const double &c[], const double atr, SigOut &out)
+  {
+   if(!InpUseSpike) return false;
+   int idx = SpikeIndexOf(s.sym);
+   SpikeState sp = g_spike[idx];
+   if(sp.dir == 0 || sp.seen < InpMinSpikes) return false;
+   if(sp.avgGap < 5.0 || sp.drift <= 0.0 || sp.medSpike <= 0.0) return false;
+   if(sp.barsSince < 0) return false;
+
+   double dueness = sp.barsSince / sp.avgGap;
+   double rr1 = StyleRR1(s.style), rr2 = StyleRR2(s.style);
+
+   //--- FADE : the spike has fired and is giving back; ride the drift home
+   if(InpSpikeFade && sp.barsSince >= 1 && sp.barsSince <= InpFadeWindow &&
+      sp.lastDir == sp.dir && dueness < InpFadeBlockDue)
+     {
+      double exhaust = (sp.dir > 0 ? (sp.lastHigh - c[1]) : (c[1] - sp.lastLow)) / sp.lastRange;
+      if(exhaust >= InpFadeExhaust)
+        {
+         int dir = -sp.dir;                       // with the drift
+         double entry = c[1];
+         double sl = (dir > 0 ? sp.lastLow - InpFadeSlBuf * sp.drift
+                      : sp.lastHigh + InpFadeSlBuf * sp.drift);
+         double risk = MathAbs(entry - sl);
+         if(risk > 0.0)
+           {
+            //--- the level the spike launched from is the natural target
+            double tp1 = (dir > 0 ? MathMax(sp.preClose, entry + risk * 1.0)
+                          : MathMin(sp.preClose, entry - risk * 1.0));
+            out.valid = true; out.dir = dir; out.model = M_FADE;
+            out.score = InpMinScore;
+            out.entry = entry; out.sl = sl; out.tp1 = tp1;
+            out.tp2 = entry + (dir > 0 ? 1.0 : -1.0) * risk * rr2;
+            out.atr = atr;
+            out.why = StringFormat("spike %d bars ago gave back %.0f%%, next spike only %.0f%% due, riding the drift",
+                                   sp.barsSince, exhaust * 100.0, dueness * 100.0);
+            return true;
+           }
+        }
+     }
+
+   //--- HUNT : a spike is overdue and price sits at the far edge of the drift
+   if(InpSpikeHunt && dueness >= InpHuntMinDue && dueness <= InpHuntMaxDue)
+     {
+      int look = MathMin(50, ArraySize(h) - 2);
+      double chHi = h[ArrayMaximum(h, 1, look)];
+      double chLo = l[ArrayMinimum(l, 1, look)];
+      double pos = (chHi > chLo ? (c[1] - chLo) / (chHi - chLo) : 0.5);
+      if(sp.dir < 0) pos = 1.0 - pos;             // Crash hunts from the top
+
+      if(pos <= InpHuntMaxPos)
+        {
+         int dir = sp.dir;                        // with the spike
+         double entry = c[1];
+         double sl = (dir > 0 ? l[ArrayMinimum(l, 1, 10)] - InpHuntSlDrift * sp.drift
+                      : h[ArrayMaximum(h, 1, 10)] + InpHuntSlDrift * sp.drift);
+         double risk = MathAbs(entry - sl);
+         double tp1 = entry + dir * InpSpikeTP1 * sp.medSpike;
+         if(risk > 0.0 && MathAbs(tp1 - entry) / risk >= 1.0)
+           {
+            out.valid = true; out.dir = dir; out.model = M_HUNT;
+            out.score = InpMinScore;
+            out.entry = entry; out.sl = sl; out.tp1 = tp1;
+            out.tp2 = entry + dir * InpSpikeTP2 * sp.medSpike;
+            out.atr = atr;
+            out.why = StringFormat("spike %.0f%% overdue, price at %.0f%% of the drift channel",
+                                   dueness * 100.0, pos * 100.0);
+            return true;
+           }
+        }
+     }
+   return false;
+  }
+
+//+------------------------------------------------------------------+
 //| The signal engine - the logic verified in verify_lite_logic.py   |
 //+------------------------------------------------------------------+
 bool Evaluate(Slot &s, SigOut &out)
@@ -496,6 +894,14 @@ bool Evaluate(Slot &s, SigOut &out)
    double hEma = hEmaArr[0], hCl = hClArr[0];
    if(hEma <= 0.0) return false;
 
+   //--- structure and the spike engine run before the trend filter, because
+   //--- a spike index has no meaningful EMA trend to agree with
+   int evType = 0, evDir = 0;
+   UpdateStructure(s, o, h, l, c, atr, evType, evDir);
+
+   UpdateSpikeState(s.sym, s.tf);
+   if(SpikeSignal(s, o, h, l, c, atr, out)) return true;
+
    int htfTrend = (hCl > hEma ? TR_UP : (hCl < hEma ? TR_DOWN : TR_RANGE));
 
    int chartTrend = TR_RANGE;
@@ -512,41 +918,94 @@ bool Evaluate(Slot &s, SigOut &out)
 
    bool buy = (trend == TR_UP);
 
-   //--- location inside the recent range
+   //--- where price sits in the recent range (used by the two simple models;
+   //--- the structure model judges location against its own dealing range)
    double rHi = h[ArrayMaximum(h, 1, InpRangeLook)];
    double rLo = l[ArrayMinimum(l, 1, InpRangeLook)];
    double loc = (rHi > rLo ? (c[1] - rLo) / (rHi - rLo) : 0.5);
-   if(buy  && loc > InpMaxBuyLoc)  return false;
-   if(!buy && loc < InpMinSellLoc) return false;
 
    string candle = (buy ? BullCandle(o, h, l, c, atr) : BearCandle(o, h, l, c, atr));
 
-   //--- model 1: sweep of the prior 20-bar extreme, then reclaim
    int    model = -1;
    double trig  = 0.0;
+   double locDepth = 0.0;
    string trigTxt = "";
 
-   double lvl = (buy ? l[ArrayMinimum(l, 2, 20)] : h[ArrayMaximum(h, 2, 20)]);
-   double pen = (buy ? lvl - l[1] : h[1] - lvl);
-   bool swept = (buy ? (l[1] < lvl && c[1] > lvl) : (h[1] > lvl && c[1] < lvl));
-   if(swept && pen >= 0.15 * atr)
+   //--- Zones are armed on EVERY structural break, before any model can claim
+   //--- the bar. Arming inside a model branch means a break that happens to
+   //--- coincide with another signal is lost and never retested.
+   if(InpUseSMC)
      {
-      model = M_SWEEP;
-      trig  = Clamp01(pen / (0.8 * atr));
-      trigTxt = StringFormat("swept the %s at %s", (buy ? "low" : "high"),
-                             DoubleToString(lvl, (int)SymbolInfoInteger(s.sym, SYMBOL_DIGITS)));
+      bool wantEv = (evType == 1) || (evType == 2 && InpAllowCHoCH);
+      if(wantEv)
+        {
+         bool evBuy = (evDir > 0);
+         double zl = 0.0, zh = 0.0;
+         string kd = "";
+         if(FindZone(o, h, l, c, evBuy, zl, zh, kd))
+           {
+            s.zoneOn = true; s.zoneDir = evDir;
+            s.zoneLo = zl; s.zoneHi = zh; s.zoneBar = 0; s.zoneKind = kd;
+            s.structBar = (evType == 2 ? 2 : 1);
+           }
+        }
+      else
+         if(s.zoneOn) s.zoneBar++;
+      if(s.zoneOn && s.zoneBar > InpZoneExpiry) s.zoneOn = false;
      }
 
-   //--- model 2: pullback into EMA 50 while trending
+   //--- model 1: structure break, then a retest of the imbalance it left
+   if(InpUseSMC && s.zoneOn && s.zoneBar > 0 && s.zoneDir == (buy ? 1 : -1))
+     {
+      double tol = InpZoneTolATR * atr;
+      bool tapped = (buy ? (l[1] <= s.zoneHi + tol && c[1] > s.zoneLo)
+                     : (h[1] >= s.zoneLo - tol && c[1] < s.zoneHi));
+      double pd = RangePosition(s, c[1]);
+      bool located = (buy ? pd <= InpMaxBuyPD : pd >= InpMinSellPD);
+      if(tapped && located)
+        {
+         model = M_SMC;
+         trig  = Clamp01(1.0 - MathAbs(c[1] - (buy ? s.zoneHi : s.zoneLo)) / MathMax(tol, 1e-9));
+         locDepth = (buy ? Clamp01((InpMaxBuyPD - pd) / MathMax(InpMaxBuyPD, 0.01))
+                     : Clamp01((pd - InpMinSellPD) / MathMax(1.0 - InpMinSellPD, 0.01)));
+         trigTxt = StringFormat("%s then %s retest, %s of the leg",
+                                (s.structBar == 2 ? "CHoCH" : "BOS"), s.zoneKind,
+                                (pd < 0.5 ? "discount" : "premium"));
+         s.zoneOn = false;
+        }
+     }
+
+   //--- the two simple models are judged against the plain range instead
    if(model < 0)
      {
-      bool touch = (buy ? (l[1] <= fast[1] && c[1] > fast[1])
-                    : (h[1] >= fast[1] && c[1] < fast[1]));
-      if(touch)
+      if(buy  && loc > InpMaxBuyLoc)  return false;
+      if(!buy && loc < InpMinSellLoc) return false;
+      locDepth = (buy ? Clamp01((InpMaxBuyLoc - loc) / MathMax(InpMaxBuyLoc, 0.01))
+                  : Clamp01((loc - InpMinSellLoc) / MathMax(1.0 - InpMinSellLoc, 0.01)));
+
+      //--- model 2: sweep of the prior 20-bar extreme, then reclaim
+      double lvl = (buy ? l[ArrayMinimum(l, 2, 20)] : h[ArrayMaximum(h, 2, 20)]);
+      double pen = (buy ? lvl - l[1] : h[1] - lvl);
+      bool swept = (buy ? (l[1] < lvl && c[1] > lvl) : (h[1] > lvl && c[1] < lvl));
+      if(swept && pen >= 0.15 * atr)
         {
-         model = M_TPB;
-         trig  = Clamp01(MathAbs(fast[1] - slow[1]) / (1.5 * atr));
-         trigTxt = StringFormat("pullback into EMA %d", InpEmaFast);
+         model = M_SWEEP;
+         trig  = Clamp01(pen / (0.8 * atr));
+         trigTxt = StringFormat("swept the %s at %s", (buy ? "low" : "high"),
+                                DoubleToString(lvl, (int)SymbolInfoInteger(s.sym, SYMBOL_DIGITS)));
+        }
+
+      //--- model 3: pullback into EMA 50 while trending
+      if(model < 0)
+        {
+         bool touch = (buy ? (l[1] <= fast[1] && c[1] > fast[1])
+                       : (h[1] >= fast[1] && c[1] < fast[1]));
+         if(touch)
+           {
+            model = M_TPB;
+            trig  = Clamp01(MathAbs(fast[1] - slow[1]) / (1.5 * atr));
+            trigTxt = StringFormat("pullback into EMA %d", InpEmaFast);
+           }
         }
      }
 
@@ -564,8 +1023,6 @@ bool Evaluate(Slot &s, SigOut &out)
    double tp1 = entry + (buy ? 1.0 : -1.0) * risk * rr1;
    double tp2 = entry + (buy ? 1.0 : -1.0) * risk * rr2;
 
-   double locDepth = (buy ? Clamp01((InpMaxBuyLoc - loc) / MathMax(InpMaxBuyLoc, 0.01))
-                      : Clamp01((loc - InpMinSellLoc) / MathMax(1.0 - InpMinSellLoc, 0.01)));
    double sepQ  = Clamp01(MathAbs(fast[1] - slow[1]) / (1.2 * atr));
    double htfQ  = Clamp01(MathAbs(hCl - hEma) / MathMax(MathAbs(hEma) * 0.004, 1e-9));
    double trendQ = 0.6 * sepQ + 0.4 * htfQ;
@@ -1175,6 +1632,12 @@ void BuildSlots()
          s.lastBar = 0;
          s.lastSigTime = 0;
          s.newsDone = 0;
+         s.stState = ST_RANGE;
+         s.swHigh = 0.0; s.swLow = 0.0; s.swHighBar = -1; s.swLowBar = -1;
+         s.protLow = 0.0; s.protHigh = 0.0;
+         s.legLo = 0.0; s.legHi = 0.0; s.structBar = -1;
+         s.zoneOn = false; s.zoneDir = 0; s.zoneLo = 0.0; s.zoneHi = 0.0;
+         s.zoneBar = -1; s.zoneKind = "";
          if(s.hFast == INVALID_HANDLE || s.hSlow == INVALID_HANDLE ||
             s.hAtr == INVALID_HANDLE || s.hHtfEma == INVALID_HANDLE)
             continue;

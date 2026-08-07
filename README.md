@@ -698,6 +698,71 @@ Reads the real MT5 economic calendar for every currency in your symbol universe.
 
 News trading is off by default, and it carries the worst slippage of anything here.
 
+## Structure, SMC and the spike engine
+
+Three layers were added on top of the two original models. All of it is verified in
+`tools/verify_structure_smc.py` before it reaches the EA.
+
+### Market structure — BOS and CHoCH
+
+The EA tracks swings and classifies every break:
+
+- **BOS** (break of structure) — price continues the prevailing direction.
+- **CHoCH** (change of character) — price breaks the *other* side first, the
+  earliest sign the leg is finished.
+
+The idea that makes this work is the **protected low** (or high). In a bullish leg,
+price breaking some minor swing low is only a pullback. Only the low that produced
+the last break of structure is protected, and breaking *that* is a CHoCH.
+
+This mattered: the first implementation treated every fractal as structural and
+**flipped direction on every pullback** — 4 of 7 breaks in a clean uptrend were
+labelled bearish. With protected swings it reads 10 of 11 correctly, and the
+reversal test produces exactly one CHoCH, at the turn.
+
+### SMC entries — displacement, then the imbalance
+
+On a structural break the EA looks for what the move left behind:
+
+1. **Fair value gap** — a three-candle imbalance where price moved too fast to trade
+   back. Preferred, because it is direct evidence of displacement.
+2. **Order block** — the last opposing candle before the impulse, used when there is
+   no gap.
+
+Only zones price can still *return to* are armed. A second bug caught in testing:
+returning the nearest opposing candle regardless of side handed back zones price had
+already passed, which can never be retested.
+
+Entry is the retest of that zone, and it must be in **discount** of the dealing range
+for a buy, **premium** for a sell. The dealing range is the current leg — swing low
+to swing high — and it resets on every BOS. Anchoring it to the start of the whole
+trend was a third bug: every pullback read as premium and no buy could ever qualify.
+
+Zones are armed on **every** structural break, before any model claims the bar. Arming
+inside a model branch loses breaks that coincide with another signal.
+
+### Spike engine — Boom, Crash, GainX, PainX
+
+Ported from Pro and now measured rather than assumed. On each symbol the EA scans
+history and works out the spike direction, the median spike size, and the average
+interval between spikes. Verification against synthetic Boom and Crash feeds:
+direction correct both ways, interval measured at 60.0 bars against a true 60, median
+size 6.15 against a true 6.0, and an ordinary trending market correctly **not**
+classified as a spike index.
+
+| Model | Direction | Fires when |
+| --- | --- | --- |
+| **FADE** | with the drift, against the spike | a spike has printed and given back ≥35% of its range, and the next one is not due |
+| **HUNT** | with the spike, against the drift | a spike is 70–250% overdue and price sits at the far edge of the drift channel |
+
+On Boom, FADE sells the spike and rides the drift down; HUNT buys ahead of the next
+spike. Mirrored on Crash. The spike models run **before** the trend filter, because a
+spike index has no meaningful EMA trend for the models to agree with.
+
+**HUNT is off by default.** Its premise is that spikes become "due", which only holds
+if the interval is regular rather than memoryless. FADE is the higher-probability
+side and is on.
+
 ## The smallest account that can actually trade
 
 The broker's **minimum lot is a hard floor**. Below a certain equity the smallest
