@@ -590,3 +590,122 @@ Three real bugs were found and fixed this way:
 
 This proves the rules behave as described. It does **not** prove they are profitable
 — that still needs your broker's data.
+
+---
+
+# CRT Sniper EA
+
+`MT5/Experts/CRT_Sniper_EA.mq5`
+
+An expert advisor built on the **verified** Lite signal engine — the same two
+models, the same trend and location gates, the same scoring. Nothing new was
+invented for the EA; what was added is everything around the entry.
+
+**Trading is OFF by default.** `Enable live trading` starts at `false`. Until you
+turn it on the EA runs in monitor mode: it evaluates every slot, logs what it would
+have done and why, and sends no orders. Leave it there until you have watched it on
+demo for a few weeks.
+
+## Scalp, intraday and swing at the same time
+
+Each symbol gets up to three independent slots, each with its own timeframe, anchor
+and reward profile:
+
+| Style | Chart | Anchor | TP1 / TP2 |
+| --- | --- | --- | --- |
+| Scalp | M5 | H1 | 1.2R / 2.0R |
+| Intraday | M15 | H4 | 2.0R / 3.0R |
+| Swing | H4 | D1 | 2.5R / 5.0R |
+
+A scalp cannot wait for 3R and a swing should not settle for 1.2R, so the targets
+move with the horizon rather than being one setting for all three.
+
+## Which symbols
+
+By default it trades **everything in your Market Watch**, capped at `Max symbols`
+(12) to protect both CPU and exposure. Symbols the account cannot actually trade
+(disabled, close-only) are skipped automatically. You can supply an explicit list
+instead, or an exclusion list.
+
+## Position sizing — verified, not assumed
+
+`tools/verify_risk_math.py` checks the sizing against cases worked out by hand.
+Three results worth knowing:
+
+- **Rounding can only ever reduce risk.** Across 400 sizes the worst overshoot was
+  exactly 0. Lots always round *down* to the broker's step.
+- **Cent accounts are read at real value.** A balance of 50,000 on a cent account is
+  $500, not $50,000. Without that division a small cent account lands in the lowest
+  risk tier and trades far too large. This is the single most dangerous bug for the
+  accounts you described, and it is tested.
+- **An account too small for an instrument is refused, not forced.** $2 of risk on
+  US30 needs 0.044 lots against a 0.1 minimum, so the EA declines rather than taking
+  five times the intended risk at minimum size.
+
+### Risk falls as the account grows
+
+| Equity (real) | Risk per trade |
+| --- | --- |
+| under $200 | 2.0% |
+| under $1,000 | 1.5% |
+| under $10,000 | 1.0% |
+| above | 0.75% |
+
+Small accounts get more aggression because the absolute loss is small and growth
+needs compounding. Large accounts get less because preservation matters more than
+speed. There is a hard ceiling of 2% per trade regardless of tier.
+
+## The honest part about "grow fast with low drawdown"
+
+Those are the same dial turned in opposite directions. Risk 5% a trade and you can
+double an account in a good month and halve it in a bad week. Risk 0.5% and neither
+happens. No code resolves that trade-off — it only decides where you sit on it.
+
+What the EA does instead is make the downside *bounded and automatic*:
+
+- **Total live risk cap** (4%) across all open positions. A position whose stop has
+  moved to breakeven stops counting toward it, which is what frees room for the next
+  trade — this is tested in the verifier.
+- **Daily loss halt** (3%) — stops opening for the rest of the day.
+- **Drawdown halt** (12% from peak equity) — stops entirely and alerts you.
+- **Max 6 concurrent positions**, max 2 per symbol.
+- **Spread gate** — skips when spread exceeds 25% of ATR.
+
+## Trade management, and the reasoning
+
+| Stage | Trigger | Why |
+| --- | --- | --- |
+| **Breakeven** | +1.0R | Removes the risk once the trade has proved itself. Locks 0.1R so it is a small win, not a scratch. |
+| **Partial** | +2.0R, close 50% | Banks real money at the level most trades reach, leaves the rest to run. Stamped in the comment so it can never fire twice. |
+| **Trail** | after the partial, 1.5× ATR | Only follows in the winning direction, never retreats — verified. |
+| **Time stop** | optional, off by default | Capital stuck in a trade going nowhere is capital not working. |
+| **Scale-in** | first trade ≥ +1R | Adds **half size**, never a full second bet, never against an open trade, and never if it would breach the 4% cap. |
+
+Scaling in is how the account grows faster without raising per-trade risk: you add
+only to positions the market has already confirmed, funded by risk the first trade
+has already released by moving to breakeven.
+
+## News — avoid it and trade it
+
+Reads the real MT5 economic calendar for every currency in your symbol universe.
+
+- **Avoid:** no new trades from 30 minutes before to 30 minutes after a high-impact
+  release. Optionally closes open trades before one.
+- **Trade:** with `Trade the release` on, it marks the 30-minute pre-news range, waits
+  2 minutes after the print, and takes a break of that range by more than 1 ATR. Stop
+  goes on the far side of the range. One trade per event per slot. This is the only
+  model allowed to fire inside a blackout.
+
+News trading is off by default, and it carries the worst slippage of anything here.
+
+## Before you run it
+
+1. Compile in MetaEditor (**F7**).
+2. Attach to **one** chart — it manages every symbol from there. Enable AutoTrading.
+3. Leave `Enable live trading` **false**. Watch the log and the panel for a week.
+4. Move to a demo account with the same balance you plan to trade.
+5. Only then consider going live, and start at the smallest size your broker allows.
+
+The signal logic is verified. The money math is verified. **The profitability is
+not** — no backtest has been run on real data. The EA will do exactly what it is
+told, faithfully, on rules whose edge is still unproven.
