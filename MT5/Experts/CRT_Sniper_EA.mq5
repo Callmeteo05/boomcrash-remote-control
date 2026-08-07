@@ -21,6 +21,13 @@
 #define M_SMC   2   // BOS/CHoCH -> displacement -> retest of FVG or order block
 #define M_FADE  3   // spike fade  : against the spike, with the drift
 #define M_HUNT  4   // spike hunt  : with the spike, against the drift
+#define M_ASIA  5   // Judas swing : London sweeps the Asian range and reclaims it
+#define M_NREV  6   // news reversal : the release spikes out and fails back in
+
+#define SESS_OFF 0
+#define SESS_ASIA 1
+#define SESS_LON  2
+#define SESS_NY   3
 
 #define ST_RANGE 0
 #define ST_BULL  1
@@ -128,6 +135,25 @@ input bool   InpAllowScaleIn    = true;    // Add to a winner
 input double InpScaleInAfterR   = 1.0;     // Only once the first trade is this far ahead
 input int    InpMaxScaleIns     = 1;       // Max additions per symbol
 
+input group "=== Sessions (killzones, in GMT) ==="
+input bool   InpUseSessions    = true;    // Only trade inside the selected killzones
+input bool   InpSessScalp      = true;    // Apply the filter to scalp signals
+input bool   InpSessIntraday   = true;    // Apply the filter to intraday signals
+input bool   InpSessSwing      = false;   // Apply it to swing too (an H4 bar spans sessions)
+input int    InpGmtOverride    = 99;      // Server GMT offset, 99 = detect automatically
+input bool   InpAsiaOn         = false;   // Trade the Asian session itself
+input int    InpAsiaStart      = 0;       // Asia start (GMT hour)
+input int    InpAsiaEnd        = 6;       // Asia end (GMT hour)
+input bool   InpLondonOn       = true;    // Trade London
+input int    InpLonStart       = 7;       // London start (GMT hour)
+input int    InpLonEnd         = 12;      // London end (GMT hour)
+input bool   InpNYOn           = true;    // Trade New York
+input int    InpNYStart        = 12;      // New York start (GMT hour)
+input int    InpNYEnd          = 17;      // New York end (GMT hour)
+input bool   InpUseJudas       = true;    // Asian range sweep model (Judas swing)
+input int    InpJudasStart     = 7;       // Judas hunt window start (GMT hour)
+input int    InpJudasEnd       = 12;      // Judas hunt window end (GMT hour)
+
 input group "=== News ==="
 input bool   InpUseNews         = true;    // Use the MT5 economic calendar
 input bool   InpNewsHighOnly    = true;    // High impact only
@@ -139,6 +165,8 @@ input int    InpNewsPreRange    = 30;      // Pre-news range length (minutes)
 input int    InpNewsDelay       = 2;       // Wait this long after the release (minutes)
 input int    InpNewsWindow      = 60;      // News models stay live this long (minutes)
 input double InpNewsDispATR     = 1.0;     // Breakout must clear the range by this (x ATR)
+input bool   InpNewsReversal    = true;    // Also trade the release that spikes out and fails back
+input double InpNewsSpikeATR    = 1.5;     // Reversal : excursion beyond the range (x ATR)
 
 input group "=== Account capability ==="
 input bool   InpAffordableOnly  = true;    // Skip symbols the account is too small to size properly
@@ -232,6 +260,8 @@ string ModelName(const int m)
       case M_SMC:   return "Structure + zone";
       case M_FADE:  return "Spike fade";
       case M_HUNT:  return "Spike hunt";
+      case M_ASIA:  return "Asian sweep";
+      case M_NREV:  return "News reversal";
      }
    return "?";
   }
@@ -522,6 +552,94 @@ int CandleStrength(const string p)
    if(p == "rejection wick")                                return 12;
    if(p == "momentum close")                                return 10;
    return 0;
+  }
+
+//+------------------------------------------------------------------+
+//| Sessions                                                         |
+//|                                                                  |
+//| Verified in tools/verify_sessions_news.py. Broker servers are    |
+//| rarely on GMT - GMT+2 and GMT+3 are the usual offsets - so bar   |
+//| times must be converted or every killzone lands on the wrong     |
+//| hours and the filter silently blocks the sessions it should let  |
+//| through. The offset is measured, not asked for.                  |
+//+------------------------------------------------------------------+
+int g_gmtOffset = 0;
+
+void UpdateGmtOffset()
+  {
+   if(InpGmtOverride != 99) { g_gmtOffset = InpGmtOverride; return; }
+   g_gmtOffset = (int)MathRound((double)(TimeCurrent() - TimeGMT()) / 3600.0);
+  }
+
+int GmtHourOf(const datetime serverTime)
+  {
+   MqlDateTime dt;
+   TimeToStruct(serverTime, dt);
+   return ((dt.hour - g_gmtOffset) % 24 + 24) % 24;
+  }
+
+int SessionOf(const datetime t)
+  {
+   int g = GmtHourOf(t);
+   if(g >= InpAsiaStart && g < InpAsiaEnd) return SESS_ASIA;
+   if(g >= InpLonStart  && g < InpLonEnd)  return SESS_LON;
+   if(g >= InpNYStart   && g < InpNYEnd)   return SESS_NY;
+   return SESS_OFF;
+  }
+
+string SessionName(const int x)
+  {
+   if(x == SESS_ASIA) return "ASIA";
+   if(x == SESS_LON)  return "LONDON";
+   if(x == SESS_NY)   return "NEW YORK";
+   return "OFF-SESSION";
+  }
+
+bool SessionAllows(const int style, const datetime t)
+  {
+   if(!InpUseSessions) return true;
+   if(style == STY_SCALP && !InpSessScalp)    return true;
+   if(style == STY_INTRA && !InpSessIntraday) return true;
+   if(style == STY_SWING && !InpSessSwing)    return true;
+
+   int x = SessionOf(t);
+   if(x == SESS_ASIA) return InpAsiaOn;
+   if(x == SESS_LON)  return InpLondonOn;
+   if(x == SESS_NY)   return InpNYOn;
+   return false;
+  }
+
+//--- today's Asian range, read straight from the bars rather than accumulated,
+//--- so a restart mid-session never loses it
+bool AsianRange(const string sym, const ENUM_TIMEFRAMES tf, double &hi, double &lo)
+  {
+   hi = 0.0; lo = 0.0;
+   int need = (int)(24 * 3600 / MathMax(PeriodSeconds(tf), 60)) + 10;
+   need = MathMin(need, 600);
+
+   datetime tm[];
+   double hh[], ll[];
+   ArraySetAsSeries(tm, true); ArraySetAsSeries(hh, true); ArraySetAsSeries(ll, true);
+   if(CopyTime(sym, tf, 0, need, tm) < 10) return false;
+   if(CopyHigh(sym, tf, 0, need, hh) < 10) return false;
+   if(CopyLow(sym, tf, 0, need, ll) < 10)  return false;
+
+   MqlDateTime nowDt;
+   TimeToStruct(tm[0], nowDt);
+   int today = nowDt.day_of_year;
+   bool any = false;
+
+   for(int i = 1; i < ArraySize(tm); i++)
+     {
+      MqlDateTime dt;
+      TimeToStruct(tm[i], dt);
+      if(dt.day_of_year != today) break;          // only today's session
+      int g = GmtHourOf(tm[i]);
+      if(g < InpAsiaStart || g >= InpAsiaEnd) continue;
+      if(!any) { hi = hh[i]; lo = ll[i]; any = true; }
+      else     { hi = MathMax(hi, hh[i]); lo = MathMin(lo, ll[i]); }
+     }
+   return (any && hi > lo);
   }
 
 //+------------------------------------------------------------------+
@@ -975,6 +1093,32 @@ bool Evaluate(Slot &s, SigOut &out)
         }
      }
 
+   //--- model 4: London sweeps the Asian range and reclaims it (Judas swing)
+   if(InpUseJudas && model < 0 && s.style != STY_SWING)
+     {
+      int gh = GmtHourOf(iTime(s.sym, s.tf, 1));
+      if(gh >= InpJudasStart && gh < InpJudasEnd)
+        {
+         double aHi = 0.0, aLo = 0.0;
+         if(AsianRange(s.sym, s.tf, aHi, aLo))
+           {
+            bool sweptLo = (buy  && l[1] < aLo && c[1] > aLo);
+            bool sweptHi = (!buy && h[1] > aHi && c[1] < aHi);
+            if(sweptLo || sweptHi)
+              {
+               model = M_ASIA;
+               double depth = (buy ? (aLo - l[1]) : (h[1] - aHi));
+               trig = Clamp01(depth / MathMax(0.8 * atr, 1e-9));
+               locDepth = 0.75;
+               trigTxt = StringFormat("London swept the Asian %s at %s and reclaimed it",
+                                      (buy ? "low" : "high"),
+                                      DoubleToString((buy ? aLo : aHi),
+                                                     (int)SymbolInfoInteger(s.sym, SYMBOL_DIGITS)));
+              }
+           }
+        }
+     }
+
    //--- the two simple models are judged against the plain range instead
    if(model < 0)
      {
@@ -1102,8 +1246,59 @@ bool NewsBreakout(Slot &s, SigOut &out)
    double atr = atrb[1];
    if(atr <= 0.0 || preHi <= preLo) return false;
 
+   //--- how far the release pushed beyond the range in each direction
+   int postFrom = iBarShift(s.sym, s.tf, T, false);
+   double postHi = preHi, postLo = preLo;
+   if(postFrom >= 1)
+     {
+      int pc = postFrom;
+      double ph[], pl[];
+      ArraySetAsSeries(ph, true); ArraySetAsSeries(pl, true);
+      if(CopyHigh(s.sym, s.tf, 1, pc, ph) == pc && CopyLow(s.sym, s.tf, 1, pc, pl) == pc)
+        {
+         postHi = ph[ArrayMaximum(ph, 0, pc)];
+         postLo = pl[ArrayMinimum(pl, 0, pc)];
+        }
+     }
+
    bool up   = (c[1] > preHi + InpNewsDispATR * atr);
    bool down = (c[1] < preLo - InpNewsDispATR * atr);
+
+   //--- reversal : the spike failed and price is back INSIDE the range.
+   //--- Requiring "inside" is what keeps this from firing against a live
+   //--- breakout; without it the two models contradict each other.
+   if(!up && !down && InpNewsReversal && c[1] > preLo && c[1] < preHi)
+     {
+      double upEx = postHi - preHi;
+      double dnEx = preLo - postLo;
+      int rdir = 0;
+      if(upEx >= InpNewsSpikeATR * atr && upEx >= dnEx)      rdir = -1;
+      else if(dnEx >= InpNewsSpikeATR * atr && dnEx > upEx)  rdir = 1;
+
+      if(rdir != 0)
+        {
+         double rEntry = c[1];
+         double rSl = (rdir > 0 ? postLo - 0.2 * atr : postHi + 0.2 * atr);
+         double rRisk = MathAbs(rEntry - rSl);
+         if(rRisk > 0.0)
+           {
+            //--- the far side of the pre-news range is the natural target
+            double rTp1 = (rdir > 0 ? preHi : preLo);
+            if(MathAbs(rTp1 - rEntry) / rRisk < 0.8)
+               rTp1 = rEntry + rdir * rRisk * StyleRR1(s.style);
+            out.valid = true; out.dir = rdir; out.model = M_NREV;
+            out.score = InpMinScore;
+            out.entry = rEntry; out.sl = rSl; out.tp1 = rTp1;
+            out.tp2 = rEntry + rdir * rRisk * StyleRR2(s.style);
+            out.atr = atr;
+            out.why = StringFormat("release spiked %.1f x ATR out of the pre-news range and failed back inside",
+                                   MathMax(upEx, dnEx) / MathMax(atr, 1e-9));
+            s.newsDone = T;
+            return true;
+           }
+        }
+     }
+
    if(!up && !down) return false;
 
    double entry = c[1];
@@ -1696,6 +1891,9 @@ void DrawPanel()
    PanelRow(r++, StringFormat("Open trades : %d / %d", CountPositions(), InpMaxTrades), clrGainsboro);
    PanelRow(r++, StringFormat("Affordable  : %d symbols sizeable at %.2f%% risk", g_affordable, riskPct),
             (g_affordable > 0 ? clrGainsboro : clrOrangeRed));
+   int sNow = SessionOf(TimeCurrent());
+   PanelRow(r++, StringFormat("Session     : %s   (server is GMT%+d)", SessionName(sNow), g_gmtOffset),
+            (sNow == SESS_OFF ? clrGoldenrod : clrAqua));
    PanelRow(r++, StringFormat("Day P/L     : %+.2f%%   (halt at -%.1f%%)", dayPL, InpMaxDailyLossPct),
             (dayPL >= 0.0 ? clrLimeGreen : clrOrangeRed));
    PanelRow(r++, StringFormat("Drawdown    : %.2f%%   (halt at %.1f%%)", dd, InpMaxDrawdownPct),
@@ -1737,6 +1935,7 @@ int OnInit()
    g_peakEq = AccountInfoDouble(ACCOUNT_EQUITY);
    g_dayStartEq = g_peakEq;
 
+   UpdateGmtOffset();
    BuildSlots();
    if(g_slots == 0)
      {
@@ -1771,6 +1970,7 @@ void OnTimer()
 
 void OnTick()
   {
+   UpdateGmtOffset();
    UpdateAccountGuards();
    ManagePositions();
    CloseBeforeNews();
@@ -1801,6 +2001,9 @@ void OnTick()
       if(g_slot[i].lastSigTime > 0 && (bt - g_slot[i].lastSigTime) < cdSec) continue;
 
       if(!SpreadOk(g_slot[i].sym, sig.atr)) continue;
+      //--- news and spike models set their own timing, so they bypass killzones
+      bool timingOwn = (sig.model == M_NREV || sig.model == M_FADE || sig.model == M_HUNT);
+      if(!timingOwn && !SessionAllows(g_slot[i].style, TimeCurrent())) continue;
 
       //--- monitor-only mode still reports what it would have done
       if(!canOpen)

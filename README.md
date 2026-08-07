@@ -763,6 +763,49 @@ spike index has no meaningful EMA trend for the models to agree with.
 if the interval is regular rather than memoryless. FADE is the higher-probability
 side and is on.
 
+## Sessions and news in the EA
+
+### Killzones, with the broker clock solved
+
+Broker servers are rarely on GMT — GMT+2 and GMT+3 are the usual offsets. A killzone
+computed from raw bar times lands on the wrong hours and **silently blocks the
+sessions it was meant to allow**. The EA measures the offset instead of asking for it
+(`TimeCurrent() − TimeGMT()`), and the panel shows what it detected.
+
+Verified: a GMT+3 server showing 10:00 correctly resolves to 07:00 GMT — London open.
+The same 10:00 reads London on GMT+0 and Asia on GMT+8.
+
+| Session | GMT | Default |
+| --- | --- | --- |
+| Asia | 00:00–06:00 | off |
+| London | 07:00–12:00 | on |
+| New York | 12:00–17:00 | on |
+
+The filter is **per style**: on for scalp and intraday, off for swing, because an H4
+bar spans several sessions and filtering it by the hour of its close is meaningless.
+
+### Asian range sweep (Judas swing)
+
+During London, if price sweeps the Asian session low and closes back above it — with
+the higher timeframe bullish — that is a Judas swing and the EA buys the reclaim.
+Mirrored for sells. The Asian range is read straight from the bars each time rather
+than accumulated, so restarting the EA mid-session never loses it.
+
+### News reversal
+
+The EA already traded the pre-news range breakout. It now also trades the release
+that **spikes out and fails back in** — the classic whipsaw.
+
+Testing caught a real conflict here: the reversal originally only asked "did price
+spike out", so a two-sided whipsaw fired **both** models at once. The reversal now
+requires price to actually be back **inside** the range, which makes the two mutually
+exclusive by construction — breakout needs price outside, reversal needs it inside.
+Verified across 26 closing prices with zero conflicts. When a release whipsaws both
+ways, the larger excursion is the one that failed, so that is the side faded.
+
+News and spike models **bypass the killzone filter** — they carry their own timing.
+An NFP print does not care whether it lands inside your London window.
+
 ## The smallest account that can actually trade
 
 The broker's **minimum lot is a hard floor**. Below a certain equity the smallest
