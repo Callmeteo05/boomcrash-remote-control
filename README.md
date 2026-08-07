@@ -671,6 +671,36 @@ What the EA does instead is make the downside *bounded and automatic*:
 - **Max 6 concurrent positions**, max 2 per symbol.
 - **Spread gate** — skips when spread exceeds 25% of ATR.
 
+## Position registry — why management needs its own memory
+
+An open position carries no memory of how it was opened. MT5 has no writable
+per-position storage, and a comment cannot be edited after the fact. Everything
+management needs — the **original** stop distance, the style, whether a partial has
+already been taken — must be tracked by the EA itself.
+
+The first version didn't, and auditing it for this produced four real bugs:
+
+1. **The partial was taken repeatedly.** The "already taken" flag was looked for in
+   the position comment, which never contained it. At 2R the EA banked 50%, then 50%
+   of the remainder on the next tick, and again — **slicing the position down to the
+   volume minimum**.
+2. **R was wrong for two styles out of three.** After breakeven the original stop
+   distance is gone, so it was rebuilt from the target using one hardcoded reward
+   multiple. Measured: a **swing trade used risk 8.33 instead of 5.00, a 67% error**;
+   a scalp was 33% out. Every downstream trigger — partial, trail, time stop — fired
+   at the wrong price.
+3. **The trail used a fixed M15 ATR** regardless of style, so an H4 swing was trailed
+   with a scalper's stop — 4.50 tighter in the test case, which is noise-stopped.
+4. **Scale-in had the same defect.** It measured R from the *live* stop, so a trade
+   sitting at breakeven read roughly ten times further ahead than it was, and added
+   far too early.
+
+All four are fixed by a registry keyed on ticket, and verified in
+`tools/verify_trade_mgmt.py`. Positions that survive an EA restart are adopted, with
+the style read back from the comment and the risk distance recovered from the target
+using the **correct** style. The one thing a restart cannot recover is whether a
+partial was already taken, so that is logged rather than assumed.
+
 ## Trade management, and the reasoning
 
 | Stage | Trigger | Why |

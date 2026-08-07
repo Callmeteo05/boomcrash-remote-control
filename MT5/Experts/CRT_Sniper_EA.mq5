@@ -1591,6 +1591,7 @@ bool OpenTrade(Slot &s, SigOut &sig, const bool isScaleIn)
      }
 
    g_opened++;
+   RegisterPositions(false);
    g_lastAction = StringFormat("%s %s %.2f lots @ %s  risk %.2f (%.2f%%)  %s",
                                (sig.dir > 0 ? "BUY" : "SELL"), sym, lots,
                                DoubleToString(price, digits), riskMoney, riskPct, sig.why);
@@ -1599,16 +1600,122 @@ bool OpenTrade(Slot &s, SigOut &sig, const bool isScaleIn)
   }
 
 //+------------------------------------------------------------------+
+//| Position metadata                                                |
+//|                                                                  |
+//| An open position carries no memory of how it was opened. MT5 has |
+//| no writable per-position storage and a comment cannot be edited  |
+//| after the fact, so the EA keeps its own registry. Without it:    |
+//|   - the partial-taken flag has nowhere to live and the position  |
+//|     is sliced again on every tick down to the volume minimum     |
+//|   - R has to be guessed from the target using some fixed reward  |
+//|     multiple, which is wrong for every style but one             |
+//|   - the trail cannot know which timeframe the trade belongs to   |
+//| Verified in tools/verify_trade_mgmt.py.                          |
+//+------------------------------------------------------------------+
+struct TradeMeta
+  {
+   ulong    ticket;
+   int      style;
+   double   riskDist;        // the ORIGINAL stop distance, never updated
+   bool     beDone;
+   bool     partialDone;
+  };
+TradeMeta g_meta[];
+
+int MetaIndex(const ulong ticket)
+  {
+   for(int i = 0; i < ArraySize(g_meta); i++)
+      if(g_meta[i].ticket == ticket) return i;
+   return -1;
+  }
+
+void MetaAdd(const ulong ticket, const int style, const double riskDist,
+             const bool beDone, const bool partialDone)
+  {
+   if(MetaIndex(ticket) >= 0 || riskDist <= 0.0) return;
+   int n = ArraySize(g_meta);
+   ArrayResize(g_meta, n + 1);
+   g_meta[n].ticket = ticket;
+   g_meta[n].style = style;
+   g_meta[n].riskDist = riskDist;
+   g_meta[n].beDone = beDone;
+   g_meta[n].partialDone = partialDone;
+  }
+
+//--- drop entries whose position has closed
+void MetaPrune()
+  {
+   for(int i = ArraySize(g_meta) - 1; i >= 0; i--)
+      if(!PositionSelectByTicket(g_meta[i].ticket))
+        {
+         for(int k = i + 1; k < ArraySize(g_meta); k++) g_meta[k-1] = g_meta[k];
+         ArrayResize(g_meta, ArraySize(g_meta) - 1);
+        }
+  }
+
+int StyleFromComment(const string c)
+  {
+   if(StringFind(c, "Scalp") >= 0) return STY_SCALP;
+   if(StringFind(c, "Swing") >= 0) return STY_SWING;
+   return STY_INTRA;
+  }
+
+//--- register anything this EA owns that is not in the registry yet.
+//--- Called after every entry, and once at start-up to adopt positions
+//--- that survived a restart.
+void RegisterPositions(const bool announce)
+  {
+   int adopted = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong t = PositionGetTicket(i);
+      if(t == 0 || !PositionSelectByTicket(t)) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+      if(MetaIndex(t) >= 0) continue;
+
+      int    style = StyleFromComment(PositionGetString(POSITION_COMMENT));
+      double open  = PositionGetDouble(POSITION_PRICE_OPEN);
+      double sl    = PositionGetDouble(POSITION_SL);
+      double tp    = PositionGetDouble(POSITION_TP);
+      long   type  = PositionGetInteger(POSITION_TYPE);
+      int    dir   = (type == POSITION_TYPE_BUY ? 1 : -1);
+
+      bool beAlready = (sl != 0.0 && ((dir > 0 && sl >= open) || (dir < 0 && sl <= open)));
+      double riskDist = 0.0;
+      if(!beAlready && sl != 0.0)
+         riskDist = MathAbs(open - sl);
+      else
+         if(tp != 0.0)                       // recover it from the target, with
+            riskDist = MathAbs(tp - open) / MathMax(StyleRR2(style), 0.1);  // the RIGHT style
+
+      if(riskDist > 0.0)
+        {
+         MetaAdd(t, style, riskDist, beAlready, false);
+         adopted++;
+        }
+     }
+   if(announce && adopted > 0)
+      PrintFormat("CRT Sniper EA: adopted %d existing position(s). A partial already "
+                  "taken before the restart cannot be detected, so one extra partial "
+                  "is possible on those.", adopted);
+  }
+
+//+------------------------------------------------------------------+
 //| Trade management                                                 |
 //| breakeven -> partial -> trail, in that order, once each          |
 //+------------------------------------------------------------------+
 void ManagePositions()
   {
+   MetaPrune();
+
    for(int i = PositionsTotal() - 1; i >= 0; i--)
      {
       ulong ticket = PositionGetTicket(i);
       if(ticket == 0 || !PositionSelectByTicket(ticket)) continue;
       if(PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+
+      int mi = MetaIndex(ticket);
+      if(mi < 0) continue;                       // not ours to manage yet
 
       string sym  = PositionGetString(POSITION_SYMBOL);
       long   type = PositionGetInteger(POSITION_TYPE);
@@ -1618,74 +1725,69 @@ void ManagePositions()
       double vol  = PositionGetDouble(POSITION_VOLUME);
       int    dir  = (type == POSITION_TYPE_BUY ? 1 : -1);
       int    digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+      int    style = g_meta[mi].style;
 
       double px = (dir > 0 ? SymbolInfoDouble(sym, SYMBOL_BID)
                    : SymbolInfoDouble(sym, SYMBOL_ASK));
       if(px <= 0.0) continue;
 
-      //--- R is measured from the ORIGINAL stop; once the stop has moved to
-      //--- breakeven that distance is gone, so reconstruct it from the target
-      double riskDist = MathAbs(open - sl);
-      if(sl == 0.0 || (dir > 0 && sl >= open) || (dir < 0 && sl <= open))
-        {
-         if(tp != 0.0) riskDist = MathAbs(tp - open) / MathMax(StyleRR2(STY_INTRA), 0.1);
-        }
+      //--- R always measured from the ORIGINAL stop, held in the registry
+      double riskDist = g_meta[mi].riskDist;
       if(riskDist <= 0.0) continue;
-
       double rNow = (dir > 0 ? (px - open) : (open - px)) / riskDist;
 
+      //--- ATR on the timeframe this trade actually belongs to
+      ENUM_TIMEFRAMES mtf = StyleTF(style);
+      double atr = 0.0;
       double atrBuf[];
       ArraySetAsSeries(atrBuf, true);
-      double atr = 0.0;
-      int hAtr = iATR(sym, PERIOD_M15, InpAtrPeriod);
+      int hAtr = iATR(sym, mtf, InpAtrPeriod);
       if(hAtr != INVALID_HANDLE && CopyBuffer(hAtr, 0, 0, 2, atrBuf) >= 2) atr = atrBuf[1];
 
       double minDist = MinStopDistance(sym);
-      bool   atBreakeven = (dir > 0 ? (sl >= open) : (sl <= open && sl > 0.0));
 
-      //--- 1. breakeven: remove the risk once the trade has proved itself
-      if(!atBreakeven && rNow >= InpBreakevenR)
+      //--- 1. breakeven : take the risk off once the trade has proved itself
+      if(!g_meta[mi].beDone && rNow >= InpBreakevenR)
         {
          double newSl = open + dir * InpBreakevenLockR * riskDist;
-         if(MathAbs(px - newSl) >= minDist &&
-            ((dir > 0 && newSl > sl) || (dir < 0 && (newSl < sl || sl == 0.0))))
+         bool better = (dir > 0 ? (newSl > sl) : (newSl < sl || sl == 0.0));
+         if(better && MathAbs(px - newSl) >= minDist)
            {
             newSl = NormalizeDouble(newSl, digits);
             if(g_trade.PositionModify(ticket, newSl, tp))
               {
-               Print("CRT Sniper EA: ", sym, " to breakeven at ", DoubleToString(newSl, digits));
-               atBreakeven = true;
+               g_meta[mi].beDone = true;
                sl = newSl;
+               PrintFormat("CRT Sniper EA: %s to breakeven at %s (%.2fR)",
+                           sym, DoubleToString(newSl, digits), rNow);
               }
            }
         }
 
-      //--- 2. partial: bank part of the move, let the rest run
-      double closedFlag = 0.0;
-      if(InpPartialPct > 0.0 && rNow >= InpPartialAtR)
+      //--- 2. partial : banked once, tracked in the registry, never repeated
+      if(!g_meta[mi].partialDone && InpPartialPct > 0.0 && rNow >= InpPartialAtR)
         {
-         //--- the comment is stamped once so a partial is never taken twice
-         string cmt = PositionGetString(POSITION_COMMENT);
-         if(StringFind(cmt, "|P") < 0)
+         double step = SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP);
+         double vmin = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
+         if(step <= 0.0) step = 0.01;
+         double part = MathFloor((vol * InpPartialPct / 100.0) / step) * step;
+
+         if(part >= vmin && (vol - part) >= vmin)
            {
-            double step = SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP);
-            double vmin = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
-            double part = MathFloor((vol * InpPartialPct / 100.0) / step) * step;
-            if(part >= vmin && (vol - part) >= vmin)
-              {
-               if(g_trade.PositionClosePartial(ticket, part))
-                 {
-                  Print("CRT Sniper EA: ", sym, " partial ", DoubleToString(part, 2),
-                        " lots at ", DoubleToString(rNow, 2), "R");
-                  closedFlag = 1.0;
-                 }
-              }
+            if(g_trade.PositionClosePartial(ticket, part))
+               PrintFormat("CRT Sniper EA: %s banked %.2f of %.2f lots at %.2fR",
+                           sym, part, vol, rNow);
            }
+         else
+            PrintFormat("CRT Sniper EA: %s too small to split (%.2f lots), left whole",
+                        sym, vol);
+         //--- marked done either way, so an unsplittable position is not retried
+         g_meta[mi].partialDone = true;
         }
 
       //--- 3. trail the remainder
-      if(closedFlag == 0.0 && atr > 0.0 && InpTrailATR > 0.0 &&
-         (!InpTrailAfterPartial || rNow >= InpPartialAtR))
+      if(atr > 0.0 && InpTrailATR > 0.0 &&
+         (!InpTrailAfterPartial || g_meta[mi].partialDone))
         {
          double cand = px - dir * InpTrailATR * atr;
          bool better = (dir > 0 ? (cand > sl) : (cand < sl || sl == 0.0));
@@ -1696,16 +1798,16 @@ void ManagePositions()
            }
         }
 
-      //--- 4. time stop: capital sitting in a trade that is going nowhere
+      //--- 4. time stop : capital in a trade going nowhere is capital idle
       if(InpTimeStopBars > 0)
         {
          datetime opened = (datetime)PositionGetInteger(POSITION_TIME);
-         int bars = iBarShift(sym, PERIOD_M15, opened, false);
+         int bars = iBarShift(sym, mtf, opened, false);
          if(bars >= InpTimeStopBars && rNow < InpTimeStopMinR && rNow > -0.5)
            {
             if(g_trade.PositionClose(ticket))
-               Print("CRT Sniper EA: ", sym, " time stop after ", bars, " bars at ",
-                     DoubleToString(rNow, 2), "R");
+               PrintFormat("CRT Sniper EA: %s time stop after %d %s bars at %.2fR",
+                           sym, bars, EnumToString(mtf), rNow);
            }
         }
      }
@@ -1751,10 +1853,14 @@ bool ScaleInAllowed(const string sym, const int dir)
       same++;
 
       double open = PositionGetDouble(POSITION_PRICE_OPEN);
-      double sl   = PositionGetDouble(POSITION_SL);
       double px   = (pdir > 0 ? SymbolInfoDouble(sym, SYMBOL_BID)
                      : SymbolInfoDouble(sym, SYMBOL_ASK));
-      double rd = MathAbs(open - sl);
+
+      //--- the ORIGINAL stop distance, from the registry. Using the live stop
+      //--- here would read a breakeven trade as roughly ten times further
+      //--- ahead than it is, and add to it far too early.
+      int mi = MetaIndex(t);
+      double rd = (mi >= 0 ? g_meta[mi].riskDist : MathAbs(open - PositionGetDouble(POSITION_SL)));
       if(rd > 0.0)
         {
          double r = (pdir > 0 ? (px - open) : (open - px)) / rd;
@@ -1945,6 +2051,7 @@ int OnInit()
 
    LoadNewsForUniverse();
    CapabilityReport(InpReportOnInit);
+   RegisterPositions(true);
 
    if(!InpEnableTrading)
       Print("CRT Sniper EA: MONITOR ONLY. Signals are logged but no orders are sent. "
