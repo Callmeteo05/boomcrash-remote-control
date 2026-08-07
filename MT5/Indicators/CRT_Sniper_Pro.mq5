@@ -44,10 +44,21 @@
 #define REG_BULL  1
 #define REG_BEAR  2
 
-//--- signal engine that produced a dot
-#define MODE_CRT  0
-#define MODE_HUNT 1
-#define MODE_FADE 2
+//--- entry models
+#define NMODELS   7
+#define MODE_CRT   0   // Candle Range Theory : anchor raid -> MSS -> retest
+#define MODE_HUNT  1   // spike hunt   (with the spike)
+#define MODE_FADE  2   // spike fade   (against the spike)
+#define MODE_SWEEP 3   // liquidity sweep + reclaim
+#define MODE_BRT   4   // break and retest
+#define MODE_TPB   5   // trend pullback to EMA 50
+#define MODE_ASIA  6   // Asian range sweep (Judas swing)
+
+//--- sessions
+#define SESS_OFF    0
+#define SESS_ASIA   1
+#define SESS_LONDON 2
+#define SESS_NY     3
 
 //+------------------------------------------------------------------+
 //| Enums                                                            |
@@ -163,6 +174,31 @@ input double          InpFadeSlBuf        = 0.50;           // FADE: stop beyond
 input double          InpFadeTp2Drift     = 3.0;            // FADE: TP2 beyond the pre-spike level (x drift range)
 input int             InpMinSpikesToTrade = 3;              // Min spikes observed before the engine arms
 
+input group "=== Entry models ==="
+input bool            InpUseCRT           = true;           // CRT : anchor raid -> MSS -> retest
+input bool            InpUseSweep         = true;           // Liquidity sweep + reclaim
+input bool            InpUseBRT           = true;           // Break and retest
+input bool            InpUseTPB           = true;           // Trend pullback to EMA 50
+input bool            InpUseAsia          = true;           // Asian range sweep (Judas swing)
+input int             InpSweepLook        = 20;             // Sweep : prior-low/high lookback (bars)
+input double          InpSweepMinATR      = 0.15;           // Sweep : min penetration beyond the level (x ATR)
+input double          InpBrtTolATR        = 0.35;           // Break+retest : retest tolerance (x ATR)
+input int             InpBrtExpiry        = 30;             // Break+retest : level stays armed N bars
+input double          InpTpbMaxDepth      = 0.62;           // Pullback : max retracement of the leg (0..1)
+input int             InpAsiaSweepStart   = 7;              // Asian sweep : hunt window start (GMT hour)
+input int             InpAsiaSweepEnd     = 12;             // Asian sweep : hunt window end (GMT hour)
+
+input group "=== News filter (MT5 economic calendar) ==="
+input bool            InpUseNews          = true;           // Block signals around high-impact news
+input bool            InpNewsHighOnly     = true;           // High impact only (off = high + medium)
+input int             InpNewsBefore       = 30;             // Blackout before the release (minutes)
+input int             InpNewsAfter        = 30;             // Blackout after the release (minutes)
+
+input group "=== Freshness (turns a dot into an entry) ==="
+input bool            InpUseFreshness     = true;           // Expire signals that price has run away from
+input double          InpMaxChaseR        = 0.30;           // Max adverse chase from the signal price (in R)
+input int             InpSignalTTL        = 3;              // Signal stops being actionable after N bars
+
 input group "=== Signal quality & grading ==="
 input int             InpMinScore         = 62;             // Minimum confluence score to print a dot (0-100)
 input int             InpPremiumScore     = 85;             // Score at or above this prints the large A+ dot
@@ -275,7 +311,13 @@ int    g_cooldown   = 3;
 int    g_minScore   = 62;
 bool   g_liqTP      = true;
 
+//--- break-and-retest armed level
+int    g_brtDir   = 0;
+double g_brtLevel = 0.0;
+int    g_brtBar   = -1;
+
 //--- health / diagnostics
+int    g_newsReject   = 0;
 int    g_htfAvail     = 0;
 bool   g_htfOk        = true;
 int    g_spreadReject = 0;
@@ -328,7 +370,7 @@ double   g_stDisp    = 0.0;
 bool     g_stZone    = false;
 double   g_stZoneHi  = 0.0, g_stZoneLo = 0.0;
 string   g_stZoneKind = "";
-int      g_lastSigBarMode[3];
+int      g_lastSigBarMode[NMODELS];
 int      g_lastProc  = -1;
 
 double   g_swHigh = 0.0, g_swLow = 0.0;
@@ -347,6 +389,7 @@ struct SigRec
    double   entry, sl, tp1, tp2;
    string   pattern;
    string   grade;
+   string   reason;
   };
 SigRec   g_sig[MAXSIG];
 int      g_sigCount = 0;
@@ -363,7 +406,7 @@ OpenTrade g_open[MAXOPEN];
 int    g_nWin = 0, g_nLoss = 0;
 double g_sumWinR = 0.0, g_sumLossR = 0.0;
 int    g_streak = 0, g_worstStreak = 0;
-int    g_modeWin[3], g_modeLoss[3];
+int    g_modeWin[NMODELS], g_modeLoss[NMODELS];
 
 //+------------------------------------------------------------------+
 //| Dashboard snapshot                                               |
@@ -451,9 +494,38 @@ color RegColor(const int r)
 
 string ModeName(const int m)
   {
-   if(m == MODE_HUNT) return "Hunt";
-   if(m == MODE_FADE) return "Fade";
+   switch(m)
+     {
+      case MODE_HUNT:  return "Spike Hunt";
+      case MODE_FADE:  return "Spike Fade";
+      case MODE_SWEEP: return "Liq Sweep";
+      case MODE_BRT:   return "Break+Retest";
+      case MODE_TPB:   return "Trend Pullback";
+      case MODE_ASIA:  return "Asian Sweep";
+     }
    return "CRT";
+  }
+
+string ModeShort(const int m)
+  {
+   switch(m)
+     {
+      case MODE_HUNT:  return "HUNT";
+      case MODE_FADE:  return "FADE";
+      case MODE_SWEEP: return "SWEEP";
+      case MODE_BRT:   return "BRT";
+      case MODE_TPB:   return "TPB";
+      case MODE_ASIA:  return "ASIA";
+     }
+   return "CRT";
+  }
+
+string SessName(const int s)
+  {
+   if(s == SESS_ASIA)   return "ASIA";
+   if(s == SESS_LONDON) return "LONDON";
+   if(s == SESS_NY)     return "NEW YORK";
+   return "OFF-SESSION";
   }
 
 ENUM_TIMEFRAMES ResolveHTF(const ENUM_TIMEFRAMES chart)
@@ -950,17 +1022,184 @@ int PatternStrength(const string p)
 //+------------------------------------------------------------------+
 //| Sessions                                                         |
 //+------------------------------------------------------------------+
+int GmtHour(const datetime t)
+  {
+   MqlDateTime dt;
+   TimeToStruct(t, dt);
+   return (dt.hour - InpGmtOffset + 48) % 24;
+  }
+
+int GmtDay(const datetime t)
+  {
+   return (int)((t - (datetime)(InpGmtOffset * 3600)) / 86400);
+  }
+
 bool InKillzone(const datetime t)
   {
    if(!g_useSessions)
       return true;
-   MqlDateTime dt;
-   TimeToStruct(t, dt);
-   int g = (dt.hour - InpGmtOffset + 48) % 24;
+   int g = GmtHour(t);
    if(InpAsia    && g >= InpAsiaStart && g < InpAsiaEnd) return true;
    if(InpLondon  && g >= InpLonStart  && g < InpLonEnd)  return true;
    if(InpNewYork && g >= InpNYStart   && g < InpNYEnd)   return true;
    return false;
+  }
+
+int SessionOf(const datetime t)
+  {
+   int g = GmtHour(t);
+   if(g >= InpAsiaStart && g < InpAsiaEnd) return SESS_ASIA;
+   if(g >= InpLonStart  && g < InpLonEnd)  return SESS_LONDON;
+   if(g >= InpNYStart   && g < InpNYEnd)   return SESS_NY;
+   return SESS_OFF;
+  }
+
+//--- Asian range, rebuilt each GMT day as the loop walks forward
+int    g_asiaDay = -1;
+double g_asiaHi  = 0.0, g_asiaLo = 0.0;
+bool   g_asiaSet = false;
+bool   g_asiaSweptHi = false, g_asiaSweptLo = false;
+
+void UpdateAsianRange(const datetime t, const double hi, const double lo)
+  {
+   int day = GmtDay(t);
+   if(day != g_asiaDay)
+     {
+      g_asiaDay = day;
+      g_asiaHi = 0.0; g_asiaLo = 0.0; g_asiaSet = false;
+      g_asiaSweptHi = false; g_asiaSweptLo = false;
+     }
+   int g = GmtHour(t);
+   if(g >= InpAsiaStart && g < InpAsiaEnd)
+     {
+      if(!g_asiaSet) { g_asiaHi = hi; g_asiaLo = lo; g_asiaSet = true; }
+      else           { g_asiaHi = MathMax(g_asiaHi, hi); g_asiaLo = MathMin(g_asiaLo, lo); }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| News filter - MT5 economic calendar                              |
+//| Events are fetched once per recalculation, not once per bar.     |
+//+------------------------------------------------------------------+
+datetime g_newsTimes[];
+int      g_newsCount   = 0;
+bool     g_newsOk      = false;   // calendar reachable and relevant to this symbol
+string   g_newsCcy     = "";
+
+void CollectNewsFor(const string ccy, datetime from, datetime to)
+  {
+   if(ccy == "")
+      return;
+
+   MqlCalendarEvent events[];
+   int ne = CalendarEventByCurrency(ccy, events);
+   if(ne <= 0)
+      return;
+
+   MqlCalendarValue values[];
+   int nv = CalendarValueHistory(values, from, to, NULL, ccy);
+   if(nv <= 0)
+      return;
+
+   for(int v = 0; v < nv; v++)
+     {
+      for(int e = 0; e < ne; e++)
+        {
+         if(events[e].id != values[v].event_id)
+            continue;
+         bool keep = (events[e].importance == CALENDAR_IMPORTANCE_HIGH) ||
+                     (!InpNewsHighOnly && events[e].importance == CALENDAR_IMPORTANCE_MODERATE);
+         if(keep)
+           {
+            int n = ArraySize(g_newsTimes);
+            ArrayResize(g_newsTimes, n + 1);
+            g_newsTimes[n] = values[v].time;
+           }
+         break;
+        }
+     }
+  }
+
+void LoadNews(const datetime from, const datetime to)
+  {
+   ArrayResize(g_newsTimes, 0);
+   g_newsCount = 0;
+   g_newsOk = false;
+   g_newsCcy = "";
+
+   if(!InpUseNews)
+      return;
+   //--- synthetics have no macro calendar; their base currency would be misleading
+   if(g_symClass == SC_SPIKE_UP || g_symClass == SC_SPIKE_DOWN || g_symClass == SC_VOL)
+      return;
+
+   string b = SymbolInfoString(_Symbol, SYMBOL_CURRENCY_BASE);
+   string q = SymbolInfoString(_Symbol, SYMBOL_CURRENCY_PROFIT);
+
+   CollectNewsFor(b, from, to);
+   if(q != b)
+      CollectNewsFor(q, from, to);
+
+   g_newsCount = ArraySize(g_newsTimes);
+   if(g_newsCount > 0)
+     {
+      ArraySort(g_newsTimes);
+      g_newsOk = true;
+      g_newsCcy = (q != b ? b + "/" + q : b);
+     }
+  }
+
+bool NewsBlackout(const datetime t)
+  {
+   if(!InpUseNews || g_newsCount <= 0)
+      return false;
+   long before = (long)InpNewsBefore * 60;
+   long after  = (long)InpNewsAfter  * 60;
+   for(int k = 0; k < g_newsCount; k++)
+     {
+      long d = (long)g_newsTimes[k] - (long)t;
+      if(d >= 0 && d <= before) return true;   // release is imminent
+      if(d < 0 && -d <= after)  return true;   // release just happened
+     }
+   return false;
+  }
+
+//--- minutes to the next scheduled release (-1 when none / unavailable)
+int MinutesToNews(const datetime t)
+  {
+   if(g_newsCount <= 0)
+      return -1;
+   for(int k = 0; k < g_newsCount; k++)
+     {
+      if(g_newsTimes[k] >= t)
+         return (int)(((long)g_newsTimes[k] - (long)t) / 60);
+     }
+   return -1;
+  }
+
+//+------------------------------------------------------------------+
+//| Reason stack - why this trade is worth taking                    |
+//+------------------------------------------------------------------+
+string BuildReason(const int model, const int bias, const int mtfAgree, const double pd,
+                   const string zone, const string pat, const int sess,
+                   const double rr, const string extra)
+  {
+   string r = ModeShort(model);
+   r += " | " + TfName(g_htf) + " " + RegName(bias);
+   if(mtfAgree >= 0)
+      r += StringFormat(" | %d/3 MTF", mtfAgree);
+   if(pd >= 0.0)
+      r += StringFormat(" | %s %.0f%%", (pd < 0.5 ? "discount" : "premium"), pd * 100.0);
+   if(sess != SESS_OFF)
+      r += " | " + SessName(sess);
+   if(extra != "")
+      r += " | " + extra;
+   if(zone != "")
+      r += " | " + zone;
+   if(pat != "")
+      r += " | " + pat;
+   r += StringFormat(" | %.1fR", rr);
+   return r;
   }
 
 //+------------------------------------------------------------------+
@@ -1046,7 +1285,7 @@ void ResetSetup()
 void ResetAll()
   {
    ResetSetup();
-   for(int m = 0; m < 3; m++)
+   for(int m = 0; m < NMODELS; m++)
      {
       g_lastSigBarMode[m] = -1000000;
       g_modeWin[m] = 0;
@@ -1055,6 +1294,9 @@ void ResetAll()
    g_swHigh = 0.0; g_swLow = 0.0; g_swHighBar = -1; g_swLowBar = -1;
    g_sigCount = 0;
 
+   g_brtDir = 0; g_brtLevel = 0.0; g_brtBar = -1;
+   g_asiaDay = -1; g_asiaHi = 0.0; g_asiaLo = 0.0; g_asiaSet = false;
+   g_asiaSweptHi = false; g_asiaSweptLo = false;
    g_lastSpikeBar = -1; g_lastSpikeDir = 0;
    g_lastSpikeHigh = 0.0; g_lastSpikeLow = 0.0; g_lastSpikeRange = 0.0;
    g_preSpikeClose = 0.0;
@@ -1200,12 +1442,30 @@ int ScoreFade(const double spikeVsMedian, const double exhaust, const int htfReg
    return (int)MathRound(Clamp(s, 0, 100));
   }
 
+//--- shared scorer for the pure price-action models
+int ScorePA(const bool biasAligned, const int mtfAgree, const double pdDepth,
+            const double structQual, const string pattern, const bool emaAligned,
+            const double adx, const bool inSess, const double rr, const bool edgeBonus)
+  {
+   double s = 0.0;
+   s += (biasAligned ? 16.0 : 0.0);
+   s += 12.0 * Clamp((double)mtfAgree / 3.0, 0, 1);
+   s += 12.0 * Clamp(pdDepth, 0, 1);
+   s += 14.0 * Clamp(structQual, 0, 1);
+   s += (double)PatternStrength(pattern);
+   s += (emaAligned ? 5.0 : 0.0) + 5.0 * Clamp((adx - g_adxTrend) / 15.0, 0, 1);
+   s += (inSess ? 8.0 : 0.0);
+   s += 10.0 * Clamp(rr / 3.0, 0, 1);
+   s += (edgeBonus ? 8.0 : 0.0);
+   return (int)MathRound(Clamp(s, 0, 100));
+  }
+
 //+------------------------------------------------------------------+
 //| Signal storage + forward performance tracking                    |
 //+------------------------------------------------------------------+
 void PushSignal(const datetime t, const int bar, const int dir, const int mode,
                 const int score, const double entry, const double sl,
-                const double tp1, const double tp2, const string pat)
+                const double tp1, const double tp2, const string pat, const string reason)
   {
    int idx = g_sigCount;
    if(g_sigCount >= MAXSIG)
@@ -1228,6 +1488,7 @@ void PushSignal(const datetime t, const int bar, const int dir, const int mode,
    g_sig[idx].tp2 = tp2;
    g_sig[idx].pattern = pat;
    g_sig[idx].grade = GradeOf(score);
+   g_sig[idx].reason = reason;
 
    if(!InpTrackStats)
       return;
@@ -1402,7 +1663,7 @@ void DrawSignalLevels(const bool force)
          string id = PREFIX + "grd_" + IntegerToString(s);
          double at = (g_sig[s].dir > 0 ? g_sig[s].sl : g_sig[s].tp2);
          color  cc = (g_sig[s].dir > 0 ? clrDodgerBlue : clrOrangeRed);
-         string tx = g_sig[s].grade + " " + IntegerToString(g_sig[s].score);
+         string tx = g_sig[s].grade + " " + IntegerToString(g_sig[s].score) + " " + ModeShort(g_sig[s].mode);
          MakeText(id, g_sig[s].t, at, tx, cc, MathMax(6, InpFontSize - 1),
                   (g_sig[s].dir > 0 ? ANCHOR_UPPER : ANCHOR_LOWER));
         }
@@ -1460,6 +1721,58 @@ void PanelRow(const int idx, const string txt, const color col)
    ObjectSetInteger(0, nm, OBJPROP_HIDDEN, true);
   }
 
+//--- how far price has run from the last signal, and whether it is still takeable
+bool FreshnessVerdict(string &verdict, color &col, double &chasedR, int &ageBars)
+  {
+   verdict = "no signal yet";
+   col = clrSilver;
+   chasedR = 0.0;
+   ageBars = -1;
+   if(g_sigCount <= 0)
+      return false;
+
+   SigRec s = g_sig[g_sigCount-1];
+   double risk = MathAbs(s.entry - s.sl);
+   if(risk <= 0.0)
+      return false;
+
+   double px = (s.dir > 0 ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
+                : SymbolInfoDouble(_Symbol, SYMBOL_BID));
+   if(px <= 0.0) px = s.entry;
+
+   //--- positive = price has moved away in the trade direction (chasing costs you)
+   chasedR = (s.dir > 0 ? (px - s.entry) : (s.entry - px)) / risk;
+   ageBars = (int)((TimeCurrent() - s.t) / MathMax(1, PeriodSeconds(_Period)));
+
+   if(!InpUseFreshness)
+     {
+      verdict = "freshness off";
+      col = clrSilver;
+      return true;
+     }
+   if(ageBars > InpSignalTTL)
+     {
+      verdict = StringFormat("EXPIRED  (%d bars old)", ageBars);
+      col = clrOrangeRed;
+     }
+   else if(chasedR > InpMaxChaseR)
+     {
+      verdict = StringFormat("TOO LATE  (chased %.2fR)", chasedR);
+      col = clrOrangeRed;
+     }
+   else if(chasedR < -1.0)
+     {
+      verdict = "INVALIDATED  (past the stop)";
+      col = clrOrangeRed;
+     }
+   else
+     {
+      verdict = StringFormat("TAKEABLE  (chased %.2fR, %d bars)", chasedR, ageBars);
+      col = clrLimeGreen;
+     }
+   return true;
+  }
+
 void BuildRows()
   {
    g_rowN = 0;
@@ -1471,6 +1784,32 @@ void BuildRows()
    AddRow(StringFormat("Class       : %s  [%s]", ClassName(g_symClass), g_classHow),
           (g_spikeDir != 0 ? clrOrange : InpPanelText));
    AddRow(StringFormat("Style       : %s   TP %.1fR / %.1fR", StyleName(g_style), g_rr1, g_rr2), clrGold);
+
+   int sessNow = SessionOf(TimeCurrent());
+   AddRow(StringFormat("Session     : %s%s", SessName(sessNow),
+                       (g_asiaSet ? StringFormat("   Asia %s-%s",
+                        DoubleToString(g_asiaLo, _Digits), DoubleToString(g_asiaHi, _Digits)) : "")),
+          (sessNow == SESS_OFF ? clrSilver : clrAqua));
+
+   string newsTxt = "off";
+   color  newsCol = dimc;
+   if(InpUseNews)
+     {
+      if(g_symClass == SC_SPIKE_UP || g_symClass == SC_SPIKE_DOWN || g_symClass == SC_VOL)
+        { newsTxt = "n/a for synthetics"; }
+      else if(!g_newsOk)
+        { newsTxt = "calendar unavailable"; newsCol = clrGoldenrod; }
+      else
+        {
+         int mins = MinutesToNews(TimeCurrent());
+         bool blocked = NewsBlackout(TimeCurrent());
+         newsTxt = StringFormat("%s  %s  (%d events, %d blocked)", g_newsCcy,
+                                (blocked ? "BLACKOUT" : (mins >= 0 ? StringFormat("next in %dm", mins) : "clear")),
+                                g_newsCount, g_newsReject);
+         newsCol = (blocked ? clrOrangeRed : (mins >= 0 && mins <= 60 ? clrGoldenrod : clrLimeGreen));
+        }
+     }
+   AddRow(StringFormat("News        : %s", newsTxt), newsCol);
    AddRow(SEP, dimc);
 
    AddRow(StringFormat("HTF anchor  : %s", TfName(g_htf)), InpPanelText);
@@ -1536,7 +1875,34 @@ void BuildRows()
       AddRow(StringFormat("Last signal : %s %s   %s %d  (%s)",
                           (s.dir > 0 ? "BUY " : "SELL"), DoubleToString(s.entry, _Digits),
                           s.grade, s.score, ModeName(s.mode)), sc);
-      AddRow(StringFormat("Pattern     : %s", s.pattern), InpPanelText);
+
+      string verdict; color vcol; double chased; int age;
+      FreshnessVerdict(verdict, vcol, chased, age);
+      AddRow(StringFormat("Status      : %s", verdict), vcol);
+
+      //--- the reason stack, wrapped so it stays inside the panel
+      string why = s.reason;
+      int guard = 0;
+      bool first = true;
+      while(StringLen(why) > 0 && guard < 4)
+        {
+         string chunk = why;
+         if(StringLen(why) > 52)
+           {
+            int cut = StringLen(why) > 52 ? 52 : StringLen(why);
+            int bar = -1;
+            for(int q = cut; q > 20; q--)
+               if(StringGetCharacter(why, q) == '|') { bar = q; break; }
+            if(bar < 0) bar = cut;
+            chunk = StringSubstr(why, 0, bar);
+            why = StringSubstr(why, bar);
+           }
+         else
+            why = "";
+         AddRow(StringFormat("%-12s: %s", (first ? "Why" : ""), chunk), C'170,190,220');
+         first = false;
+         guard++;
+        }
       AddRow(StringFormat("SL / TP1    : %s / %s",
                           DoubleToString(s.sl, _Digits), DoubleToString(s.tp1, _Digits)), InpPanelText);
       AddRow(StringFormat("TP2 / R:R   : %s   1:%.1f", DoubleToString(s.tp2, _Digits), rr), InpPanelText);
@@ -1634,17 +2000,18 @@ void DrawPanel()
 //+------------------------------------------------------------------+
 void FireAlert(const datetime t, const int dir, const int mode, const int score,
                const string grade, const double entry, const double sl,
-               const double tp1, const double tp2, const string pat)
+               const double tp1, const double tp2, const string pat, const string reason)
   {
    if(t <= g_lastAlert)
       return;
    g_lastAlert = t;
 
-   string msg = StringFormat("%s %s %s | %s %d (%s, %s) @ %s  SL %s  TP1 %s  TP2 %s",
+   string msg = StringFormat("%s %s %s | %s %d | %s\nEntry %s  SL %s  TP1 %s  TP2 %s\nWHY: %s\nValid while price stays within %.2fR of entry, %d bars.",
                              (dir > 0 ? "BUY" : "SELL"), _Symbol, TfName((ENUM_TIMEFRAMES)_Period),
-                             grade, score, ModeName(mode), pat,
+                             grade, score, ModeName(mode),
                              DoubleToString(entry, _Digits), DoubleToString(sl, _Digits),
-                             DoubleToString(tp1, _Digits), DoubleToString(tp2, _Digits));
+                             DoubleToString(tp1, _Digits), DoubleToString(tp2, _Digits),
+                             reason, InpMaxChaseR, InpSignalTTL);
 
    if(InpAlertPopup) Alert(msg);
    if(InpAlertPush)  SendNotification(msg);
@@ -1962,11 +2329,20 @@ int OnCalculate(const int rates_total,
       AutoTune();
       ApplyStyle();
       g_spreadReject = 0;
+      g_newsReject = 0;
       g_lastProc = calcFrom - 1;
      }
 
    if(!LoadSeries(rates_total, calcFrom))
       return prev_calculated;
+
+   //--- economic calendar, fetched once for the whole calculated range
+   static datetime s_newsLoaded = 0;
+   if(InpUseNews && (prev_calculated == 0 || time[rates_total-1] - s_newsLoaded > 3600))
+     {
+      s_newsLoaded = time[rates_total-1];
+      LoadNews(time[calcFrom] - 86400, time[rates_total-1] + 7 * 86400);
+     }
 
    int start = MathMax(calcFrom, g_lastProc + 1);
    int last  = rates_total - 2;
@@ -2000,6 +2376,8 @@ int OnCalculate(const int rates_total,
 
       int barsSince = (g_lastSpikeBar >= 0 ? i - g_lastSpikeBar : 1000000);
       double dueness = (g_avgGap > 0.0 && barsSince < 1000000 ? barsSince / g_avgGap : 0.0);
+
+      UpdateAsianRange(time[i], high[i], low[i]);
 
       //--- swing structure ------------------------------------------
       int L = MathMax(1, InpSwingLen);
@@ -2052,7 +2430,7 @@ int OnCalculate(const int rates_total,
       //================= ENGINE OUTPUT ==============================
       int    sigDir = 0, sigMode = -1, sigScore = 0;
       double sigEntry = 0.0, sigSL = 0.0, sigTP1 = 0.0, sigTP2 = 0.0;
-      string sigPat = "";
+      string sigPat = "", sigReason = "";
 
       //--------------------------------------------------------------
       // ENGINE A : spike FADE  (against the spike, with the drift)
@@ -2105,6 +2483,9 @@ int OnCalculate(const int rates_total,
                  {
                   sigDir = fdir; sigMode = MODE_FADE; sigScore = sc;
                   sigEntry = entry; sigSL = sl; sigTP1 = tp1; sigTP2 = tp2; sigPat = pat;
+                  sigReason = BuildReason(MODE_FADE, bias, -1, htfPD, "", pat, SessionOf(time[i]), rr,
+                                          StringFormat("spike %d bars ago, %.0f%% given back, due %.0f%%",
+                                                       barsSince, exhaust * 100.0, dueness * 100.0));
                  }
               }
            }
@@ -2157,6 +2538,9 @@ int OnCalculate(const int rates_total,
                     {
                      sigDir = g_spikeDir; sigMode = MODE_HUNT; sigScore = sc;
                      sigEntry = entry; sigSL = sl; sigTP1 = tp1; sigTP2 = tp2; sigPat = pat;
+                     sigReason = BuildReason(MODE_HUNT, bias, -1, chanPos, "", pat, SessionOf(time[i]), rr,
+                                             StringFormat("spike due %.0f%%, channel %.0f%%, CV %.2f",
+                                                          dueness * 100.0, chanPos * 100.0, g_gapConsistency));
                     }
                  }
               }
@@ -2166,7 +2550,7 @@ int OnCalculate(const int rates_total,
       //--------------------------------------------------------------
       // ENGINE C : the core CRT / MSS / retest engine
       //--------------------------------------------------------------
-      if(sigMode < 0 && haveCrt)
+      if(sigMode < 0 && haveCrt && InpUseCRT)
         {
          double crtRng = g_stCrtHi - g_stCrtLo;
          if(crtRng > 0.0)
@@ -2295,6 +2679,9 @@ int OnCalculate(const int rates_total,
                           {
                            sigDir = (wantBuy ? 1 : -1); sigMode = MODE_CRT; sigScore = sc;
                            sigEntry = entry; sigSL = sl; sigTP1 = tp1; sigTP2 = tp2; sigPat = pat;
+                           sigReason = BuildReason(MODE_CRT, bias, mtfAgree, pd, g_stZoneKind, pat,
+                                                   SessionOf(time[i]), g_rr1,
+                                                   StringFormat("CRT raid q%.2f, MSS %.1fxATR", g_stCrtQual, g_stDisp));
                           }
 
                         if(!InpMultiEntry && sc >= g_minScore)
@@ -2306,6 +2693,236 @@ int OnCalculate(const int rates_total,
                  }
               }
            }
+        }
+
+      //--------------------------------------------------------------
+      // Shared context for the pure price-action models
+      //--------------------------------------------------------------
+      int    wantReg  = REG_RANGE;
+      int    mtf3     = 0;
+      bool   newsOut  = NewsBlackout(time[i]);
+      int    sessNow  = SessionOf(time[i]);
+      double chHi50   = HighestOf(high, i - InpDriftChanLook + 1, i, rates_total);
+      double chLo50   = LowestOf(low,  i - InpDriftChanLook + 1, i, rates_total);
+      double chPos    = (chHi50 > chLo50 ? (close[i] - chLo50) / (chHi50 - chLo50) : 0.5);
+
+      bool paAllowed = (sigMode < 0) && !newsOut && inSess && bias != REG_RANGE;
+
+      //--------------------------------------------------------------
+      // ENGINE D : liquidity sweep + reclaim
+      //--------------------------------------------------------------
+      if(paAllowed && InpUseSweep && i - g_lastSigBarMode[MODE_SWEEP] >= g_cooldown)
+        {
+         bool wantBuy = (bias == REG_BULL);
+         double lvl = (wantBuy ? LowestOf(low,  i - InpSweepLook, i - 1, rates_total)
+                       : HighestOf(high, i - InpSweepLook, i - 1, rates_total));
+         double pen = (wantBuy ? (lvl - low[i]) : (high[i] - lvl));
+
+         bool swept = (wantBuy ? (low[i] < lvl && close[i] > lvl)
+                       : (high[i] > lvl && close[i] < lvl));
+
+         if(swept && pen >= InpSweepMinATR * atr)
+           {
+            string pat = (wantBuy ? BullishPattern(open, high, low, close, i, atr)
+                          : BearishPattern(open, high, low, close, i, atr));
+            if(!(InpRequirePattern && pat == ""))
+              {
+               if(pat == "") pat = "Reclaim";
+               double entry = close[i];
+               double sl = (wantBuy ? low[i] - g_slBuf * atr : high[i] + g_slBuf * atr);
+               double risk = MathAbs(entry - sl);
+               if(risk > 0.0 && (g_maxRiskATR <= 0.0 || risk <= g_maxRiskATR * atr))
+                 {
+                  double tp1 = entry + (wantBuy ? 1.0 : -1.0) * risk * g_rr1;
+                  double tp2 = entry + (wantBuy ? 1.0 : -1.0) * risk * g_rr2;
+                  double pdD = (wantBuy ? Clamp(1.0 - chPos, 0, 1) : Clamp(chPos, 0, 1));
+                  wantReg = (wantBuy ? REG_BULL : REG_BEAR);
+                  mtf3 = (bias == wantReg) + (midReg == wantReg) + (ltfReg == wantReg);
+                  bool emaAl = (wantBuy ? (emaF > emaS && close[i] > emaF) : (emaF < emaS && close[i] < emaF));
+                  int sc = ScorePA(true, mtf3, pdD, Clamp(pen / (0.8 * atr), 0, 1), pat,
+                                   emaAl, adx, inSess, g_rr1, sessNow != SESS_OFF);
+                  if(sc >= g_minScore)
+                    {
+                     sigDir = (wantBuy ? 1 : -1); sigMode = MODE_SWEEP; sigScore = sc;
+                     sigEntry = entry; sigSL = sl; sigTP1 = tp1; sigTP2 = tp2; sigPat = pat;
+                     sigReason = BuildReason(MODE_SWEEP, bias, mtf3, chPos, "", pat, sessNow, g_rr1,
+                                             StringFormat("swept %s %s", (wantBuy ? "low" : "high"),
+                                                          DoubleToString(lvl, _Digits)));
+                    }
+                 }
+              }
+           }
+        }
+
+      //--------------------------------------------------------------
+      // ENGINE E : break and retest
+      //--------------------------------------------------------------
+      if(g_swHighBar > 0 && close[i] > g_swHigh && (close[i] - g_swHigh) >= 0.2 * atr &&
+         g_brtDir != 1)
+        {
+         g_brtDir = 1; g_brtLevel = g_swHigh; g_brtBar = i;
+        }
+      if(g_swLowBar > 0 && close[i] < g_swLow && (g_swLow - close[i]) >= 0.2 * atr &&
+         g_brtDir != -1)
+        {
+         g_brtDir = -1; g_brtLevel = g_swLow; g_brtBar = i;
+        }
+      if(g_brtDir != 0 && i - g_brtBar > InpBrtExpiry)
+         g_brtDir = 0;
+
+      if(paAllowed && sigMode < 0 && InpUseBRT && g_brtDir != 0 && i > g_brtBar &&
+         i - g_lastSigBarMode[MODE_BRT] >= g_cooldown)
+        {
+         bool wantBuy = (g_brtDir > 0);
+         if((wantBuy && bias == REG_BULL) || (!wantBuy && bias == REG_BEAR))
+           {
+            double tol = InpBrtTolATR * atr;
+            bool touched = (wantBuy ? (low[i] <= g_brtLevel + tol && close[i] > g_brtLevel)
+                            : (high[i] >= g_brtLevel - tol && close[i] < g_brtLevel));
+            if(touched)
+              {
+               string pat = (wantBuy ? BullishPattern(open, high, low, close, i, atr)
+                             : BearishPattern(open, high, low, close, i, atr));
+               if(!(InpRequirePattern && pat == ""))
+                 {
+                  if(pat == "") pat = "Retest Hold";
+                  double entry = close[i];
+                  double sl = (wantBuy ? MathMin(low[i], g_brtLevel) - g_slBuf * atr
+                               : MathMax(high[i], g_brtLevel) + g_slBuf * atr);
+                  double risk = MathAbs(entry - sl);
+                  if(risk > 0.0 && (g_maxRiskATR <= 0.0 || risk <= g_maxRiskATR * atr))
+                    {
+                     double tp1 = entry + (wantBuy ? 1.0 : -1.0) * risk * g_rr1;
+                     double tp2 = entry + (wantBuy ? 1.0 : -1.0) * risk * g_rr2;
+                     double precision = Clamp(1.0 - MathAbs(close[i] - g_brtLevel) / MathMax(tol, 1e-12), 0, 1);
+                     wantReg = (wantBuy ? REG_BULL : REG_BEAR);
+                     mtf3 = (bias == wantReg) + (midReg == wantReg) + (ltfReg == wantReg);
+                     bool emaAl = (wantBuy ? (emaF > emaS && close[i] > emaF) : (emaF < emaS && close[i] < emaF));
+                     double pdD = (wantBuy ? Clamp(1.0 - chPos, 0, 1) : Clamp(chPos, 0, 1));
+                     int sc = ScorePA(true, mtf3, pdD, precision, pat, emaAl, adx, inSess,
+                                      g_rr1, sessNow != SESS_OFF);
+                     if(sc >= g_minScore)
+                       {
+                        sigDir = (wantBuy ? 1 : -1); sigMode = MODE_BRT; sigScore = sc;
+                        sigEntry = entry; sigSL = sl; sigTP1 = tp1; sigTP2 = tp2; sigPat = pat;
+                        sigReason = BuildReason(MODE_BRT, bias, mtf3, chPos, "", pat, sessNow, g_rr1,
+                                                "retest " + DoubleToString(g_brtLevel, _Digits));
+                        g_brtDir = 0;
+                       }
+                    }
+                 }
+              }
+           }
+        }
+
+      //--------------------------------------------------------------
+      // ENGINE F : trend pullback to EMA 50
+      //--------------------------------------------------------------
+      if(paAllowed && sigMode < 0 && InpUseTPB && ltfReg != REG_RANGE && ltfReg == bias &&
+         i - g_lastSigBarMode[MODE_TPB] >= g_cooldown && emaF > 0.0)
+        {
+         bool wantBuy = (bias == REG_BULL);
+         bool touchedEma = (wantBuy ? (low[i] <= emaF && close[i] > emaF)
+                            : (high[i] >= emaF && close[i] < emaF));
+         if(touchedEma)
+           {
+            double legHi = HighestOf(high, i - InpLegLookback * 2 + 1, i, rates_total);
+            double legLo = LowestOf(low,  i - InpLegLookback * 2 + 1, i, rates_total);
+            double legRng = legHi - legLo;
+            double depth = (legRng > 0.0 ? (wantBuy ? (legHi - close[i]) / legRng
+                                            : (close[i] - legLo) / legRng) : 1.0);
+            if(depth <= InpTpbMaxDepth)
+              {
+               string pat = (wantBuy ? BullishPattern(open, high, low, close, i, atr)
+                             : BearishPattern(open, high, low, close, i, atr));
+               if(!(InpRequirePattern && pat == ""))
+                 {
+                  if(pat == "") pat = "EMA Hold";
+                  double entry = close[i];
+                  double sl = (wantBuy ? LowestOf(low, i - InpSlLookback + 1, i, rates_total) - g_slBuf * atr
+                               : HighestOf(high, i - InpSlLookback + 1, i, rates_total) + g_slBuf * atr);
+                  double risk = MathAbs(entry - sl);
+                  if(risk > 0.0 && (g_maxRiskATR <= 0.0 || risk <= g_maxRiskATR * atr))
+                    {
+                     double tp1 = entry + (wantBuy ? 1.0 : -1.0) * risk * g_rr1;
+                     double tp2 = entry + (wantBuy ? 1.0 : -1.0) * risk * g_rr2;
+                     wantReg = (wantBuy ? REG_BULL : REG_BEAR);
+                     mtf3 = (bias == wantReg) + (midReg == wantReg) + (ltfReg == wantReg);
+                     int sc = ScorePA(true, mtf3, Clamp(depth / InpTpbMaxDepth, 0, 1),
+                                      Clamp((adx - g_adxTrend) / 15.0, 0, 1), pat, true, adx,
+                                      inSess, g_rr1, sessNow != SESS_OFF);
+                     if(sc >= g_minScore)
+                       {
+                        sigDir = (wantBuy ? 1 : -1); sigMode = MODE_TPB; sigScore = sc;
+                        sigEntry = entry; sigSL = sl; sigTP1 = tp1; sigTP2 = tp2; sigPat = pat;
+                        sigReason = BuildReason(MODE_TPB, bias, mtf3, (wantBuy ? depth : 1.0 - depth),
+                                                "", pat, sessNow, g_rr1,
+                                                StringFormat("EMA%d pullback %.0f%%", InpEmaFast, depth * 100.0));
+                       }
+                    }
+                 }
+              }
+           }
+        }
+
+      //--------------------------------------------------------------
+      // ENGINE G : Asian range sweep (Judas swing)
+      //--------------------------------------------------------------
+      if(paAllowed && sigMode < 0 && InpUseAsia && g_asiaSet && g_spikeDir == 0 &&
+         g_asiaHi > g_asiaLo && i - g_lastSigBarMode[MODE_ASIA] >= g_cooldown)
+        {
+         int gh = GmtHour(time[i]);
+         if(gh >= InpAsiaSweepStart && gh < InpAsiaSweepEnd)
+           {
+            bool wantBuy = (bias == REG_BULL);
+            bool swept = false;
+            if(wantBuy && !g_asiaSweptLo && low[i] < g_asiaLo && close[i] > g_asiaLo)
+              { swept = true; g_asiaSweptLo = true; }
+            if(!wantBuy && !g_asiaSweptHi && high[i] > g_asiaHi && close[i] < g_asiaHi)
+              { swept = true; g_asiaSweptHi = true; }
+
+            if(swept)
+              {
+               string pat = (wantBuy ? BullishPattern(open, high, low, close, i, atr)
+                             : BearishPattern(open, high, low, close, i, atr));
+               if(!(InpRequirePattern && pat == ""))
+                 {
+                  if(pat == "") pat = "Judas Reclaim";
+                  double entry = close[i];
+                  double sl = (wantBuy ? low[i] - g_slBuf * atr : high[i] + g_slBuf * atr);
+                  double risk = MathAbs(entry - sl);
+                  if(risk > 0.0 && (g_maxRiskATR <= 0.0 || risk <= g_maxRiskATR * atr))
+                    {
+                     // the opposite side of the Asian range is the natural target
+                     double liq = (wantBuy ? g_asiaHi : g_asiaLo);
+                     double tp1 = entry + (wantBuy ? 1.0 : -1.0) * risk * g_rr1;
+                     if(wantBuy && liq > tp1) tp1 = liq;
+                     if(!wantBuy && liq < tp1) tp1 = liq;
+                     double tp2 = entry + (wantBuy ? 1.0 : -1.0) * risk * g_rr2;
+                     double rrEff = MathAbs(tp1 - entry) / risk;
+                     wantReg = (wantBuy ? REG_BULL : REG_BEAR);
+                     mtf3 = (bias == wantReg) + (midReg == wantReg) + (ltfReg == wantReg);
+                     bool emaAl = (wantBuy ? (emaF > emaS) : (emaF < emaS));
+                     int sc = ScorePA(true, mtf3, 0.8, 0.85, pat, emaAl, adx, true, rrEff, true);
+                     if(sc >= g_minScore)
+                       {
+                        sigDir = (wantBuy ? 1 : -1); sigMode = MODE_ASIA; sigScore = sc;
+                        sigEntry = entry; sigSL = sl; sigTP1 = tp1; sigTP2 = tp2; sigPat = pat;
+                        sigReason = BuildReason(MODE_ASIA, bias, mtf3, -1.0, "", pat, sessNow, rrEff,
+                                                StringFormat("swept Asian %s", (wantBuy ? "low" : "high")));
+                       }
+                    }
+                 }
+              }
+           }
+        }
+
+      //--- news blackout also vetoes the CRT and spike engines -------
+      if(sigMode >= 0 && newsOut)
+        {
+         g_newsReject++;
+         sigMode = -1;
+         sigDir = 0;
         }
 
       //--- spread viability : a target the spread eats is not a signal ---
@@ -2324,7 +2941,9 @@ int OnCalculate(const int rates_total,
       if(sigMode >= 0 && sigDir != 0)
         {
          double off = InpDotOffsetATR * atr;
-         bool premium = (sigScore >= InpPremiumScore);
+         // large dot = premium score AND every hard gate clear (news, session,
+         // spread, and enough anchor history for the bias to mean anything)
+         bool premium = (sigScore >= InpPremiumScore) && g_htfOk;
          if(sigDir > 0)
            {
             if(premium) BufBuyHi[i] = low[i] - off;
@@ -2341,12 +2960,12 @@ int OnCalculate(const int rates_total,
          BufScore[i] = (double)sigScore;
          BufMode[i] = (double)sigMode;
 
-         PushSignal(time[i], i, sigDir, sigMode, sigScore, sigEntry, sigSL, sigTP1, sigTP2, sigPat);
+         PushSignal(time[i], i, sigDir, sigMode, sigScore, sigEntry, sigSL, sigTP1, sigTP2, sigPat, sigReason);
          g_lastSigBarMode[sigMode] = i;
 
          if(i == rates_total - 2)
             FireAlert(time[i], sigDir, sigMode, sigScore, GradeOf(sigScore),
-                      sigEntry, sigSL, sigTP1, sigTP2, sigPat);
+                      sigEntry, sigSL, sigTP1, sigTP2, sigPat, sigReason);
         }
 
       //--- carry window state to the dashboard on the newest bar ------

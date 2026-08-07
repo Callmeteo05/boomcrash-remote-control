@@ -33,6 +33,95 @@ never contradict each other on the same candle.
 
 ---
 
+## Seven entry models
+
+CRT alone waits for a specific higher-timeframe sequence, which is why quiet days
+were quiet. Six more models now run alongside it, each a distinct, well-defined
+price-action setup. All of them inherit the same gates: HTF bias, session, news,
+spread, score.
+
+| Model | Tag | Trigger |
+| --- | --- | --- |
+| Candle Range Theory | `CRT` | anchor raid → close back inside → MSS → FVG/OB retest |
+| Liquidity Sweep + Reclaim | `SWEEP` | takes out a prior swing low/high, then closes back through it |
+| Break and Retest | `BRT` | displacement break of a swing level, then price returns and holds it |
+| Trend Pullback | `TPB` | trending market pulls back to EMA 50, holds, and prints a rejection |
+| Asian Range Sweep | `ASIA` | London sweeps the Asian session low/high and reclaims it (Judas swing) |
+| Spike Hunt | `HUNT` | overdue spike, price at the far edge of the drift channel |
+| Spike Fade | `FADE` | spike prints and gives back part of its range |
+
+They fire in priority order, so only one signal prints per bar. `SWEEP`, `BRT` and
+`TPB` are the high-frequency models that fill in the days CRT skips. `ASIA` is FX
+and index oriented and switches itself off on spike indices. Each model has its own
+toggle.
+
+The chart tag on every dot names the model that fired: `A+ 91 BRT`.
+
+## Why this trade — the reason stack
+
+Every signal carries a plain-language explanation, shown on the dashboard and
+included in the alert:
+
+```
+BRT | H4 BEARISH | 3/3 MTF | premium 71% | LONDON | retest 1.09420
+    | Bear Engulf | 2.0R
+```
+
+That is assembled from the same components the scorer uses, so the score and the
+explanation can never disagree. It tells you which model fired, what the anchor bias
+is, how many timeframes agree, where price sits in the range, which session you are
+in, the structural trigger, the confirming candle, and the reward on offer.
+
+## News awareness
+
+**MT5 reads the real economic calendar.** It pulls scheduled events for the symbol's
+base and profit currencies via `CalendarEventByCurrency` / `CalendarValueHistory`,
+keeps high-impact ones (medium too, optionally), and blocks every engine for a
+window before and after each release. The dashboard shows the currencies being
+watched, minutes to the next event, and how many signals the filter has blocked.
+
+Two honest limits. The calendar needs a terminal connected to a MetaQuotes server —
+if it returns nothing the dashboard says `calendar unavailable` and the filter fails
+**open**, so check that row rather than assuming you are protected. And the filter
+disables itself on synthetics, because Boom's base currency is USD and US news has
+nothing to do with it.
+
+**TradingView has no economic calendar at all.** Pine cannot see events. The Pine
+build offers a manual daily blackout window instead, off by default. This is a
+platform limitation, not something I can code around.
+
+## Session engine
+
+Beyond killzone filtering, the indicator now tracks the **Asian session range** each
+GMT day and carries it forward. That range powers the `ASIA` model and is displayed
+live. The dashboard names the active session and marks off-session hours.
+
+## Freshness — what makes a dot actionable
+
+A dot prints at bar close. By the time you see it, price has moved. The indicator now
+measures that directly and gives a verdict on the most recent signal:
+
+```
+Status : TAKEABLE  (chased 0.08R, 1 bars)
+Status : TOO LATE  (chased 0.41R)
+Status : EXPIRED   (5 bars old)
+```
+
+`chased` is how far price has run *against your entry price* in R. Past
+`Max adverse chase` (default 0.30R), the trade you'd get is no longer the trade the
+indicator scored, and the panel says so. Past `Signal TTL` bars, it expires. The
+alert carries the same window in text.
+
+This is the closest an indicator can honestly get to "dots printed = enter now": the
+dot means every rule passed, and the status line tells you whether the price you can
+still get is one worth taking.
+
+**The large A+ dot** now requires more than a high score — it also requires every
+hard gate clear, including sufficient anchor history for the bias to be meaningful.
+Small dots are watch-list; large dots are the ones the system considers complete.
+
+---
+
 ## Scalp, day trade, swing
 
 One `Trading style` input reshapes the whole indicator. On **Auto** it reads your
