@@ -514,3 +514,79 @@ Compile both before trading them, and validate the settings on your own symbol a
 broker feed. The built-in performance tracker is the fastest way to do that: load the
 indicator, let it scan your history, and read the win rate and per-engine breakdown
 off the dashboard before risking anything.
+
+---
+
+# CRT Sniper Lite
+
+A deliberately small indicator, built after Pro turned out to be too much. Use this
+one first.
+
+| | Pro | **Lite** |
+| --- | --- | --- |
+| Settings | 110 | **32** |
+| Lines of code | 3,281 | **689** |
+| Entry models | 9 | **2** |
+| Chart output | 35-row dashboard | **BUY / SELL, SL, TP, 6-line panel** |
+| Logic verified | no | **yes, see below** |
+
+`MT5/Indicators/CRT_Sniper_Lite.mq5`
+
+## What it draws
+
+Exactly what the reference screenshot shows and nothing else: the word **BUY** or
+**SELL** at the signal candle, a vertical line from entry out to the far target, and
+horizontal **SL** / **TP** lines with labels. A six-line panel at the top left gives
+trend, location, the last signal and why it fired.
+
+## What it looks for
+
+Two models, both requiring the chart **and** the higher timeframe to agree:
+
+- **Liquidity sweep** — price takes out a prior swing low or high, then closes back
+  through it.
+- **Trend pullback** — price pulls back into EMA 50 inside an established trend and
+  holds.
+
+Then: buys only in the lower half of the recent range, sells only in the upper half,
+plus a candlestick confirmation. A signal skips the candle requirement only when the
+structural trigger is strong on its own.
+
+Quality is scored out of 100 from five equal parts — trend strength, entry location,
+candle, trigger quality and reward — with one dial (`Signal quality`, default 70)
+controlling how strict it is.
+
+## Why the higher-timeframe check is different from Pro
+
+Pro asks for **EMA 200 on the anchor timeframe** — 200 daily candles. Synthetics and
+newer symbols often do not have that, so the bias read wrong or stuck, and every
+model downstream inherited the error. That is the most likely reason Pro's signals
+looked wrong.
+
+Lite uses **EMA 50 on the higher timeframe** instead. Fifty bars, which every broker
+has, on every symbol.
+
+## Verified, not just written
+
+`tools/verify_lite_logic.py` re-implements the decision chain in Python and runs it
+against synthetic series whose correct answer is known in advance. Run it with
+`python3 tools/verify_lite_logic.py`.
+
+It checks that buys appear only in uptrends, sells only in downtrends, almost nothing
+in a range, that stops always sit on the losing side of entry and targets on the
+winning side, and that R multiples come out as configured.
+
+Three real bugs were found and fixed this way:
+
+1. **Signals were far too rare** — one per 145 bars. The candle filter was rejecting
+   88% of otherwise valid setups. Broadening confirmation to include inside-bar
+   breaks, tweezers and momentum closes took it to one per 45 bars.
+2. **The trend component of the score was a constant 20**, so it contributed nothing
+   and compressed the usable range to 70–81. Now it measures EMA separation and the
+   higher-timeframe distance from its own EMA, and the range is 70–88.
+3. **Break-and-retest was removed.** It fired zero times in trends — price does not
+   return to the broken level — and fired constantly in ranges on meaningless
+   micro-breaks. Two models that work beat three where one is a noise generator.
+
+This proves the rules behave as described. It does **not** prove they are profitable
+— that still needs your broker's data.
