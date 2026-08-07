@@ -1,0 +1,618 @@
+//@version=5
+// =============================================================================
+//  CRT SNIPER SIGNALS
+//  Candle Range Theory (CRT) + higher-timeframe bias + MSS/FVG execution
+//
+//  The sequence this script enforces, top down:
+//    1. Anchor on a higher-timeframe candle that closed at a key S/R level
+//    2. Mark CRT-High and CRT-Low (that candle's high and low)
+//    3. Wait for the next candle to raid the CRT-High (bearish) or CRT-Low (bullish)
+//    4. That raiding candle must close back INSIDE the range
+//    5. Drop to the chart timeframe for the trigger
+//    6. Require a market structure shift (MSS) with displacement
+//    7. Enter on the retest into the FVG / order block left by the displacement
+//
+//  A dot only prints when the higher-timeframe bias agrees, price is in
+//  discount (buys) or premium (sells), and a candlestick pattern confirms.
+//  Everything is evaluated on closed bars only - the script does not repaint.
+// =============================================================================
+indicator("CRT Sniper Signals", overlay = true, max_lines_count = 500,
+     max_labels_count = 500, max_boxes_count = 100)
+
+// -----------------------------------------------------------------------------
+// Inputs
+// -----------------------------------------------------------------------------
+grpH  = "Higher timeframe (CRT anchor)"
+htfIn          = input.timeframe("",    "Anchor timeframe (blank = auto)", group = grpH)
+crtValidBars   = input.int(2,     "CRT stays valid for N anchor candles", minval = 1, maxval = 2, group = grpH)
+requireKey     = input.bool(true, "Anchor must sit on a key S/R (liquidity) level", group = grpH)
+srLook         = input.int(10,    "Key level lookback (anchor candles)", minval = 3, group = grpH)
+keyTol         = input.float(0.25,"Key level tolerance (x HTF ATR)", minval = 0.0, step = 0.05, group = grpH)
+minCloseBack   = input.float(0.0, "Min close-back inside range (0..0.5)", minval = 0.0, maxval = 0.5, step = 0.05, group = grpH)
+
+grpT  = "Trend / regime engine"
+emaFastLen     = input.int(50,    "EMA fast", minval = 2, group = grpT)
+emaSlowLen     = input.int(200,   "EMA slow", minval = 5, group = grpT)
+adxLen         = input.int(14,    "ADX period", minval = 2, group = grpT)
+adxTrend       = input.float(20.0,"ADX above this = trending", group = grpT)
+minSepATR      = input.float(0.25,"Min EMA50/200 separation (x ATR)", step = 0.05, group = grpT)
+emaFilter      = input.string("Soft", "EMA filter on the signal timeframe", options = ["Off", "Soft", "Strict"], group = grpT)
+blockInRange   = input.bool(true, "Block all signals while HTF is SIDEWAYS", group = grpT)
+
+grpP  = "Premium / discount"
+maxBuyPD       = input.float(0.50,"Buy only when CRT position <= this", minval = 0.0, maxval = 1.0, step = 0.05, group = grpP)
+minSellPD      = input.float(0.50,"Sell only when CRT position >= this", minval = 0.0, maxval = 1.0, step = 0.05, group = grpP)
+useHtfPD       = input.bool(false,"Also gate on the HTF dealing-range position", group = grpP)
+htfMaxBuyPD    = input.float(0.60,"HTF max position for buys", minval = 0.0, maxval = 1.0, step = 0.05, group = grpP)
+htfMinSellPD   = input.float(0.40,"HTF min position for sells", minval = 0.0, maxval = 1.0, step = 0.05, group = grpP)
+
+grpL  = "Lower timeframe execution"
+swingLen       = input.int(3,     "Swing (pivot) strength", minval = 1, group = grpL)
+legLook        = input.int(12,    "Displacement leg lookback (bars)", minval = 3, group = grpL)
+dispATR        = input.float(1.20,"Min displacement of the MSS leg (x ATR)", step = 0.1, group = grpL)
+zoneMode       = input.string("FVG then OB", "Retest zone source", options = ["FVG then OB", "FVG only", "OB only"], group = grpL)
+allowMssRetest = input.bool(true, "Fall back to a retest of the MSS level", group = grpL)
+requirePattern = input.bool(true, "Require a candlestick pattern at the retest", group = grpL)
+setupExpiry    = input.int(24,    "Cancel setup if no entry within N bars", minval = 2, group = grpL)
+invalidATR     = input.float(0.35,"Zone invalidation buffer (x ATR)", step = 0.05, group = grpL)
+multiEntry     = input.bool(false,"Allow several entries from one zone", group = grpL)
+cooldownBars   = input.int(3,     "Min bars between signals", minval = 0, group = grpL)
+
+grpR  = "Risk : stop loss & targets"
+atrLen         = input.int(14,    "ATR period", minval = 2, group = grpR)
+slLook         = input.int(6,     "Structural SL lookback (bars)", minval = 2, group = grpR)
+slBufATR       = input.float(0.30,"SL buffer beyond structure (x ATR)", step = 0.05, group = grpR)
+maxRiskATR     = input.float(4.0, "Skip signal if risk > this (x ATR, 0 = off)", step = 0.5, group = grpR)
+rr1            = input.float(2.0, "Take profit 1 (R multiple)", step = 0.1, group = grpR)
+rr2            = input.float(3.5, "Take profit 2 (R multiple)", step = 0.1, group = grpR)
+useLiqTP       = input.bool(true, "Push TP2 to the opposing liquidity if further", group = grpR)
+liqLook        = input.int(30,    "Opposing liquidity lookback (bars)", minval = 5, group = grpR)
+
+grpD  = "Display"
+dotOffATR      = input.float(0.55,"Dot distance from the wick (x ATR)", step = 0.05, group = grpD)
+showSLTP       = input.bool(true, "Draw SL / TP lines", group = grpD)
+showLast       = input.int(6,     "Draw SL/TP for the last N signals", minval = 1, maxval = 40, group = grpD)
+projectBars    = input.int(28,    "SL/TP line length (bars)", minval = 4, group = grpD)
+buyCol         = input.color(#2196f3, "Buy dot", group = grpD)
+sellCol        = input.color(#ff5252, "Sell dot", group = grpD)
+slCol          = input.color(#e53935, "SL", group = grpD)
+tp1Col         = input.color(#26a69a, "TP1", group = grpD)
+tp2Col         = input.color(#66bb6a, "TP2", group = grpD)
+showCrtBox     = input.bool(false,"Debug: draw the active CRT range", group = grpD)
+showPanel      = input.bool(true, "Show dashboard", group = grpD)
+panelPos       = input.string("Top right", "Dashboard position", options = ["Top right", "Top left", "Bottom right", "Bottom left"], group = grpD)
+
+// -----------------------------------------------------------------------------
+// Anchor timeframe resolution
+// -----------------------------------------------------------------------------
+chartSec = timeframe.in_seconds()
+autoTf   = chartSec <= 300   ? "60"  :
+     chartSec <= 1800  ? "240" :
+     chartSec <= 14400 ? "D"   :
+     chartSec <= 86400 ? "W"   : "M"
+htf = htfIn == "" ? autoTf : htfIn
+
+// -----------------------------------------------------------------------------
+// Higher timeframe data - only CLOSED anchor candles are ever referenced
+// -----------------------------------------------------------------------------
+htfPack() =>
+    e50  = ta.ema(close, emaFastLen)
+    e200 = ta.ema(close, emaSlowLen)
+    atrH = ta.atr(atrLen)
+    [_dp, _dm, adxH] = ta.dmi(adxLen, adxLen)
+    loSr = ta.lowest(low,   srLook)
+    hiSr = ta.highest(high, srLook)
+    [high[1], low[1], close[1], time[1],
+     high[2], low[2], close[2], time[2],
+     high[3], low[3], close[3],
+     e50[1], e200[1], atrH[1], atrH[2], atrH[3], adxH[1],
+     loSr[3], hiSr[3], loSr[4], hiSr[4], loSr[1], hiSr[1]]
+
+[h1, l1, c1, t1, h2, l2, c2, t2, h3, l3, c3, hE50, hE200, hAtr1, hAtr2, hAtr3,
+ hAdx, loP1, hiP1, loP2, hiP2, hRangeLo, hRangeHi] =
+     request.security(syminfo.tickerid, htf, htfPack(), lookahead = barmerge.lookahead_off)
+
+// -----------------------------------------------------------------------------
+// Regime classifier : 1 bullish, -1 bearish, 0 sideways
+// -----------------------------------------------------------------------------
+regime(e50, e200, price, adx, a) =>
+    int res = 0
+    if not na(e50) and not na(e200) and not na(a) and a > 0 and not na(adx)
+        sep      = math.abs(e50 - e200)
+        trending = adx >= adxTrend and sep >= minSepATR * a
+        res := not trending ? 0 :
+             e50 > e200 and price > e200 ?  1 :
+             e50 < e200 and price < e200 ? -1 : 0
+    res
+
+// -----------------------------------------------------------------------------
+// Chart timeframe indicators (all ta.* calls stay unconditional)
+// -----------------------------------------------------------------------------
+atrv  = ta.atr(atrLen)
+emaF  = ta.ema(close, emaFastLen)
+emaS  = ta.ema(close, emaSlowLen)
+[_dip, _dim, adxC] = ta.dmi(adxLen, adxLen)
+
+legLowV  = ta.lowest(low,   legLook)
+legHighV = ta.highest(high, legLook)
+slLowV   = ta.lowest(low,   slLook)
+slHighV  = ta.highest(high, slLook)
+liqLowV  = ta.lowest(low,   liqLook)
+liqHighV = ta.highest(high, liqLook)
+
+htfBias  = regime(hE50, hE200, c1, hAdx, hAtr1)
+chartReg = regime(emaF, emaS, close, adxC, atrv)
+
+// -----------------------------------------------------------------------------
+// CRT detection on the anchor timeframe
+// -----------------------------------------------------------------------------
+crtCheck(aHi, aLo, rHi, rLo, rCl, atrA, loPrior, hiPrior, bias) =>
+    int dir = 0
+    if not na(aHi) and not na(aLo) and not na(rCl) and not na(atrA) and atrA > 0 and aHi > aLo
+        aRng = aHi - aLo
+        tol  = keyTol * atrA
+        back = math.max(0.0, math.min(0.5, minCloseBack)) * aRng
+        // bullish CRT : sweep the CRT-Low, close back above it, still inside the range
+        bool bull = rLo < aLo and rCl > aLo + back and rCl < aHi
+        // bearish CRT : sweep the CRT-High, close back below it, still inside the range
+        bool bear = rHi > aHi and rCl < aHi - back and rCl > aLo
+        if requireKey
+            bull := bull and not na(loPrior) and aLo <= loPrior + tol
+            bear := bear and not na(hiPrior) and aHi >= hiPrior - tol
+        if bull and bear
+            // outside candle swept both sides - let the bias break the tie
+            bull := bias ==  1
+            bear := bias == -1
+        dir := bull ? 1 : bear ? -1 : 0
+    dir
+
+d1 = crtCheck(h2, l2, h1, l1, c1, hAtr2, loP1, hiP1, htfBias)
+d2raw = crtCheck(h3, l3, h2, l2, c2, hAtr3, loP2, hiP2, htfBias)
+d2 = crtValidBars >= 2 ? d2raw : 0
+
+crtDir      = d1 != 0 ? d1 : d2
+crtHi       = d1 != 0 ? h2 : h3
+crtLo       = d1 != 0 ? l2 : l3
+crtRaidTime = d1 != 0 ? t1 : t2
+haveCrt     = crtDir != 0 and not na(crtHi) and not na(crtLo) and crtHi > crtLo
+
+// -----------------------------------------------------------------------------
+// Candlestick patterns
+// -----------------------------------------------------------------------------
+bullPattern(a) =>
+    string p = ""
+    body = math.abs(close - open)
+    rng  = high - low
+    up   = high - math.max(open, close)
+    dn   = math.min(open, close) - low
+    if rng > 0 and a > 0
+        if close > open and close[1] < open[1] and close >= open[1] and open <= close[1] and body > 0.30 * a
+            p := "Bull Engulf"
+        else if dn >= 2.0 * body and up <= 0.60 * body and close >= low + 0.60 * rng
+            p := "Hammer"
+        else if close[1] < open[1] and open < close[1] and close > (open[1] + close[1]) * 0.5 and close < open[1]
+            p := "Piercing"
+        else if close[2] < open[2] and math.abs(close[2] - open[2]) > 0.40 * a and
+             math.abs(close[1] - open[1]) < 0.35 * math.abs(close[2] - open[2]) and
+             close > open and close > (open[2] + close[2]) * 0.5
+            p := "Morning Star"
+        else if math.abs(low - low[1]) <= 0.12 * a and close > open and close[1] < open[1] and body > 0.25 * a
+            p := "Tweezer Btm"
+        else if high[1] < high[2] and low[1] > low[2] and close > high[1] and close > open
+            p := "IB Break Up"
+        else if dn >= 0.55 * rng and close > (high + low) * 0.5 and rng > 0.50 * a
+            p := "Rejection"
+    p
+
+bearPattern(a) =>
+    string p = ""
+    body = math.abs(close - open)
+    rng  = high - low
+    up   = high - math.max(open, close)
+    dn   = math.min(open, close) - low
+    if rng > 0 and a > 0
+        if close < open and close[1] > open[1] and close <= open[1] and open >= close[1] and body > 0.30 * a
+            p := "Bear Engulf"
+        else if up >= 2.0 * body and dn <= 0.60 * body and close <= high - 0.60 * rng
+            p := "Shooting Star"
+        else if close[1] > open[1] and open > close[1] and close < (open[1] + close[1]) * 0.5 and close > open[1]
+            p := "Dark Cloud"
+        else if close[2] > open[2] and math.abs(close[2] - open[2]) > 0.40 * a and
+             math.abs(close[1] - open[1]) < 0.35 * math.abs(close[2] - open[2]) and
+             close < open and close < (open[2] + close[2]) * 0.5
+            p := "Evening Star"
+        else if math.abs(high - high[1]) <= 0.12 * a and close < open and close[1] > open[1] and body > 0.25 * a
+            p := "Tweezer Top"
+        else if high[1] < high[2] and low[1] > low[2] and close < low[1] and close < open
+            p := "IB Break Dn"
+        else if up >= 0.55 * rng and close < (high + low) * 0.5 and rng > 0.50 * a
+            p := "Rejection"
+    p
+
+// -----------------------------------------------------------------------------
+// Chart timeframe swing structure
+// -----------------------------------------------------------------------------
+ph = ta.pivothigh(high, swingLen, swingLen)
+pl = ta.pivotlow(low,  swingLen, swingLen)
+
+var float swHigh    = na
+var int   swHighBar = na
+var float swLow     = na
+var int   swLowBar  = na
+
+if not na(ph)
+    swHigh    := ph
+    swHighBar := bar_index - swingLen
+if not na(pl)
+    swLow    := pl
+    swLowBar := bar_index - swingLen
+
+// -----------------------------------------------------------------------------
+// Retest zones left behind by the displacement leg
+// (computed unconditionally; the MSS level is always the swing being broken)
+// -----------------------------------------------------------------------------
+buildBullZone(a, mssLvl) =>
+    float zHi = na
+    float zLo = na
+    string kind = ""
+    if zoneMode != "OB only"
+        for k = 0 to legLook
+            if low[k] > high[k + 2] and low[k] < close
+                zHi  := low[k]
+                zLo  := high[k + 2]
+                kind := "FVG"
+                break
+    if na(zHi) and zoneMode != "FVG only"
+        for k = 1 to legLook
+            if close[k] < open[k] and math.max(open[k], close[k]) < close
+                zLo  := low[k]
+                zHi  := math.max(open[k], close[k])
+                kind := "Order Block"
+                break
+    if na(zHi) and allowMssRetest and not na(mssLvl)
+        zLo  := mssLvl - invalidATR * a
+        zHi  := mssLvl + 0.15 * a
+        kind := "MSS Retest"
+    [zHi, zLo, kind]
+
+buildBearZone(a, mssLvl) =>
+    float zHi = na
+    float zLo = na
+    string kind = ""
+    if zoneMode != "OB only"
+        for k = 0 to legLook
+            if high[k] < low[k + 2] and high[k] > close
+                zLo  := high[k]
+                zHi  := low[k + 2]
+                kind := "FVG"
+                break
+    if na(zHi) and zoneMode != "FVG only"
+        for k = 1 to legLook
+            if close[k] > open[k] and math.min(open[k], close[k]) > close
+                zHi  := high[k]
+                zLo  := math.min(open[k], close[k])
+                kind := "Order Block"
+                break
+    if na(zHi) and allowMssRetest and not na(mssLvl)
+        zHi  := mssLvl + invalidATR * a
+        zLo  := mssLvl - 0.15 * a
+        kind := "MSS Retest"
+    [zHi, zLo, kind]
+
+[bullZH, bullZL, bullZK] = buildBullZone(atrv, swHigh)
+[bearZH, bearZL, bearZK] = buildBearZone(atrv, swLow)
+
+// -----------------------------------------------------------------------------
+// State machine
+// -----------------------------------------------------------------------------
+var int    stRaid     = 0
+var int    stDir      = 0
+var float  stCrtHi    = na
+var float  stCrtLo    = na
+var bool   stMss      = false
+var float  stMssLvl   = na
+var int    stMssBar   = na
+var bool   stZone     = false
+var float  stZoneHi   = na
+var float  stZoneLo   = na
+var string stZoneKind = ""
+var int    lastSigBar = -100000
+
+var float  lastEntry  = na
+var float  lastSL     = na
+var float  lastTP1    = na
+var float  lastTP2    = na
+var int    lastDir    = 0
+var string lastPat    = ""
+
+bool  buySig  = false
+bool  sellSig = false
+float sigSL   = na
+float sigTP1  = na
+float sigTP2  = na
+
+if barstate.isconfirmed and not na(atrv) and atrv > 0
+    // --- 1. keep the CRT state in sync with the anchor timeframe -------------
+    if not haveCrt
+        stRaid     := 0
+        stDir      := 0
+        stMss      := false
+        stZone     := false
+        stMssLvl   := na
+        stZoneKind := ""
+    else if crtRaidTime != stRaid or crtDir != stDir
+        stRaid     := crtRaidTime
+        stDir      := crtDir
+        stCrtHi    := crtHi
+        stCrtLo    := crtLo
+        stMss      := false
+        stZone     := false
+        stMssLvl   := na
+        stMssBar   := na
+        stZoneKind := ""
+
+    crtRng = nz(stCrtHi - stCrtLo, 0.0)
+
+    if stDir != 0 and crtRng > 0
+        if not stMss
+            // --- 2. market structure shift with displacement ------------------
+            if stDir == 1 and not na(swHigh) and not na(swHighBar) and swHighBar < bar_index and
+                 close > swHigh and (close - legLowV) >= dispATR * atrv
+                stMss      := true
+                stMssLvl   := swHigh
+                stMssBar   := bar_index
+                stZoneHi   := bullZH
+                stZoneLo   := bullZL
+                stZoneKind := bullZK
+                stZone     := not na(bullZH) and not na(bullZL) and bullZH > bullZL
+            else if stDir == -1 and not na(swLow) and not na(swLowBar) and swLowBar < bar_index and
+                 close < swLow and (legHighV - close) >= dispATR * atrv
+                stMss      := true
+                stMssLvl   := swLow
+                stMssBar   := bar_index
+                stZoneHi   := bearZH
+                stZoneLo   := bearZL
+                stZoneKind := bearZK
+                stZone     := not na(bearZH) and not na(bearZL) and bearZH > bearZL
+        else
+            // --- 3. housekeeping ----------------------------------------------
+            expired    = bar_index - stMssBar > setupExpiry
+            invalidBuy = stDir ==  1 and close < stZoneLo - invalidATR * atrv
+            invalidSel = stDir == -1 and close > stZoneHi + invalidATR * atrv
+
+            if not stZone or expired or invalidBuy or invalidSel
+                stMss      := false
+                stZone     := false
+                stMssLvl   := na
+                stZoneKind := ""
+            else
+                // --- 4. gates --------------------------------------------------
+                pd       = (close - stCrtLo) / crtRng
+                htfPD    = hRangeHi > hRangeLo ? (close - hRangeLo) / (hRangeHi - hRangeLo) : 0.5
+                wantBuy  = stDir == 1
+                wantSell = stDir == -1
+
+                bool ok = true
+                if blockInRange and htfBias == 0
+                    ok := false
+                if wantBuy  and htfBias !=  1
+                    ok := false
+                if wantSell and htfBias != -1
+                    ok := false
+                if wantBuy  and pd > maxBuyPD
+                    ok := false
+                if wantSell and pd < minSellPD
+                    ok := false
+                if useHtfPD and wantBuy  and htfPD > htfMaxBuyPD
+                    ok := false
+                if useHtfPD and wantSell and htfPD < htfMinSellPD
+                    ok := false
+                if emaFilter == "Soft"
+                    if wantBuy and close < emaF
+                        ok := false
+                    if wantSell and close > emaF
+                        ok := false
+                if emaFilter == "Strict"
+                    if wantBuy and not (emaF > emaS and close > emaF)
+                        ok := false
+                    if wantSell and not (emaF < emaS and close < emaF)
+                        ok := false
+                if bar_index - lastSigBar < cooldownBars
+                    ok := false
+
+                // --- 5. retest of the zone + candlestick confirmation ----------
+                tapped = wantBuy ? (low <= stZoneHi and close > stZoneLo)
+                     : (high >= stZoneLo and close < stZoneHi)
+                if not tapped
+                    ok := false
+
+                string pat = ""
+                if ok
+                    pat := wantBuy ? bullPattern(atrv) : bearPattern(atrv)
+                    if requirePattern and pat == ""
+                        ok := false
+                    if pat == ""
+                        pat := "Zone Tap"
+
+                // --- 6. stop loss and targets ----------------------------------
+                if ok
+                    entry = close
+                    sl    = wantBuy ? math.min(slLowV,  stZoneLo) - slBufATR * atrv
+                         : math.max(slHighV, stZoneHi) + slBufATR * atrv
+                    risk  = math.abs(entry - sl)
+
+                    if risk > 0 and (maxRiskATR <= 0 or risk <= maxRiskATR * atrv)
+                        float tp1 = na
+                        float tp2 = na
+                        if wantBuy
+                            tp1 := entry + risk * rr1
+                            tp2 := entry + risk * rr2
+                            liq = math.max(stCrtHi, liqHighV)
+                            tp2 := useLiqTP and liq > tp1 ? liq : tp2
+                        else
+                            tp1 := entry - risk * rr1
+                            tp2 := entry - risk * rr2
+                            liq = math.min(stCrtLo, liqLowV)
+                            tp2 := useLiqTP and liq < tp1 ? liq : tp2
+
+                        buySig  := wantBuy
+                        sellSig := wantSell
+                        sigSL   := sl
+                        sigTP1  := tp1
+                        sigTP2  := tp2
+
+                        lastEntry  := entry
+                        lastSL     := sl
+                        lastTP1    := tp1
+                        lastTP2    := tp2
+                        lastDir    := wantBuy ? 1 : -1
+                        lastPat    := pat
+                        lastSigBar := bar_index
+
+                        if not multiEntry
+                            stMss      := false
+                            stZone     := false
+                            stMssLvl   := na
+                            stZoneKind := ""
+
+// -----------------------------------------------------------------------------
+// The dots - the only signal graphics on the chart
+// -----------------------------------------------------------------------------
+dotOff = nz(atrv, 0.0) * dotOffATR
+plotshape(buySig  ? low  - dotOff : na, title = "CRT Buy",  style = shape.circle,
+     location = location.absolute, color = buyCol,  size = size.tiny)
+plotshape(sellSig ? high + dotOff : na, title = "CRT Sell", style = shape.circle,
+     location = location.absolute, color = sellCol, size = size.tiny)
+
+// -----------------------------------------------------------------------------
+// SL / TP levels
+// -----------------------------------------------------------------------------
+var line[]  drawnLines  = array.new_line()
+var label[] drawnLabels = array.new_label()
+
+pushLine(l) =>
+    array.push(drawnLines, l)
+    if array.size(drawnLines) > showLast * 3
+        line.delete(array.shift(drawnLines))
+
+pushLabel(lb) =>
+    array.push(drawnLabels, lb)
+    if array.size(drawnLabels) > showLast * 3
+        label.delete(array.shift(drawnLabels))
+
+levelLine(price, col, sty) =>
+    line.new(bar_index, price, bar_index + projectBars, price, xloc = xloc.bar_index,
+         color = col, style = sty, width = 1)
+
+levelTag(price, txt, col) =>
+    label.new(bar_index + projectBars, price, txt, xloc = xloc.bar_index,
+         style = label.style_label_left, color = color.new(col, 85),
+         textcolor = col, size = size.tiny)
+
+if showSLTP and (buySig or sellSig)
+    pushLine(levelLine(sigSL,  slCol,  line.style_dotted))
+    pushLine(levelLine(sigTP1, tp1Col, line.style_dotted))
+    pushLine(levelLine(sigTP2, tp2Col, line.style_dashed))
+    pushLabel(levelTag(sigSL,  "SL "  + str.tostring(sigSL,  format.mintick), slCol))
+    pushLabel(levelTag(sigTP1, "TP1 " + str.tostring(sigTP1, format.mintick), tp1Col))
+    pushLabel(levelTag(sigTP2, "TP2 " + str.tostring(sigTP2, format.mintick), tp2Col))
+
+// -----------------------------------------------------------------------------
+// Optional CRT range box (debug)
+// -----------------------------------------------------------------------------
+var box crtBox = na
+if showCrtBox and barstate.islast
+    if not na(crtBox)
+        box.delete(crtBox)
+    if haveCrt
+        crtBox := box.new(bar_index - 40, crtHi, bar_index + 10, crtLo,
+             border_color = crtDir == 1 ? buyCol : sellCol,
+             border_style = line.style_dotted,
+             bgcolor = color.new(crtDir == 1 ? buyCol : sellCol, 94))
+
+// -----------------------------------------------------------------------------
+// Dashboard
+// -----------------------------------------------------------------------------
+regName(r)  => r == 1 ? "BULLISH" : r == -1 ? "BEARISH" : "SIDEWAYS"
+regColor(r) => r == 1 ? buyCol : r == -1 ? sellCol : color.new(#ffb300, 0)
+
+scaleHint(tf) =>
+    tf == "M"   ? "W1 / D1 / H4"  :
+     tf == "W"   ? "D1 / H4 / H1"  :
+     tf == "D"   ? "H4 / H1 / M30" :
+     tf == "240" ? "H1 / M30 / M15":
+     tf == "60"  ? "M15 / M5"      : "M5 / M1"
+
+dashRow(t, i, k, v, vc) =>
+    table.cell(t, 0, i, k, text_color = color.new(#8d93a8, 0), text_size = size.small,
+         bgcolor = color.new(#12141c, 10), text_halign = text.align_left)
+    table.cell(t, 1, i, v, text_color = vc, text_size = size.small,
+         bgcolor = color.new(#12141c, 10), text_halign = text.align_left)
+
+var table dash = na
+
+if showPanel and barstate.islast
+    if na(dash)
+        dash := table.new(position.top_right, 2, 15, border_width = 1)
+    table.set_position(dash, panelPos == "Top right"    ? position.top_right    :
+         panelPos == "Top left"     ? position.top_left     :
+         panelPos == "Bottom right" ? position.bottom_right : position.bottom_left)
+
+    fg  = color.new(#d8dbe6, 0)
+    dim = color.new(#8d93a8, 0)
+
+    pd     = haveCrt ? (close - crtLo) / (crtHi - crtLo) : 0.5
+    htfPD  = hRangeHi > hRangeLo ? (close - hRangeLo) / (hRangeHi - hRangeLo) : 0.5
+    pdTxt  = pd < 0.45 ? "DISCOUNT" : pd > 0.55 ? "PREMIUM" : "EQUILIBRIUM"
+    pdCol  = pd < 0.45 ? buyCol : pd > 0.55 ? sellCol : color.new(#ffb300, 0)
+    hpdTxt = htfPD < 0.45 ? "DISCOUNT" : htfPD > 0.55 ? "PREMIUM" : "EQUILIBRIUM"
+
+    crtTxt = not haveCrt ? "SEARCHING" : crtDir == 1 ? "BULLISH CRT ARMED" : "BEARISH CRT ARMED"
+    crtC   = not haveCrt ? dim : crtDir == 1 ? buyCol : sellCol
+
+    phase = not haveCrt ? "waiting for a CRT raid" :
+         not stMss ? "raid confirmed - waiting MSS" :
+         stZone    ? "MSS ok - waiting retest (" + stZoneKind + ")" : "MSS ok - no valid zone"
+
+    sigTxt = lastDir == 0 ? "-" :
+         (lastDir == 1 ? "BUY " : "SELL ") + str.tostring(lastEntry, format.mintick) + "  [" + lastPat + "]"
+    sigC   = lastDir == 0 ? dim : lastDir == 1 ? buyCol : sellCol
+    riskV  = lastDir == 0 ? na : math.abs(lastEntry - lastSL)
+    rrTxt  = lastDir == 0 or na(riskV) or riskV <= 0 ? "-" :
+         str.tostring(lastTP2, format.mintick) + "  (1:" + str.tostring(math.abs(lastTP2 - lastEntry) / riskV, "#.#") + ")"
+
+    canScale = haveCrt and ((crtDir == 1 and htfBias == 1) or (crtDir == -1 and htfBias == -1))
+    scaleTxt = canScale ? (crtDir == 1 ? "LONGS on " : "SHORTS on ") + scaleHint(htf) : "-"
+    scaleC   = canScale ? (crtDir == 1 ? buyCol : sellCol) : dim
+
+    dashRow(dash, 0,  "C R T   S N I P E R", syminfo.ticker + "  " + timeframe.period, color.white)
+    dashRow(dash, 1,  "HTF anchor",  htf, fg)
+    dashRow(dash, 2,  "HTF bias",    regName(htfBias)  + "  (ADX " + str.tostring(hAdx, "#.#") + ")", regColor(htfBias))
+    dashRow(dash, 3,  "Chart trend", regName(chartReg) + "  (ADX " + str.tostring(adxC, "#.#") + ")", regColor(chartReg))
+    dashRow(dash, 4,  "EMA " + str.tostring(emaFastLen) + "/" + str.tostring(emaSlowLen),
+         emaF > emaS ? "BULL STACK" : "BEAR STACK", emaF > emaS ? buyCol : sellCol)
+    dashRow(dash, 5,  "CRT state",   crtTxt, crtC)
+    dashRow(dash, 6,  "CRT range",   haveCrt ? str.tostring(crtHi, format.mintick) + " / " + str.tostring(crtLo, format.mintick) : "-", fg)
+    dashRow(dash, 7,  "Location",    pdTxt  + "  " + str.tostring(pd    * 100, "#") + "%", pdCol)
+    dashRow(dash, 8,  "HTF range",   hpdTxt + "  " + str.tostring(htfPD * 100, "#") + "%", fg)
+    dashRow(dash, 9,  "Setup",       phase, dim)
+    dashRow(dash, 10, "Last signal", sigTxt, sigC)
+    dashRow(dash, 11, "SL / TP1",    lastDir == 0 ? "-" : str.tostring(lastSL, format.mintick) + " / " + str.tostring(lastTP1, format.mintick), fg)
+    dashRow(dash, 12, "TP2",         rrTxt, fg)
+    dashRow(dash, 13, "Scale in",    scaleTxt, scaleC)
+    dashRow(dash, 14, "ATR",         str.tostring(atrv, format.mintick), dim)
+
+// -----------------------------------------------------------------------------
+// Alerts
+// -----------------------------------------------------------------------------
+alertcondition(buySig,  "CRT Buy",  "CRT BUY signal")
+alertcondition(sellSig, "CRT Sell", "CRT SELL signal")
+
+if buySig
+    alert("BUY " + syminfo.ticker + " " + timeframe.period + " @ " + str.tostring(lastEntry, format.mintick) +
+         "  SL " + str.tostring(sigSL, format.mintick) + "  TP1 " + str.tostring(sigTP1, format.mintick) +
+         "  TP2 " + str.tostring(sigTP2, format.mintick) + "  [" + lastPat + "]", alert.freq_once_per_bar_close)
+if sellSig
+    alert("SELL " + syminfo.ticker + " " + timeframe.period + " @ " + str.tostring(lastEntry, format.mintick) +
+         "  SL " + str.tostring(sigSL, format.mintick) + "  TP1 " + str.tostring(sigTP1, format.mintick) +
+         "  TP2 " + str.tostring(sigTP2, format.mintick) + "  [" + lastPat + "]", alert.freq_once_per_bar_close)
