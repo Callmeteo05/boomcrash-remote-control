@@ -113,6 +113,15 @@ newsHour       = input.int(12,    "News hour (GMT)", minval = 0, maxval = 23, gr
 newsMinute     = input.int(30,    "News minute", minval = 0, maxval = 59, group = grpN)
 newsBefore     = input.int(30,    "Blackout before (minutes)", minval = 0, group = grpN)
 newsAfter      = input.int(30,    "Blackout after (minutes)", minval = 0, group = grpN)
+tradeNews      = input.bool(true, "Trade the release instead of only avoiding it", group = grpN)
+newsBO         = input.bool(true, "News breakout continuation", group = grpN)
+newsFade       = input.bool(true, "News spike reversal", group = grpN)
+newsPreRange   = input.int(30,    "Pre-news range built over N minutes", minval = 5, group = grpN)
+newsDelay      = input.int(2,     "Wait N minutes after the release", minval = 0, group = grpN)
+newsWindowM    = input.int(60,    "Models stay live N minutes after release", minval = 5, group = grpN)
+newsBoNeedBias = input.bool(false,"Breakout must agree with the HTF bias", group = grpN)
+newsDispATR    = input.float(1.00,"Breakout displacement beyond the range (x ATR)", step = 0.1, group = grpN)
+newsSpikeATR   = input.float(1.50,"Reversal : spike beyond the range (x ATR)", step = 0.1, group = grpN)
 
 grpFr = "Freshness (turns a dot into an entry)"
 useFresh       = input.bool(true, "Expire signals that price has run away from", group = grpFr)
@@ -370,6 +379,19 @@ minsNow  = gmtHour * 60 + minute(time, "GMT")
 newsMins = newsHour * 60 + newsMinute
 newsOut  = useNews and minsNow >= newsMins - newsBefore and minsNow <= newsMins + newsAfter
 
+// news phase : pre-release range, post-release excursion, trade window
+inPreNews  = minsNow >= newsMins - newsPreRange and minsNow < newsMins
+inPostNews = minsNow >= newsMins and minsNow <= newsMins + newsWindowM
+inNewsTrade = useNews and tradeNews and minsNow >= newsMins + newsDelay and minsNow <= newsMins + newsWindowM
+var float preHi = na
+var float preLo = na
+var bool  preSet = false
+var float postHi = na
+var float postLo = na
+var bool  postSet = false
+var bool  nboDone = false
+var bool  nfdDone = false
+
 // Asian range, rebuilt each GMT day
 inAsia = gmtHour >= asiaStart and gmtHour < asiaEnd
 var float asiaHi = na
@@ -384,6 +406,22 @@ if newGmtDay
     asiaSet := false
     asiaSweptHi := false
     asiaSweptLo := false
+    preHi := na
+    preLo := na
+    preSet := false
+    postHi := na
+    postLo := na
+    postSet := false
+    nboDone := false
+    nfdDone := false
+if inPreNews
+    preHi := na(preHi) ? high : math.max(preHi, high)
+    preLo := na(preLo) ? low  : math.min(preLo, low)
+    preSet := true
+if inPostNews
+    postHi := na(postHi) ? high : math.max(postHi, high)
+    postLo := na(postLo) ? low  : math.min(postLo, low)
+    postSet := true
 if inAsia
     asiaHi := na(asiaHi) ? high : math.max(asiaHi, high)
     asiaLo := na(asiaLo) ? low  : math.min(asiaLo, low)
@@ -615,8 +653,8 @@ scorePA(biasAligned, mtfAgree, pdDepth, structQual, pat, emaAligned, adx, inSess
     s := s + (edgeBonus ? 8.0 : 0.0)
     int(math.round(math.max(0.0, math.min(100.0, s))))
 
-modeShort(m) => m == 1 ? "HUNT" : m == 2 ? "FADE" : m == 3 ? "SWEEP" : m == 4 ? "BRT" : m == 5 ? "TPB" : m == 6 ? "ASIA" : "CRT"
-modeName(m)  => m == 1 ? "Spike Hunt" : m == 2 ? "Spike Fade" : m == 3 ? "Liq Sweep" : m == 4 ? "Break+Retest" : m == 5 ? "Trend Pullback" : m == 6 ? "Asian Sweep" : "CRT"
+modeShort(m) => m == 1 ? "HUNT" : m == 2 ? "FADE" : m == 3 ? "SWEEP" : m == 4 ? "BRT" : m == 5 ? "TPB" : m == 6 ? "ASIA" : m == 7 ? "NEWS-BO" : m == 8 ? "NEWS-REV" : "CRT"
+modeName(m)  => m == 1 ? "Spike Hunt" : m == 2 ? "Spike Fade" : m == 3 ? "Liq Sweep" : m == 4 ? "Break+Retest" : m == 5 ? "Trend Pullback" : m == 6 ? "Asian Sweep" : m == 7 ? "News Breakout" : m == 8 ? "News Reversal" : "CRT"
 regNameOf(r) => r == 1 ? "BULLISH" : r == -1 ? "BEARISH" : "SIDEWAYS"
 
 buildReason(m, bias, mtfAgree, pd, zone, pat, sess, rr, extra) =>
@@ -670,6 +708,8 @@ var int    lastSigSweep = -100000
 var int    lastSigBrt   = -100000
 var int    lastSigTpb   = -100000
 var int    lastSigAsia  = -100000
+var int    lastSigNbo   = -100000
+var int    lastSigNfd   = -100000
 
 var float  lastEntry = na
 var float  lastSL    = na
@@ -717,6 +757,7 @@ int    sigScore = 0
 int    sigMode  = -1
 int    sigDir   = 0
 string sigReason = ""
+bool   newsOutNow = newsOut
 
 // these persist so the dashboard still reads them on the forming bar
 var bool  huntOpen = false
@@ -1047,7 +1088,7 @@ if barstate.isconfirmed and not na(atrv) and atrv > 0
     // Shared context for the pure price-action models
     // -------------------------------------------------------------------------
     chPos     = chanHi > chanLo ? (close - chanLo) / (chanHi - chanLo) : 0.5
-    paAllowed = sigMode < 0 and not newsOut and inKill and htfBias != 0
+    paAllowed = sigMode < 0 and not newsOutNow and inKill and htfBias != 0
 
     // ENGINE D : liquidity sweep + reclaim ------------------------------------
     if paAllowed and useSweep and bar_index - lastSigSweep >= cooldownV
@@ -1195,8 +1236,78 @@ if barstate.isconfirmed and not na(atrv) and atrv > 0
                         sigReason := buildReason(6, htfBias, mtf3, -1, "", patTxt, sessNow, rrE,
                              "swept Asian " + (wantBuy ? "low" : "high"))
 
-    // news blackout also vetoes CRT and the spike engines ----------------------
-    if sigMode >= 0 and newsOut
+    // ENGINE H / I : trading the release itself --------------------------------
+    // the only engines allowed to fire inside a blackout
+    if tradeNews and sigMode < 0 and inNewsTrade and preSet and preHi > preLo and spikeDir == 0
+        // H : the release breaks the pre-news range and keeps going
+        if newsBO and not nboDone and bar_index - lastSigNbo >= cooldownV
+            up   = close > preHi + newsDispATR * atrv
+            down = close < preLo - newsDispATR * atrv
+            if up or down
+                want   = up ? 1 : -1
+                biasOk = not newsBoNeedBias or htfBias == want
+                if biasOk
+                    entry = close
+                    sl    = up ? preLo - slBufV * atrv : preHi + slBufV * atrv
+                    risk  = math.abs(entry - sl)
+                    if risk > 0 and (maxRiskS <= 0 or risk <= maxRiskS * atrv)
+                        push = math.abs(up ? close - preHi : preLo - close) / math.max(atrv, 1e-10)
+                        mtf3 = (htfBias == want ? 1 : 0) + (midBias == want ? 1 : 0) + (chartReg == want ? 1 : 0)
+                        pat  = up ? bullPattern(atrv) : bearPattern(atrv)
+                        patTxt = pat == "" ? "Release Break" : pat
+                        sc = scorePA(htfBias == want, mtf3, 0.6, cl01(push / 2.0), patTxt, true, adxC, true, rr1V, true)
+                        if sc >= minScoreV
+                            sigDir := want
+                            sigMode := 7
+                            sigScore := sc
+                            sigSL := sl
+                            sigTP1 := entry + want * risk * rr1V
+                            sigTP2 := entry + want * risk * rr2V
+                            lastEntry := entry
+                            lastPat := patTxt
+                            sigReason := buildReason(7, htfBias, mtf3, -1, "", patTxt, sessNow, rr1V,
+                                 "broke " + str.tostring(newsPreRange) + "-min pre-news range by " + str.tostring(push, "#.#") + "xATR")
+                            nboDone := true
+
+        // I : the release spikes out of the range and gets rejected back in
+        if sigMode < 0 and newsFade and not nfdDone and postSet and bar_index - lastSigNfd >= cooldownV
+            spikeUp = (postHi - preHi) / math.max(atrv, 1e-10)
+            spikeDn = (preLo - postLo) / math.max(atrv, 1e-10)
+            fadeShort = spikeUp >= newsSpikeATR and close < preHi
+            fadeLong  = spikeDn >= newsSpikeATR and close > preLo
+            if fadeShort or fadeLong
+                up    = fadeLong
+                want  = up ? 1 : -1
+                entry = close
+                sl    = up ? postLo - slBufV * atrv : postHi + slBufV * atrv
+                risk  = math.abs(entry - sl)
+                if risk > 0 and (maxRiskS <= 0 or risk <= maxRiskS * atrv)
+                    liq  = up ? preHi : preLo
+                    tp1r = entry + want * risk * rr1V
+                    tp1  = up ? (liq > entry and liq < tp1r ? liq : tp1r) : (liq < entry and liq > tp1r ? liq : tp1r)
+                    rrE  = math.abs(tp1 - entry) / risk
+                    mag  = up ? spikeDn : spikeUp
+                    mtf3 = (htfBias == want ? 1 : 0) + (midBias == want ? 1 : 0) + (chartReg == want ? 1 : 0)
+                    pat  = up ? bullPattern(atrv) : bearPattern(atrv)
+                    patTxt = pat == "" ? "Release Rejection" : pat
+                    sc = scorePA(htfBias == want, mtf3, 0.7, cl01(mag / 3.0), patTxt, true, adxC, true, rrE, true)
+                    if sc >= minScoreV and rrE >= 1.0
+                        sigDir := want
+                        sigMode := 8
+                        sigScore := sc
+                        sigSL := sl
+                        sigTP1 := tp1
+                        sigTP2 := entry + want * risk * rr2V
+                        lastEntry := entry
+                        lastPat := patTxt
+                        sigReason := buildReason(8, htfBias, mtf3, -1, "", patTxt, sessNow, rrE,
+                             "release spiked " + str.tostring(mag, "#.#") + "xATR out of the range and reclaimed it")
+                        nfdDone := true
+
+    // news blackout vetoes everything except the news engines -------------------
+    if sigMode == 7 or sigMode == 8
+        newsOutNow := false
+    if sigMode >= 0 and newsOutNow
         newsReject := newsReject + 1
         sigMode := -1
         sigDir  := 0
@@ -1245,8 +1356,12 @@ if barstate.isconfirmed and not na(atrv) and atrv > 0
             lastSigBrt := bar_index
         else if sigMode == 5
             lastSigTpb := bar_index
-        else
+        else if sigMode == 6
             lastSigAsia := bar_index
+        else if sigMode == 7
+            lastSigNbo := bar_index
+        else
+            lastSigNfd := bar_index
 
         if trackStats
             array.push(opEntry, lastEntry)
@@ -1379,7 +1494,12 @@ if showPanel and barstate.islast
     r += 1
     dashRow(dash, r, "Session", sessName(sessNow) + (asiaSet ? "   Asia " + str.tostring(asiaLo, format.mintick) + "-" + str.tostring(asiaHi, format.mintick) : ""), sessNow == 0 ? dim : color.new(#4dd0e1, 0))
     r += 1
-    dashRow(dash, r, "News", not useNews ? "off (TradingView has no calendar)" : newsOut ? "BLACKOUT" : "clear   " + str.tostring(newsReject) + " blocked", not useNews ? dim : newsOut ? sellCol : ok)
+    newsState = not useNews ? "off (TradingView has no calendar)" :
+         inNewsTrade and preSet ? "TRADING THE RELEASE" :
+         newsOut ? "BLACKOUT" : "clear   " + str.tostring(newsReject) + " blocked"
+    dashRow(dash, r, "News", newsState, not useNews ? dim : (inNewsTrade and preSet) ? color.new(#4dd0e1, 0) : newsOut ? sellCol : ok)
+    r += 1
+    dashRow(dash, r, "Pre-news", preSet ? str.tostring(preLo, format.mintick) + " - " + str.tostring(preHi, format.mintick) + "   (" + str.tostring(newsPreRange) + "-min range)" : "-", preSet ? color.new(#4dd0e1, 0) : dim)
     r += 1
     dashRow(dash, r, "Style", str.upper(tStyle) + "   TP " + str.tostring(rr1V, "#.#") + "R / " + str.tostring(rr2V, "#.#") + "R", color.new(#ffd54f, 0))
     r += 1

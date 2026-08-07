@@ -45,7 +45,7 @@
 #define REG_BEAR  2
 
 //--- entry models
-#define NMODELS   7
+#define NMODELS   9
 #define MODE_CRT   0   // Candle Range Theory : anchor raid -> MSS -> retest
 #define MODE_HUNT  1   // spike hunt   (with the spike)
 #define MODE_FADE  2   // spike fade   (against the spike)
@@ -53,6 +53,8 @@
 #define MODE_BRT   4   // break and retest
 #define MODE_TPB   5   // trend pullback to EMA 50
 #define MODE_ASIA  6   // Asian range sweep (Judas swing)
+#define MODE_NBO   7   // news breakout continuation
+#define MODE_NFD   8   // news spike reversal
 
 //--- sessions
 #define SESS_OFF    0
@@ -193,6 +195,18 @@ input bool            InpUseNews          = true;           // Block signals aro
 input bool            InpNewsHighOnly     = true;           // High impact only (off = high + medium)
 input int             InpNewsBefore       = 30;             // Blackout before the release (minutes)
 input int             InpNewsAfter        = 30;             // Blackout after the release (minutes)
+
+input group "=== News TRADING (MT5 calendar) ==="
+input bool            InpTradeNews        = true;           // Trade the release instead of only avoiding it
+input bool            InpNewsBO           = true;           // News breakout continuation
+input bool            InpNewsFade         = true;           // News spike reversal
+input int             InpNewsPreRange     = 30;             // Pre-news range built over N minutes
+input int             InpNewsDelay        = 2;              // Wait N minutes after the release before entering
+input int             InpNewsWindow       = 60;             // Models stay live for N minutes after release
+input bool            InpNewsBoNeedBias   = false;          // Breakout must agree with the HTF bias
+input double          InpNewsDispATR      = 1.00;           // Breakout displacement beyond the range (x ATR)
+input double          InpNewsSpikeATR     = 1.50;           // Reversal : spike beyond the range (x ATR)
+input string          InpExtraNewsCcy     = "";             // Extra currencies to watch, comma separated
 
 input group "=== Freshness (turns a dot into an entry) ==="
 input bool            InpUseFreshness     = true;           // Expire signals that price has run away from
@@ -502,6 +516,8 @@ string ModeName(const int m)
       case MODE_BRT:   return "Break+Retest";
       case MODE_TPB:   return "Trend Pullback";
       case MODE_ASIA:  return "Asian Sweep";
+      case MODE_NBO:   return "News Breakout";
+      case MODE_NFD:   return "News Reversal";
      }
    return "CRT";
   }
@@ -516,6 +532,8 @@ string ModeShort(const int m)
       case MODE_BRT:   return "BRT";
       case MODE_TPB:   return "TPB";
       case MODE_ASIA:  return "ASIA";
+      case MODE_NBO:   return "NEWS-BO";
+      case MODE_NFD:   return "NEWS-REV";
      }
    return "CRT";
   }
@@ -1120,6 +1138,69 @@ void CollectNewsFor(const string ccy, datetime from, datetime to)
      }
   }
 
+//--- every currency this symbol is exposed to, however the broker names it.
+//--- Symbol properties first, then the name, then the index home currency,
+//--- then anything the user added. Covers majors, crosses, exotics and CFDs.
+void AddCcy(string &list[], int &n, const string c)
+  {
+   if(c == "" || StringLen(c) != 3)
+      return;
+   for(int k = 0; k < n; k++)
+      if(list[k] == c) return;
+   ArrayResize(list, n + 1);
+   list[n] = c;
+   n++;
+  }
+
+int ResolveCurrencies(string &list[])
+  {
+   int n = 0;
+   ArrayResize(list, 0);
+
+   AddCcy(list, n, SymbolInfoString(_Symbol, SYMBOL_CURRENCY_BASE));
+   AddCcy(list, n, SymbolInfoString(_Symbol, SYMBOL_CURRENCY_PROFIT));
+   AddCcy(list, n, SymbolInfoString(_Symbol, SYMBOL_CURRENCY_MARGIN));
+
+   //--- some brokers leave those blank or wrong on CFDs, so read the name too
+   string norm = NormSymbol(_Symbol);
+   string known[22] = {"USD","EUR","GBP","JPY","CHF","AUD","NZD","CAD",
+                       "SEK","NOK","DKK","PLN","CZK","HUF","TRY","ZAR",
+                       "MXN","SGD","HKD","CNH","ILS","THB"};
+   for(int k = 0; k < 22; k++)
+      if(Has(norm, known[k]))
+         AddCcy(list, n, known[k]);
+
+   //--- an index trades on its home economy's calendar
+   if(Has(norm, "US30") || Has(norm, "DJ30") || Has(norm, "NAS") || Has(norm, "USTEC") ||
+      Has(norm, "NDX")  || Has(norm, "SPX")  || Has(norm, "US500"))
+      AddCcy(list, n, "USD");
+   if(Has(norm, "GER") || Has(norm, "DAX") || Has(norm, "EU50") || Has(norm, "FRA40"))
+      AddCcy(list, n, "EUR");
+   if(Has(norm, "UK100") || Has(norm, "FTSE")) AddCcy(list, n, "GBP");
+   if(Has(norm, "JP225") || Has(norm, "NIKKEI")) AddCcy(list, n, "JPY");
+   if(Has(norm, "HK50"))   AddCcy(list, n, "HKD");
+   if(Has(norm, "AUS200")) AddCcy(list, n, "AUD");
+   //--- metals and crypto are priced in, and react to, the dollar calendar
+   if(g_symClass == SC_METAL || g_symClass == SC_CRYPTO)
+      AddCcy(list, n, "USD");
+
+   //--- user additions
+   if(InpExtraNewsCcy != "")
+     {
+      string parts[];
+      int np = StringSplit(InpExtraNewsCcy, ',', parts);
+      for(int k = 0; k < np; k++)
+        {
+         string c = parts[k];
+         StringTrimLeft(c);
+         StringTrimRight(c);
+         StringToUpper(c);
+         AddCcy(list, n, c);
+        }
+     }
+   return n;
+  }
+
 void LoadNews(const datetime from, const datetime to)
   {
    ArrayResize(g_newsTimes, 0);
@@ -1133,20 +1214,81 @@ void LoadNews(const datetime from, const datetime to)
    if(g_symClass == SC_SPIKE_UP || g_symClass == SC_SPIKE_DOWN || g_symClass == SC_VOL)
       return;
 
-   string b = SymbolInfoString(_Symbol, SYMBOL_CURRENCY_BASE);
-   string q = SymbolInfoString(_Symbol, SYMBOL_CURRENCY_PROFIT);
-
-   CollectNewsFor(b, from, to);
-   if(q != b)
-      CollectNewsFor(q, from, to);
+   string ccy[];
+   int n = ResolveCurrencies(ccy);
+   for(int k = 0; k < n; k++)
+     {
+      CollectNewsFor(ccy[k], from, to);
+      g_newsCcy += (g_newsCcy == "" ? "" : "/") + ccy[k];
+     }
 
    g_newsCount = ArraySize(g_newsTimes);
    if(g_newsCount > 0)
      {
       ArraySort(g_newsTimes);
       g_newsOk = true;
-      g_newsCcy = (q != b ? b + "/" + q : b);
      }
+  }
+
+//+------------------------------------------------------------------+
+//| News phase tracking - pre-range, release, trade window           |
+//+------------------------------------------------------------------+
+int    g_nEvt      = -1;      // index of the event currently being tracked
+double g_preHi     = 0.0, g_preLo = 0.0;
+bool   g_preSet    = false;
+double g_postHi    = 0.0, g_postLo = 0.0;
+bool   g_postSet   = false;
+bool   g_nboDone   = false, g_nfdDone = false;
+
+//--- index of the event whose pre-range / trade window contains t
+int NewsIndexFor(const datetime t)
+  {
+   if(g_newsCount <= 0)
+      return -1;
+   long pre  = (long)InpNewsPreRange * 60;
+   long post = (long)InpNewsWindow * 60;
+   for(int k = 0; k < g_newsCount; k++)
+     {
+      long d = (long)t - (long)g_newsTimes[k];
+      if(d >= -pre && d <= post)
+         return k;
+     }
+   return -1;
+  }
+
+void UpdateNewsPhase(const datetime t, const double hi, const double lo)
+  {
+   int idx = NewsIndexFor(t);
+   if(idx != g_nEvt)
+     {
+      g_nEvt = idx;
+      g_preSet = false; g_postSet = false;
+      g_preHi = 0.0; g_preLo = 0.0; g_postHi = 0.0; g_postLo = 0.0;
+      g_nboDone = false; g_nfdDone = false;
+     }
+   if(idx < 0)
+      return;
+
+   datetime T = g_newsTimes[idx];
+   if(t < T)
+     {
+      if(!g_preSet) { g_preHi = hi; g_preLo = lo; g_preSet = true; }
+      else          { g_preHi = MathMax(g_preHi, hi); g_preLo = MathMin(g_preLo, lo); }
+     }
+   else
+     {
+      if(!g_postSet) { g_postHi = hi; g_postLo = lo; g_postSet = true; }
+      else           { g_postHi = MathMax(g_postHi, hi); g_postLo = MathMin(g_postLo, lo); }
+     }
+  }
+
+//--- true while the news models are allowed to fire
+bool InNewsTradeWindow(const datetime t)
+  {
+   if(g_nEvt < 0)
+      return false;
+   long d = (long)t - (long)g_newsTimes[g_nEvt];
+   return (d >= (long)InpNewsDelay * 60 && d <= (long)InpNewsWindow * 60);
   }
 
 bool NewsBlackout(const datetime t)
@@ -1295,6 +1437,9 @@ void ResetAll()
    g_sigCount = 0;
 
    g_brtDir = 0; g_brtLevel = 0.0; g_brtBar = -1;
+   g_nEvt = -1; g_preSet = false; g_postSet = false;
+   g_preHi = 0.0; g_preLo = 0.0; g_postHi = 0.0; g_postLo = 0.0;
+   g_nboDone = false; g_nfdDone = false;
    g_asiaDay = -1; g_asiaHi = 0.0; g_asiaLo = 0.0; g_asiaSet = false;
    g_asiaSweptHi = false; g_asiaSweptLo = false;
    g_lastSpikeBar = -1; g_lastSpikeDir = 0;
@@ -1803,10 +1948,21 @@ void BuildRows()
         {
          int mins = MinutesToNews(TimeCurrent());
          bool blocked = NewsBlackout(TimeCurrent());
-         newsTxt = StringFormat("%s  %s  (%d events, %d blocked)", g_newsCcy,
-                                (blocked ? "BLACKOUT" : (mins >= 0 ? StringFormat("next in %dm", mins) : "clear")),
+         bool tradable = InpTradeNews && InNewsTradeWindow(TimeCurrent()) && g_preSet;
+         string state = tradable ? "TRADING THE RELEASE"
+                        : (blocked ? "BLACKOUT"
+                           : (mins >= 0 ? StringFormat("next in %dm", mins) : "clear"));
+         newsTxt = StringFormat("%s  %s  (%d events, %d blocked)", g_newsCcy, state,
                                 g_newsCount, g_newsReject);
-         newsCol = (blocked ? clrOrangeRed : (mins >= 0 && mins <= 60 ? clrGoldenrod : clrLimeGreen));
+         newsCol = (tradable ? clrAqua
+                    : (blocked ? clrOrangeRed
+                       : (mins >= 0 && mins <= 60 ? clrGoldenrod : clrLimeGreen)));
+        }
+      if(g_newsOk && g_preSet && g_nEvt >= 0)
+        {
+         AddRow(StringFormat("Pre-news    : %s - %s   (%d-min range)",
+                             DoubleToString(g_preLo, _Digits), DoubleToString(g_preHi, _Digits),
+                             InpNewsPreRange), clrAqua);
         }
      }
    AddRow(StringFormat("News        : %s", newsTxt), newsCol);
@@ -2378,6 +2534,7 @@ int OnCalculate(const int rates_total,
       double dueness = (g_avgGap > 0.0 && barsSince < 1000000 ? barsSince / g_avgGap : 0.0);
 
       UpdateAsianRange(time[i], high[i], low[i]);
+      UpdateNewsPhase(time[i], high[i], low[i]);
 
       //--- swing structure ------------------------------------------
       int L = MathMax(1, InpSwingLen);
@@ -2917,7 +3074,103 @@ int OnCalculate(const int rates_total,
            }
         }
 
-      //--- news blackout also vetoes the CRT and spike engines -------
+      //--------------------------------------------------------------
+      // ENGINE H / I : trading the release itself
+      // These are the only engines allowed to fire inside a blackout.
+      //--------------------------------------------------------------
+      if(InpTradeNews && sigMode < 0 && g_nEvt >= 0 && g_preSet && InNewsTradeWindow(time[i]) &&
+         g_preHi > g_preLo && g_symClass != SC_SPIKE_UP && g_symClass != SC_SPIKE_DOWN)
+        {
+         double preRng = g_preHi - g_preLo;
+
+         //--- H : the release breaks the pre-news range and keeps going
+         if(InpNewsBO && !g_nboDone && i - g_lastSigBarMode[MODE_NBO] >= g_cooldown)
+           {
+            bool up   = (close[i] > g_preHi + InpNewsDispATR * atr);
+            bool down = (close[i] < g_preLo - InpNewsDispATR * atr);
+            if(up || down)
+              {
+               int want = (up ? REG_BULL : REG_BEAR);
+               bool biasOk = (!InpNewsBoNeedBias || bias == want);
+               if(biasOk)
+                 {
+                  double entry = close[i];
+                  double sl = (up ? g_preLo - g_slBuf * atr : g_preHi + g_slBuf * atr);
+                  double risk = MathAbs(entry - sl);
+                  if(risk > 0.0 && (g_maxRiskATR <= 0.0 || risk <= g_maxRiskATR * atr))
+                    {
+                     double dirM = (up ? 1.0 : -1.0);
+                     double tp1 = entry + dirM * risk * g_rr1;
+                     double tp2 = entry + dirM * risk * g_rr2;
+                     double push = MathAbs(up ? close[i] - g_preHi : g_preLo - close[i]) / MathMax(atr, 1e-12);
+                     mtf3 = (bias == want) + (midReg == want) + (ltfReg == want);
+                     string pat = (up ? BullishPattern(open, high, low, close, i, atr)
+                                   : BearishPattern(open, high, low, close, i, atr));
+                     if(pat == "") pat = "Release Break";
+                     int sc = ScorePA(bias == want, mtf3, 0.6, Clamp(push / 2.0, 0, 1), pat,
+                                      true, adx, true, g_rr1, true);
+                     if(sc >= g_minScore)
+                       {
+                        sigDir = (up ? 1 : -1); sigMode = MODE_NBO; sigScore = sc;
+                        sigEntry = entry; sigSL = sl; sigTP1 = tp1; sigTP2 = tp2; sigPat = pat;
+                        sigReason = BuildReason(MODE_NBO, bias, mtf3, -1.0, "", pat, sessNow, g_rr1,
+                                                StringFormat("broke %d-min pre-news range by %.1fxATR", InpNewsPreRange, push));
+                        g_nboDone = true;
+                       }
+                    }
+                 }
+              }
+           }
+
+         //--- I : the release spikes out of the range and gets rejected back in
+         if(sigMode < 0 && InpNewsFade && !g_nfdDone && g_postSet &&
+            i - g_lastSigBarMode[MODE_NFD] >= g_cooldown)
+           {
+            double spikeUp = (g_postHi - g_preHi) / MathMax(atr, 1e-12);
+            double spikeDn = (g_preLo - g_postLo) / MathMax(atr, 1e-12);
+
+            bool fadeShort = (spikeUp >= InpNewsSpikeATR && close[i] < g_preHi);
+            bool fadeLong  = (spikeDn >= InpNewsSpikeATR && close[i] > g_preLo);
+            if(fadeShort || fadeLong)
+              {
+               bool up = fadeLong;
+               double entry = close[i];
+               double sl = (up ? g_postLo - g_slBuf * atr : g_postHi + g_slBuf * atr);
+               double risk = MathAbs(entry - sl);
+               if(risk > 0.0 && (g_maxRiskATR <= 0.0 || risk <= g_maxRiskATR * atr))
+                 {
+                  //--- the far side of the pre-news range is the natural target
+                  double dirM = (up ? 1.0 : -1.0);
+                  double liq = (up ? g_preHi : g_preLo);
+                  double tp1 = entry + dirM * risk * g_rr1;
+                  if(up && liq > entry && liq < tp1)  tp1 = liq;
+                  if(!up && liq < entry && liq > tp1) tp1 = liq;
+                  double tp2 = entry + dirM * risk * g_rr2;
+                  double rrEff = MathAbs(tp1 - entry) / risk;
+                  int want = (up ? REG_BULL : REG_BEAR);
+                  mtf3 = (bias == want) + (midReg == want) + (ltfReg == want);
+                  string pat = (up ? BullishPattern(open, high, low, close, i, atr)
+                                : BearishPattern(open, high, low, close, i, atr));
+                  if(pat == "") pat = "Release Rejection";
+                  double mag = (up ? spikeDn : spikeUp);
+                  int sc = ScorePA(bias == want, mtf3, 0.7, Clamp(mag / 3.0, 0, 1), pat,
+                                   true, adx, true, rrEff, true);
+                  if(sc >= g_minScore && rrEff >= 1.0)
+                    {
+                     sigDir = (up ? 1 : -1); sigMode = MODE_NFD; sigScore = sc;
+                     sigEntry = entry; sigSL = sl; sigTP1 = tp1; sigTP2 = tp2; sigPat = pat;
+                     sigReason = BuildReason(MODE_NFD, bias, mtf3, -1.0, "", pat, sessNow, rrEff,
+                                             StringFormat("release spiked %.1fxATR out of the range and reclaimed it", mag));
+                     g_nfdDone = true;
+                    }
+                 }
+              }
+           }
+        }
+
+      //--- news blackout vetoes everything except the news engines ----
+      if(sigMode == MODE_NBO || sigMode == MODE_NFD)
+         newsOut = false;
       if(sigMode >= 0 && newsOut)
         {
          g_newsReject++;

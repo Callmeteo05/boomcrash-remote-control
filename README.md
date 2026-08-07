@@ -72,13 +72,58 @@ explanation can never disagree. It tells you which model fired, what the anchor 
 is, how many timeframes agree, where price sits in the range, which session you are
 in, the structural trigger, the confirming candle, and the reward on offer.
 
+## Trading the news, not just dodging it
+
+Two more models fire **during** a release. They are the only engines allowed to run
+inside a blackout — everything else stays blocked.
+
+The indicator builds a **pre-news range** from the 30 minutes before the release,
+then watches how price treats it:
+
+| Model | Tag | Setup |
+| --- | --- | --- |
+| News Breakout | `NEWS-BO` | price closes beyond the pre-news range by ≥ 1 ATR and holds — the release created direction. SL on the far side of the range. |
+| News Reversal | `NEWS-REV` | price spikes ≥ 1.5 ATR out of the range then closes back inside — the classic release whipsaw. SL beyond the spike, TP the far side of the range. |
+
+Both wait `News delay` (default 2 minutes) after the release before they can fire, so
+you are not trading the first tick of chaos. Each fires **once per event**. The
+dashboard shows `TRADING THE RELEASE` and prints the pre-news range while the window
+is live.
+
+Set `Breakout must agree with the HTF bias` if you only want continuation trades.
+It is off by default because a release frequently *creates* the new direction rather
+than following the old one.
+
+**Read this before enabling it.** News trading is the highest-slippage activity in
+this indicator. Spreads widen violently at the release, fills go far from the price
+on your screen, and the cost gate uses the *current* spread — which on historical
+bars is not the spread that existed during the release. The performance tracker will
+therefore be **more optimistic on news models than on any other engine**. Treat
+`NEWS-BO` and `NEWS-REV` results as an upper bound, not an estimate, and demo them
+specifically before risking anything.
+
 ## News awareness
 
-**MT5 reads the real economic calendar.** It pulls scheduled events for the symbol's
-base and profit currencies via `CalendarEventByCurrency` / `CalendarValueHistory`,
-keeps high-impact ones (medium too, optionally), and blocks every engine for a
-window before and after each release. The dashboard shows the currencies being
-watched, minutes to the next event, and how many signals the filter has blocked.
+**MT5 reads the real economic calendar** via `CalendarEventByCurrency` /
+`CalendarValueHistory`, keeps high-impact events (medium too, optionally), and blocks
+every non-news engine for a window before and after each release. The dashboard shows
+the currencies watched, minutes to the next event, and how many signals were blocked.
+
+### Currency resolution — any pair, any broker
+
+Which calendar applies is resolved from four sources, unioned:
+
+1. The symbol's `BASE`, `PROFIT` and `MARGIN` currency properties.
+2. The **symbol name**, scanned for 22 currency codes — the eight majors plus SEK,
+   NOK, DKK, PLN, CZK, HUF, TRY, ZAR, MXN, SGD, HKD, CNH, ILS, THB. This catches
+   crosses and exotics on brokers that leave the properties blank or wrong on CFDs.
+3. The **index home economy** — US30/NAS100/SPX → USD, GER40/DAX → EUR, UK100 → GBP,
+   JP225 → JPY, HK50 → HKD, AUS200 → AUD. Metals and crypto pick up USD.
+4. Anything you add in `Extra currencies to watch`.
+
+So GBPJPY watches both GBP and JPY releases, USDZAR watches USD and ZAR, XAUUSD
+watches USD, and NAS100 watches USD even though its "base currency" may be reported
+as something unhelpful.
 
 Two honest limits. The calendar needs a terminal connected to a MetaQuotes server —
 if it returns nothing the dashboard says `calendar unavailable` and the filter fails
