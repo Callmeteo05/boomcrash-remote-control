@@ -103,6 +103,11 @@ input int    InpNewsDelay       = 2;       // Wait this long after the release (
 input int    InpNewsWindow      = 60;      // News models stay live this long (minutes)
 input double InpNewsDispATR     = 1.0;     // Breakout must clear the range by this (x ATR)
 
+input group "=== Account capability ==="
+input bool   InpAffordableOnly  = true;    // Skip symbols the account is too small to size properly
+input double InpTypicalStopATR  = 1.5;     // Assumed stop size for the affordability check (x ATR)
+input bool   InpReportOnInit    = true;    // Log the capability report on startup
+
 input group "=== Display ==="
 input bool   InpShowPanel       = true;    // Show the panel
 input int    InpFontSize        = 9;       // Panel font size
@@ -692,6 +697,109 @@ void SetFilling(const string sym)
   }
 
 //+------------------------------------------------------------------+
+//| Account capability                                               |
+//|                                                                  |
+//| The broker's minimum lot is a hard floor. Below a certain equity |
+//| the smallest trade allowed already risks more than the configured|
+//| percentage, and there is no way to size correctly. Rather than   |
+//| sit silent, the EA works out that floor per symbol and says so.  |
+//+------------------------------------------------------------------+
+double TypicalStopFor(Slot &s)
+  {
+   double atrb[];
+   ArraySetAsSeries(atrb, true);
+   if(CopyBuffer(s.hAtr, 0, 0, 3, atrb) < 3) return 0.0;
+   if(atrb[1] <= 0.0) return 0.0;
+   return InpTypicalStopATR * atrb[1];
+  }
+
+//--- money lost if one minimum-lot trade hits its stop
+double MinLotCost(const string sym, const double stopDist)
+  {
+   if(stopDist <= 0.0) return 0.0;
+   double tickVal = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
+   double tickSz  = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
+   double vmin    = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
+   if(tickVal <= 0.0 || tickSz <= 0.0 || vmin <= 0.0) return 0.0;
+   return vmin * stopDist / tickSz * tickVal;
+  }
+
+//--- equity required before this symbol can be sized at the configured risk
+double MinEquityFor(Slot &s, const double riskPct)
+  {
+   double stopDist = TypicalStopFor(s);
+   double cost = MinLotCost(s.sym, stopDist);
+   if(cost <= 0.0 || riskPct <= 0.0) return 0.0;
+   return cost / (riskPct / 100.0);
+  }
+
+bool Affordable(Slot &s)
+  {
+   if(!InpAffordableOnly) return true;
+   double need = MinEquityFor(s, RiskPctForEquity(RealEquity()));
+   if(need <= 0.0) return true;                 // cannot judge, let the sizer decide
+   return (AccountInfoDouble(ACCOUNT_EQUITY) >= need);
+  }
+
+int g_affordable = 0;
+
+void CapabilityReport(const bool toLog)
+  {
+   double eq = AccountInfoDouble(ACCOUNT_EQUITY);
+   double riskPct = RiskPctForEquity(RealEquity());
+   string ccy = AccountInfoString(ACCOUNT_CURRENCY);
+
+   g_affordable = 0;
+   double cheapest = 0.0;
+   string cheapestSym = "";
+
+   if(toLog)
+     {
+      PrintFormat("CRT Sniper EA capability report - equity %.2f %s, risk %.2f%% per trade",
+                  eq, ccy, riskPct);
+      Print("  symbol        min lot   one min-lot stop   equity needed   status");
+     }
+
+   //--- one line per symbol, not per slot
+   string seen = "";
+   for(int i = 0; i < g_slots; i++)
+     {
+      if(StringFind(seen, "|" + g_slot[i].sym + "|") >= 0) continue;
+      seen += "|" + g_slot[i].sym + "|";
+
+      double stopDist = TypicalStopFor(g_slot[i]);
+      double cost = MinLotCost(g_slot[i].sym, stopDist);
+      double need = (cost > 0.0 && riskPct > 0.0 ? cost / (riskPct / 100.0) : 0.0);
+      double vmin = SymbolInfoDouble(g_slot[i].sym, SYMBOL_VOLUME_MIN);
+      bool okNow = (need <= 0.0 || eq >= need);
+      if(okNow) g_affordable++;
+
+      if(cost > 0.0 && (cheapest == 0.0 || need < cheapest))
+        { cheapest = need; cheapestSym = g_slot[i].sym; }
+
+      if(toLog)
+         PrintFormat("  %-12s  %7.2f   %16.2f   %13.2f   %s",
+                     g_slot[i].sym, vmin, cost, need,
+                     (okNow ? "tradable" : "ACCOUNT TOO SMALL"));
+     }
+
+   if(toLog)
+     {
+      if(g_affordable == 0 && cheapest > 0.0)
+        {
+         PrintFormat("CRT Sniper EA: this account cannot size ANY symbol at %.2f%% risk.", riskPct);
+         PrintFormat("  The cheapest is %s, which needs %.2f %s at that risk.",
+                     cheapestSym, cheapest, ccy);
+         PrintFormat("  The broker minimum lot is a hard floor - no setting gets under it.");
+         PrintFormat("  Either fund to %.2f %s, or accept a higher risk per trade.",
+                     cheapest, ccy);
+        }
+      else
+         PrintFormat("CRT Sniper EA: %d symbol(s) tradable at the current equity.", g_affordable);
+     }
+  }
+
+//+------------------------------------------------------------------+
 //| Guards                                                           |
 //+------------------------------------------------------------------+
 void UpdateAccountGuards()
@@ -1123,6 +1231,8 @@ void DrawPanel()
    PanelRow(r++, StringFormat("Risk/trade  : %.2f%%   live risk %.2f (cap %.2f)",
                               riskPct, liveRisk, eq * InpMaxOpenRiskPct / 100.0), clrAqua);
    PanelRow(r++, StringFormat("Open trades : %d / %d", CountPositions(), InpMaxTrades), clrGainsboro);
+   PanelRow(r++, StringFormat("Affordable  : %d symbols sizeable at %.2f%% risk", g_affordable, riskPct),
+            (g_affordable > 0 ? clrGainsboro : clrOrangeRed));
    PanelRow(r++, StringFormat("Day P/L     : %+.2f%%   (halt at -%.1f%%)", dayPL, InpMaxDailyLossPct),
             (dayPL >= 0.0 ? clrLimeGreen : clrOrangeRed));
    PanelRow(r++, StringFormat("Drawdown    : %.2f%%   (halt at %.1f%%)", dd, InpMaxDrawdownPct),
@@ -1172,6 +1282,7 @@ int OnInit()
      }
 
    LoadNewsForUniverse();
+   CapabilityReport(InpReportOnInit);
 
    if(!InpEnableTrading)
       Print("CRT Sniper EA: MONITOR ONLY. Signals are logged but no orders are sent. "
@@ -1190,6 +1301,7 @@ void OnDeinit(const int reason)
 
 void OnTimer()
   {
+   CapabilityReport(false);
    DrawPanel();
    ChartRedraw();
   }
@@ -1212,6 +1324,8 @@ void OnTick()
       datetime bt = iTime(g_slot[i].sym, g_slot[i].tf, 0);
       if(bt == 0 || bt == g_slot[i].lastBar) continue;
       g_slot[i].lastBar = bt;
+
+      if(!Affordable(g_slot[i])) continue;
 
       SigOut sig;
       bool inBlackout = NewsBlackout(TimeCurrent());

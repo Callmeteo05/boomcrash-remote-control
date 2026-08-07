@@ -698,6 +698,50 @@ Reads the real MT5 economic calendar for every currency in your symbol universe.
 
 News trading is off by default, and it carries the worst slippage of anything here.
 
+## The smallest account that can actually trade
+
+The broker's **minimum lot is a hard floor**. Below a certain equity the smallest
+trade you are allowed to place already risks more than your configured percentage,
+and no setting gets underneath it.
+
+| Symbol | Min lot | Cost if the stop hits | Equity needed at 2% | at 5% | at 10% |
+| --- | --- | --- | --- | --- | --- |
+| USDJPY | 0.01 | $1.70 | $85 | $34 | $17 |
+| Boom 1000 | 0.20 | $1.60 | $80 | $32 | $16 |
+| EURUSD | 0.01 | $2.00 | $100 | $40 | $20 |
+| GBPUSD | 0.01 | $2.50 | $125 | $50 | $25 |
+| XAUUSD | 0.01 | $3.50 | $175 | $70 | $35 |
+| US30 | 0.10 | $4.50 | $225 | $90 | $45 |
+
+An account of **$0.25 cannot place a trade at all**. The cheapest minimum-lot trade
+anywhere in that list costs $1.60, so a quarter of a dollar cannot survive one
+stop-out even at 100% risk. This is arithmetic, not a limitation of the EA.
+
+Realistically: **$80–$225 is the entry point** for one symbol at sane risk. Accept
+5% risk per trade and it drops to roughly $32–$90, with the drawdown that implies.
+
+### The EA tells you where you stand
+
+On startup it prints a capability report — every symbol, its minimum lot, the cost of
+one minimum-lot stop-out, and the equity needed to size it properly:
+
+```
+CRT Sniper EA capability report - equity 45.00 USD, risk 2.00% per trade
+  symbol        min lot   one min-lot stop   equity needed   status
+  EURUSD           0.01               2.00          100.00   ACCOUNT TOO SMALL
+  USDJPY           0.01               1.70           85.00   ACCOUNT TOO SMALL
+CRT Sniper EA: this account cannot size ANY symbol at 2.00% risk.
+  The cheapest is USDJPY, which needs 85.00 USD at that risk.
+  The broker minimum lot is a hard floor - no setting gets under it.
+  Either fund to 85.00 USD, or accept a higher risk per trade.
+```
+
+The panel carries the live count (`Affordable : N symbols sizeable at 2.00% risk`),
+and symbols the account cannot size are skipped rather than repeatedly attempted.
+
+So the EA never silently does nothing. If it is not trading, it says why, and tells
+you the number that would change it.
+
 ## Before you run it
 
 1. Compile in MetaEditor (**F7**).
