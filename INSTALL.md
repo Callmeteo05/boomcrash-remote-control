@@ -162,8 +162,11 @@ less obvious.
 
 Do not do this until `COMPILE_ORDER.md` step 7 is clean.
 
-1. **Use a demo account.** `Test_RiskHalt` refuses to run on a live account,
-   and the drawdown halt has never fired in anger.
+1. **Use a demo account.** The EA now refuses to initialise on a real
+   account: `InpAllowLiveTrading` and `InpAcknowledgeUntested` both default
+   to false, and both must be true before it will start on live money. It
+   prints the account login, name, server and mode at startup so you can see
+   which account you actually attached it to.
 2. In MetaTrader: **Tools → Options → Expert Advisors**, tick
    *Allow algorithmic trading*.
 3. Click the **AutoTrading** button in the toolbar so it is green.
@@ -189,4 +192,5 @@ not — a warning naming the constraint responsible.
 | Downloaded ZIP has no `Include` folder | Downloaded `main` instead of the branch | Redo step 1 with the branch selected |
 | Sad face on the chart instead of a smiley | AutoTrading off, or *Allow Algo Trading* unticked | Step 7 items 3 and 5 |
 | EA logs a hard halt at startup and will not trade | A persisted drawdown flag, or leftover state from `Test_RiskHalt` | Run `Test_RiskHalt` with `InpPhase = 3` to clear it. This is deliberate — the kill switch is meant to survive restarts |
+| `REFUSED TO START ON A REAL ACCOUNT` | The live guard, working as intended | Move to demo. Only set `InpAllowLiveTrading` **and** `InpAcknowledgeUntested` to true once testing is genuinely finished |
 | `Test_Repaint` aborts saying it needs more bars | History not downloaded | Scroll the chart back until bars load, then re-run |

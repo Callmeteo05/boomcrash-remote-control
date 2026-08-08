@@ -23,6 +23,7 @@
 #property description "Trades purely from price action and market structure."
 #property description "Adapts to each instrument's measured statistics."
 #property description "NOT YET COMPILED OR TESTED - see CLAUDE.md working agreement."
+#property description "Refuses to start on a REAL account unless deliberately enabled."
 
 #include <SEA/SEA_Common.mqh>
 #include <SEA/CSymbolSpec.mqh>
@@ -54,6 +55,10 @@
 //| Every threshold in the EA is an input with a documented range.    |
 //| There are no magic numbers buried in strategy logic.              |
 //+------------------------------------------------------------------+
+
+input group "=== SAFETY ==="
+input bool   InpAllowLiveTrading    = false; // Allow REAL money. Leave false until tested
+input bool   InpAcknowledgeUntested = false; // I have read the warning below
 
 input group "=== IDENTITY ==="
 input long   InpMagicNumber         = 20260808;  // Magic number
@@ -314,6 +319,74 @@ int OnInit()
    Print("========================================================");
    Print("  Structure-Driven Adaptive EA starting");
    Print("========================================================");
+
+   //--- LIVE ACCOUNT GUARD.
+   //---
+   //--- This EA has not been through the testing its own CLAUDE.md
+   //--- demands: no real-tick backtest, no walk-forward, no Monte Carlo
+   //--- on the drawdown halt, no demo forward test. CTradeExec's retcode
+   //--- paths - requotes, 10030 filling rejections, partial fills - are
+   //--- the code that actually moves money, and none of them has been
+   //--- exercised against a live server.
+   //---
+   //--- So a real account is refused unless the operator deliberately
+   //--- turns both switches on. The default is to refuse.
+   ENUM_ACCOUNT_TRADE_MODE accountMode=
+      (ENUM_ACCOUNT_TRADE_MODE)AccountInfoInteger(ACCOUNT_TRADE_MODE);
+
+   string modeName="UNKNOWN";
+   switch(accountMode)
+     {
+      case ACCOUNT_TRADE_MODE_DEMO:    modeName="DEMO";    break;
+      case ACCOUNT_TRADE_MODE_CONTEST: modeName="CONTEST"; break;
+      case ACCOUNT_TRADE_MODE_REAL:    modeName="REAL";    break;
+     }
+
+   PrintFormat("[SEA] account %I64d (%s) at %s - mode %s",
+               AccountInfoInteger(ACCOUNT_LOGIN),
+               AccountInfoString(ACCOUNT_NAME),
+               AccountInfoString(ACCOUNT_SERVER),
+               modeName);
+
+   if(accountMode==ACCOUNT_TRADE_MODE_REAL)
+     {
+      if(!InpAllowLiveTrading || !InpAcknowledgeUntested)
+        {
+         Print("========================================================");
+         Print("  REFUSED TO START ON A REAL ACCOUNT");
+         Print("========================================================");
+         Print("  This EA has never completed the testing its own");
+         Print("  specification requires:");
+         Print("    - no real-tick backtest");
+         Print("    - no walk-forward or out-of-sample run");
+         Print("    - no Monte Carlo on the drawdown halt");
+         Print("    - no demo forward test");
+         Print("    - CTradeExec retcode handling never exercised live");
+         Print("");
+         Print("  The drawdown hard halt has never actually fired. If it");
+         Print("  does not work, nothing stops the losses.");
+         Print("");
+         Print("  Run it on DEMO first. When you have genuinely finished");
+         Print("  testing, set BOTH inputs to true:");
+         Print("    InpAllowLiveTrading    = true");
+         Print("    InpAcknowledgeUntested = true");
+         Print("========================================================");
+         return(INIT_FAILED);
+        }
+
+      //--- both switches are on. Say so loudly rather than starting quietly.
+      Print("========================================================");
+      Print("  RUNNING ON A REAL ACCOUNT BY EXPLICIT OPERATOR CONSENT");
+      PrintFormat("  balance %.2f  equity %.2f  %s",
+                  AccountInfoDouble(ACCOUNT_BALANCE),
+                  AccountInfoDouble(ACCOUNT_EQUITY),
+                  AccountInfoString(ACCOUNT_CURRENCY));
+      PrintFormat("  max drawdown halt at %.2f%%, daily at %.2f%%",
+                  InpMaxDDPercent,InpDailyDDPercent);
+      Print("  A hard halt requires a MANUAL reset - it will not clear");
+      Print("  itself, and it survives a terminal restart.");
+      Print("========================================================");
+     }
 
    g_pool.SetVerbose(InpVerbose);
    g_pool.SetWarnThreshold(400);

@@ -212,6 +212,7 @@ clear it with `Test_RiskHalt` phase 3. That is deliberate.**
 ---
 | `CZones`, `CLiquidity`, `CGates`, `CScoring`, `CScaling` had no correctness tests | Five new scripts. `CGates` and `CScoring` are pure unit tests; `CZones` and `CLiquidity` independently re-derive their answers from raw bars; `CScaling` walks the decay ladder and every refusal with synthetic positions |
 | `PERIOD_CURRENT` appeared as a member initialiser in five modules, against RULE 10 | Replaced with `SEA_TF_UNSET`. Only `CStyle` names a `PERIOD_` constant now |
+| Nothing stopped this untested EA being attached to a real account | `InpAllowLiveTrading` and `InpAcknowledgeUntested`, both defaulting to false. `OnInit` returns `INIT_FAILED` on a real account unless both are set, and logs the account it is attached to either way |
 
 ## Errors I still expect
 
@@ -263,3 +264,7 @@ From CLAUDE.md's own testing section. None of it has been done:
 The hard halt has never fired in anger. `Test_RiskHalt` phase 3 is the only way
 back once it latches — that is by design, and you should confirm you can do it
 before you need to.
+
+The EA now refuses to start on a real account by default. Turning that guard
+off is a deliberate two-switch action, and it should be the LAST thing you do,
+not the first.
