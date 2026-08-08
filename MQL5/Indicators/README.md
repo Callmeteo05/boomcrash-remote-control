@@ -70,12 +70,14 @@ fallback= 1.5R / 2.5R / 4R whenever no liquidity is found in range
 The legend on the chart says which was used — `targets liquidity` or `targets R fallback` —
 so you always know whether a target is a real level or a placeholder.
 
-## Confluence score (gate: `InpMinScore`, default 60)
+## Confluence score (gate: `InpMinScore`, default 70)
 
 | Points | Test |
 | --- | --- |
-| 20 | D1 bias agrees |
-| 20 | H4 bias agrees |
+| 15 | D1 bias agrees |
+| 15 | H4 bias agrees |
+| 10 | EMA trend agrees |
+| 10 | RSI not fighting the setup |
 | 15 | liquidity sweep before the shift |
 | 10 / 5 | CHoCH / BOS |
 | 10 | displacement |
@@ -87,6 +89,64 @@ Turning on the `SMC` column (`InpShowSmc`) shows which of these actually fired, 
 
 `InpBiasMode` controls strictness: **Both** (D1 and H4 must agree — fewest, strongest setups),
 **H4 led** (default: H4 agrees, D1 must not oppose), or **Any**.
+
+## Trend filter (EMA + RSI)
+
+Structure tells you *where*; the trend filter refuses the trades where structure looks right
+but momentum does not. Both are hard gates by default and also feed the score.
+
+| | Continuation (BOS) | Reversal (CHoCH) |
+| --- | --- | --- |
+| **EMA** | price on the correct side of **both** EMAs, and EMA21/EMA50 stacked that way | price has reclaimed the **fast** EMA only — on a genuine turn the slow EMA still points the old way |
+| **RSI** | buys need RSI 45–75, sells need 25–55 — it will not buy something already exhausted upward | buy needs RSI ≤ 45, sell ≥ 55 — the turn has to come from the stretched side |
+
+`InpUseEmaFilter` / `InpUseRsiFilter` switch each off; thresholds are all inputs.
+
+## Quality gates
+
+Three hard rejections exist purely to keep low-quality setups off the board:
+
+- **`InpMaxRiskAtr` (4.0)** — a stop wider than this means the structure is not clean enough
+  to trade, whatever the confluence says.
+- **`InpMaxZoneAtr` (2.5)** — a POI wider than this is not a level, it is a guess; a huge order
+  block would give a meaningless entry price.
+- **`InpHideFinished` (on)** — a setup that has already hit SL or TP3 stops being a signal. The
+  dashboard will not advertise a trade that is over.
+
+Setups stopped out before they ever filled are dropped as well (`INVALID`), so they can never
+appear as a live entry.
+
+## Real time, and no repainting
+
+**Real time**
+
+| Element | Refresh |
+| --- | --- |
+| Market Watch contents | re-read every 10 s — added or removed symbols follow |
+| Scan | round-robin, `InpSymbolsPerTick` symbols per second, each re-analysed when it prints a new bar |
+| `AGE` | recomputed at draw time from the signal bar's own timestamp against that symbol's current bar, so it is never a number frozen at scan time. `InpAgeMode = Clock` shows `1h 05m ago` instead of bars |
+| `STATUS` | every second for every signalled symbol, and **every tick** for the charted symbol |
+| Chart drawing | every tick |
+
+**No repainting.** Four separate mechanisms, because one is not enough:
+
+1. **Closed bars only.** Signals are only ever evaluated on bar 1 and older. The forming bar
+   never produces a signal.
+2. **No forward reads.** Every input to a decision at bar `i` comes from bar `i` or older.
+   Fractals are used only once confirmed by `InpSwingStrength` *newer* bars, so the confirming
+   bars are themselves at or before `i`. HTF bias reads the last **closed** D1/H4 bar.
+3. **Seed guard.** The structure walk starts from an unknown state at the oldest bar of a
+   window that slides forward each scan. Until price has actually broken structure, the state
+   still carries a trace of that seed — so bias is only published after the first real break,
+   and signals only from the second. A seed-dependent signal is a signal that can change under
+   you.
+4. **Frozen levels.** ATR/EMA/RSI are seeded from the oldest bar in the window, so a recomputed
+   value can differ in its last decimals — enough to nudge a stop by a tick. Once a setup is
+   published for a given signal bar, its entry, SL and targets are **locked**. A rescan of that
+   same bar reuses the original numbers; only the outcome is allowed to move.
+
+What *does* change, by design, and is not repainting: a setup leaves the board when it ages
+past `InpMaxAge`, when it is invalidated before filling, or when it finishes at SL/TP3.
 
 ## Why the numbers are real
 
@@ -161,8 +221,10 @@ Two opt-in extras:
   are computed inline rather than through `iMA`/`iATR` handles, so the scan is not capped by
   the terminal's per-chart indicator-handle limit — that limit is what makes large scanner
   panels show blank rows.
-- The back-test only evaluates bars where a structure break actually occurred, so the window
-  costs far less than a per-bar scan.
+- The back-test only evaluates bars where a structure break actually occurred, and **only runs
+  at all when its result is on screen** (`InpShowWinRate` or `InpShowTradeDetail`). It is by far
+  the most expensive part of a scan, and computing a number nobody is looking at is what makes
+  a scanner slow. With it off, a scan reads roughly 350 entry bars instead of 800.
 - The title shows `analysed 128/132`, so a blank row is never ambiguous between "no setup" and
   "not scanned yet". First attach on a fresh terminal takes a while: MT5 must download D1, H4
   and entry-TF history for every symbol.
@@ -173,7 +235,11 @@ Two opt-in extras:
 | --- | --- | --- |
 | `InpBiasTF1` / `InpBiasTF2` | D1 / H4 | A bias TF at or below the entry TF is ignored automatically |
 | `InpBiasMode` | H4 led | Strictness of the bias filter |
-| `InpMinScore` | 60 | Raise for fewer, higher-conviction setups |
+| `InpMinScore` | 70 | Raise for fewer, higher-conviction setups |
+| `InpUseEmaFilter` / `InpUseRsiFilter` | true | Hard trend gates on top of the SMC logic |
+| `InpMaxRiskAtr` / `InpMaxZoneAtr` | 4.0 / 2.5 | Quality rejections |
+| `InpAgeMode` | Bars | `Clock` shows elapsed time instead of bar count |
+| `InpSymbolsPerTick` | 10 | Scan throughput |
 | `InpRequireSweep` | false | Set true to demand a liquidity sweep on every setup |
 | `InpRequireDisp` | true | Reject breaks without displacement |
 | `InpRequirePD` | false | Set true to refuse entries on the wrong side of equilibrium |

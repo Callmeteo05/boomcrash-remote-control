@@ -46,6 +46,12 @@ enum ENUM_MF_POI
    MF_POI_PROXIMAL= 1   // Proximal edge (first touch)
 };
 
+enum ENUM_MF_AGE
+{
+   MF_AGE_BARS  = 0,    // "3 bars ago" / "current"
+   MF_AGE_CLOCK = 1     // "1h 05m ago"
+};
+
 enum ENUM_MF_SORT
 {
    MF_SORT_LIST   = 0,  // Market Watch order
@@ -63,7 +69,7 @@ input string          InpFilterInclude  = "";    // Only symbols containing this
 input string          InpFilterExclude  = "";    // Skip symbols containing this text
 input bool            InpSkipUntradable = true;  // Skip symbols with trading disabled
 input int             InpMaxSymbols     = 250;   // Hard cap on scanned symbols
-input int             InpSymbolsPerTick = 6;     // Symbols analysed per second
+input int             InpSymbolsPerTick = 10;    // Symbols analysed per second
 
 input group "=== Timeframes ==="
 input ENUM_TIMEFRAMES InpTimeframe      = PERIOD_CURRENT; // Entry timeframe
@@ -82,11 +88,28 @@ input int             InpPoiLookback    = 10;    // Bars back to find the OB / F
 input ENUM_MF_POI     InpPoiEntry       = MF_POI_CE; // Where in the zone to enter
 input bool            InpRequirePD      = false; // Reject entries on the wrong side of equilibrium
 
+input group "=== Trend filter (EMA + RSI) ==="
+input bool            InpUseEmaFilter   = true;  // EMA trend must agree with the setup
+input int             InpEmaFast        = 21;    // Fast EMA
+input int             InpEmaSlow        = 50;    // Slow EMA
+input bool            InpUseRsiFilter   = true;  // RSI must not be exhausted against the setup
+input int             InpRsiPeriod      = 14;    // RSI period
+input double          InpRsiMaxBuy      = 75.0;  // Never buy a continuation above this RSI
+input double          InpRsiMinSell     = 25.0;  // Never sell a continuation below this RSI
+input double          InpRsiRevBuy      = 45.0;  // Reversal buy needs RSI at or below this
+input double          InpRsiRevSell     = 55.0;  // Reversal sell needs RSI at or above this
+
+input group "=== Quality gates ==="
+input double          InpMaxRiskAtr     = 4.0;   // Reject setups whose stop is wider than ATR x
+input double          InpMaxZoneAtr     = 2.5;   // Reject POI zones wider than ATR x
+input bool            InpHideFinished   = true;  // A setup that already hit SL or TP3 is not a signal
+
 input group "=== Signal selection ==="
 input int             InpMaxAge         = 25;    // Keep a setup on the board for N bars
-input int             InpMinScore       = 60;    // Minimum confluence score (0-100)
+input int             InpMinScore       = 70;    // Minimum confluence score (0-100)
 input bool            InpOnlySignals    = false; // Show only symbols with a live setup
 input ENUM_MF_SORT    InpSortMode       = MF_SORT_FRESH; // Row order
+input ENUM_MF_AGE     InpAgeMode        = MF_AGE_BARS;   // How AGE is displayed
 
 input group "=== Risk and targets ==="
 input int             InpAtrPeriod      = 14;    // ATR period
@@ -206,6 +229,7 @@ struct MFSymbol
    double   tickSize;
    double   stopDist;
    datetime lastBar;
+   datetime curBar;         // newest bar time, refreshed every cycle
    int      statWins;
    int      statLosses;
    datetime lastAlert;
@@ -220,6 +244,9 @@ struct MFCtx
    int      n;
    MqlRates r[];
    double   atr[];
+   double   emaF[];
+   double   emaS[];
+   double   rsi[];
    int      bias[];
    int      evDir[];
    int      evChoch[];
@@ -482,6 +509,7 @@ void BuildUniverse()
       r.name       = names[i];
       r.analysed   = false;
       r.lastBar    = 0;
+      r.curBar     = 0;
       r.statWins   = 0;
       r.statLosses = 0;
       r.lastAlert  = 0;
@@ -546,6 +574,34 @@ void CalcATR(const MqlRates &r[], const int n, const int period, double &out[])
    }
 }
 
+void CalcEMA(const MqlRates &r[], const int n, const int period, double &out[])
+{
+   ArrayResize(out, n);
+   if(n <= 0)
+      return;
+   double k = 2.0 / (period + 1.0);
+   out[n - 1] = r[n - 1].close;
+   for(int i = n - 2; i >= 0; i--)
+      out[i] = r[i].close * k + out[i + 1] * (1.0 - k);
+}
+
+void CalcRSI(const MqlRates &r[], const int n, const int period, double &out[])
+{
+   ArrayResize(out, n);
+   if(n <= 0)
+      return;
+   double p  = (double)period;
+   double ag = 0.0, al = 0.0;
+   out[n - 1] = 50.0;
+   for(int i = n - 2; i >= 0; i--)
+   {
+      double d = r[i].close - r[i + 1].close;
+      ag = (ag * (p - 1.0) + (d > 0.0 ?  d : 0.0)) / p;
+      al = (al * (p - 1.0) + (d < 0.0 ? -d : 0.0)) / p;
+      out[i] = (al <= 0.0) ? 100.0 : 100.0 - 100.0 / (1.0 + ag / al);
+   }
+}
+
 //+------------------------------------------------------------------+
 //| Fractals                                                         |
 //+------------------------------------------------------------------+
@@ -596,6 +652,7 @@ void StructureSeries(const MqlRates &r[], const int n, const int s,
    double lastH = 0.0, lastL = 0.0;
    bool   haveH = false, haveL = false;
    int    state = 0;
+   int    breaks = 0;
    double rh = r[n - 1].high, rl = r[n - 1].low;
 
    for(int i = n - 1; i >= 0; i--)
@@ -614,6 +671,7 @@ void StructureSeries(const MqlRates &r[], const int n, const int s,
          ch    = (state == -1 ? 1 : 0);
          state = +1;
          ev    = +1;
+         breaks++;
          if(haveL) rl = lastL;
          rh    = r[i].high;
          haveH = false;
@@ -623,6 +681,7 @@ void StructureSeries(const MqlRates &r[], const int n, const int s,
          ch    = (state == +1 ? 1 : 0);
          state = -1;
          ev    = -1;
+         breaks++;
          if(haveH) rh = lastH;
          rl    = r[i].low;
          haveL = false;
@@ -633,9 +692,15 @@ void StructureSeries(const MqlRates &r[], const int n, const int s,
          if(state < 0) rl = MathMin(rl, r[i].low);
       }
 
-      bias[i]    = state;
-      evDir[i]   = ev;
-      evChoch[i] = ch;
+      //--- The walk starts from an unknown state at the oldest bar in the window,
+      //--- and that window slides forward by one bar each time we rescan. Until a
+      //--- couple of real breaks have happened, the state carries a trace of the
+      //--- seed rather than of price, and a seed-dependent signal is a signal that
+      //--- can change under you. So bias is only published once price has broken
+      //--- structure at least once, and events only from the second break on.
+      bias[i]    = (breaks >= 1 ? state : 0);
+      evDir[i]   = (breaks >= 2 ? ev : 0);
+      evChoch[i] = (breaks >= 2 ? ch : 0);
       rHigh[i]   = rh;
       rLow[i]    = rl;
    }
@@ -853,6 +918,31 @@ bool EvaluateAt(const MFSymbol &s, MFCtx &c, const int i, MFSignal &out)
    if(InpRequireDisp && !displaced)
       return false;
 
+   //--- 3b. EMA trend filter. A continuation has to sit on the right side of both
+   //--- EMAs; a reversal only has to have reclaimed the fast one, because on a
+   //--- genuine turn the slow EMA is still pointing the old way.
+   bool emaUp = (c.emaF[i] > c.emaS[i]);
+   bool emaOk;
+   if(choch)
+      emaOk = (dir > 0 ? c.r[i].close > c.emaF[i] : c.r[i].close < c.emaF[i]);
+   else
+      emaOk = (dir > 0 ? (emaUp  && c.r[i].close > c.emaS[i])
+                       : (!emaUp && c.r[i].close < c.emaS[i]));
+   if(InpUseEmaFilter && !emaOk)
+      return false;
+
+   //--- 3c. RSI filter. Refuses to buy something already exhausted upwards, and
+   //--- demands that a reversal actually come from the stretched side.
+   double rs = c.rsi[i];
+   bool rsiOk;
+   if(choch)
+      rsiOk = (dir > 0 ? rs <= InpRsiRevBuy : rs >= InpRsiRevSell);
+   else
+      rsiOk = (dir > 0 ? (rs >= 45.0 && rs <= InpRsiMaxBuy)
+                       : (rs <= 55.0 && rs >= InpRsiMinSell));
+   if(InpUseRsiFilter && !rsiOk)
+      return false;
+
    //--- 4. liquidity sweep shortly before the shift
    bool   hasSweep    = false;
    double sweepPrice  = 0.0;
@@ -870,6 +960,10 @@ bool EvaluateAt(const MFSymbol &s, MFCtx &c, const int i, MFSignal &out)
    //--- 5. point of interest to enter from
    MFPoi poi = FindPoi(c.r, n, i, dir);
    if(!poi.valid || poi.hi <= poi.lo)
+      return false;
+
+   //--- a zone wider than this is not a level, it is a guess
+   if((poi.hi - poi.lo) > c.atr[i] * InpMaxZoneAtr)
       return false;
 
    double entry = (InpPoiEntry == MF_POI_CE)
@@ -916,6 +1010,10 @@ bool EvaluateAt(const MFSymbol &s, MFCtx &c, const int i, MFSignal &out)
       adjusted = true;
    }
    if(risk <= 0.0)
+      return false;
+
+   //--- a stop this wide means the structure is not clean enough to trade
+   if(risk > c.atr[i] * InpMaxRiskAtr)
       return false;
 
    //--- 8. targets: resting liquidity first, R multiples only as fallback
@@ -978,19 +1076,23 @@ bool EvaluateAt(const MFSymbol &s, MFCtx &c, const int i, MFSignal &out)
 
    //--- 9. confluence score
    int score = 0;
-   if(agree1) score += 20;
-   if(agree2) score += 20;
-   if(hasSweep) score += 15;
-   score += (choch ? 10 : 5);
+   if(agree1)   score += 15;      // D1 bias
+   if(agree2)   score += 15;      // H4 bias
+   if(emaOk)    score += 10;      // EMA trend
+   if(rsiOk)    score += 10;      // RSI not fighting the setup
+   if(hasSweep) score += 15;      // liquidity taken
+   score += (choch ? 10 : 5);     // CHoCH over BOS
    if(displaced) score += 10;
    score += ((poi.isOB && poi.isFVG) ? 15 : 10);
-   if(pdOk) score += 10;
+   if(pdOk)     score += 10;
    if(score > 100) score = 100;
 
    //--- 10. compact confluence tags for the dashboard
    string tags = "";
    if(agree1) tags += g_b1Text + " ";
    if(agree2) tags += g_b2Text + " ";
+   if(emaOk) tags += "EMA ";
+   if(rsiOk) tags += "RSI ";
    if(hasSweep) tags += "SW ";
    tags += (choch ? "CH " : "BOS ");
    if(poi.isOB)  tags += "OB ";
@@ -1125,6 +1227,7 @@ int BacktestOutcome(const MqlRates &r[], const int n, const MFSignal &sg)
 //+------------------------------------------------------------------+
 void AnalyseSymbol(MFSymbol &s)
 {
+   MFSignal prev = s.sig;      // whatever is already on the board
    s.sig.valid = false;
 
    if(!s.ok)
@@ -1137,8 +1240,13 @@ void AnalyseSymbol(MFSymbol &s)
    MFCtx c;
    c.n = 0; c.n1 = 0; c.n2 = 0;
 
-   int warmup = (int)MathMax(InpAtrPeriod * 6, 150);
-   int stats  = (InpStatsBars > 0 ? InpStatsBars + InpStatsMaxHold : 0);
+   //--- the back-test is only run when its result is actually on screen; it is
+   //--- by far the most expensive part of a scan, and computing a number nobody
+   //--- is looking at is what makes a scanner slow
+   bool wantStats = (InpStatsBars > 0 && (InpShowWinRate || InpShowTradeDetail));
+
+   int warmup = (int)MathMax(MathMax(InpAtrPeriod * 6, InpEmaSlow * 4), 200);
+   int stats  = (wantStats ? InpStatsBars + InpStatsMaxHold : 0);
    int want   = (int)MathMax(InpMaxAge + InpLiquidityLook + warmup, stats + warmup);
 
    ArraySetAsSeries(c.r, true);
@@ -1151,6 +1259,9 @@ void AnalyseSymbol(MFSymbol &s)
    c.n = got;
 
    CalcATR(c.r, c.n, InpAtrPeriod, c.atr);
+   CalcEMA(c.r, c.n, InpEmaFast,   c.emaF);
+   CalcEMA(c.r, c.n, InpEmaSlow,   c.emaS);
+   CalcRSI(c.r, c.n, InpRsiPeriod, c.rsi);
 
    //--- entry timeframe structure
    StructureSeries(c.r, c.n, InpSwingStrength, c.bias, c.evDir, c.evChoch, c.rHigh, c.rLow);
@@ -1204,16 +1315,28 @@ void AnalyseSymbol(MFSymbol &s)
       if(sg.score < InpMinScore)
          continue;
 
-      sg.status = ReplayStatus(c.r, c.n, sg);
-      if(sg.status == ST_INVALID)      // the setup already died, keep looking
-         continue;
+      //--- No repaint, hard rule. Indicators here are seeded from the oldest bar
+      //--- of a window that slides forward on every new bar, so a recomputed ATR
+      //--- can differ in its last decimals - enough to nudge a stop by a tick.
+      //--- Once a setup has been published for a given signal bar, its numbers
+      //--- are locked: a rescan of that same bar reuses the original entry, SL
+      //--- and targets, and only the outcome is allowed to move.
+      MFSignal use = sg;
+      if(prev.valid && prev.time == sg.time && prev.dir == sg.dir)
+         use = prev;
 
-      s.sig = sg;
+      use.status = ReplayStatus(c.r, c.n, use);
+      if(use.status == ST_INVALID)     // stopped out before it ever filled
+         continue;
+      if(InpHideFinished && (use.status == ST_SL || use.status == ST_TP3))
+         continue;                     // already over - not something to trade now
+
+      s.sig = use;
       break;
    }
 
    //--- measured hit rate of this exact rule on this symbol
-   if(InpStatsBars > 0)
+   if(wantStats)
    {
       int wins = 0, losses = 0;
       int from = (int)MathMin(c.n - InpSwingStrength - 3, InpStatsBars + InpStatsMaxHold);
@@ -1290,6 +1413,8 @@ void RunScanBudget()
          continue;
 
       datetime bar0 = (datetime)SeriesInfoInteger(g_syms[i].name, g_tf, SERIES_LASTBAR_DATE);
+      if(bar0 != 0)
+         g_syms[i].curBar = bar0;      // keeps AGE live even between analyses
       if(g_syms[i].analysed && bar0 != 0 && bar0 == g_syms[i].lastBar)
          continue;
 
@@ -1376,13 +1501,32 @@ color BiasColor(const MFSignal &s)
    return InpClrDim;
 }
 
-string AgeText(const MFSignal &s)
+//--- AGE is derived from the signal bar's own timestamp against the symbol's
+//--- current bar, so it stays correct no matter when that symbol was last
+//--- analysed - it is never a number frozen at scan time.
+string AgeText(const MFSymbol &sym)
 {
-   if(!s.valid)
+   if(!sym.sig.valid)
       return "-";
-   if(s.barIndex <= 1)
+
+   if(InpAgeMode == MF_AGE_CLOCK)
+   {
+      long secs = (long)(TimeCurrent() - sym.sig.time);
+      if(secs < 60)
+         return "just now";
+      long mins = secs / 60;
+      if(mins < 60)
+         return StringFormat("%dm ago", (int)mins);
+      return StringFormat("%dh %02dm ago", (int)(mins / 60), (int)(mins % 60));
+   }
+
+   int ps   = PeriodSeconds(g_tf);
+   int bars = sym.sig.barIndex;
+   if(sym.curBar > 0 && ps > 0)
+      bars = (int)((sym.curBar - sym.sig.time) / ps);
+   if(bars <= 1)
       return "current";
-   return StringFormat("%d bars ago", s.barIndex - 1);
+   return StringFormat("%d bars ago", bars - 1);
 }
 
 string StatusText(const MFSignal &s)
@@ -1537,7 +1681,7 @@ void DrawPanel()
       cell[C_SMC]    = (sv ? s.sig.tags : "-");
       cell[C_SCORE]  = (sv ? IntegerToString(s.sig.score) : "-");
       cell[C_WR]     = (s.analysed ? WinRateText(s) : "-");
-      cell[C_AGE]    = (s.note != "" ? "" : AgeText(s.sig));
+      cell[C_AGE]    = (s.note != "" ? "" : AgeText(s));
       cell[C_ENTRY]  = PriceText(s, s.sig.entry);
       cell[C_SL]     = PriceText(s, s.sig.sl) + (sv && s.sig.adjusted ? "*" : "");
       cell[C_TP1]    = PriceText(s, s.sig.tp1);
@@ -1824,6 +1968,11 @@ int OnInit()
       Print("MarketFlow V8: invalid panel geometry.");
       return INIT_PARAMETERS_INCORRECT;
    }
+   if(InpEmaFast < 1 || InpEmaSlow < 1 || InpEmaFast >= InpEmaSlow || InpRsiPeriod < 2)
+   {
+      Print("MarketFlow V8: invalid EMA/RSI filter parameters.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
    if(InpSwingStrength < 1 || InpAtrPeriod < 1 || InpMaxAge < 1 || InpPoiLookback < 2)
    {
       Print("MarketFlow V8: invalid structure parameters.");
@@ -1869,12 +2018,25 @@ int OnCalculate(const int rates_total,
                 const long &volume[],
                 const int &spread[])
 {
+   //--- the timer drives the scan; this keeps the charted symbol's outcome and
+   //--- drawing live on every tick rather than once a second
+   if(rates_total > 0)
+   {
+      for(int i = 0; i < ArraySize(g_syms); i++)
+         if(g_syms[i].name == _Symbol)
+         {
+            RefreshStatus(g_syms[i]);
+            break;
+         }
+      DrawChartTrade();
+      ChartRedraw();
+   }
    return rates_total;
 }
 
 void OnTimer()
 {
-   if(TimeCurrent() - g_lastUniverse >= 30)
+   if(TimeCurrent() - g_lastUniverse >= 10)
    {
       g_lastUniverse = TimeCurrent();
       BuildUniverse();
