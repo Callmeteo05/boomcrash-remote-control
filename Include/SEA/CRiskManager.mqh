@@ -159,6 +159,21 @@ public:
    //! Consecutive losses recorded.
    int               LossStreak(void) const { return m_lossStreak; }
 
+   //! Equity ladder band index: 0 below $500, 1 for $500-2k, 2 above.
+   //! Exposed so callers can report the band without duplicating the
+   //! thresholds - the ladder is defined in exactly one place.
+   int               EquityBand(void) const;
+
+   //! Readable equity band, e.g. "$500-2k at 0.75%".
+   string            EquityBandName(void) const;
+
+   //! Risk percentage the ladder alone would give, before the rolling
+   //! profit factor moves it within the band.
+   double            LadderRiskPercent(void) const { return LadderRisk(AccountInfoDouble(ACCOUNT_EQUITY)); }
+
+   //! Micro-mode ceiling in force.
+   double            MicroModeCeiling(void) const { return m_microModeCeiling; }
+
    //--- sizing ------------------------------------------------------------
    //! Position size for a structural stop.
    //!
@@ -470,6 +485,28 @@ ENUM_SEA_HALT CRiskManager::Evaluate(void)
    m_haltState  = SEA_HALT_NONE;
    m_haltReason = "";
    return(m_haltState);
+  }
+
+//+------------------------------------------------------------------+
+int CRiskManager::EquityBand(void) const
+  {
+   double equity=AccountInfoDouble(ACCOUNT_EQUITY);
+   if(equity<500.0)
+      return(0);
+   if(equity<2000.0)
+      return(1);
+   return(2);
+  }
+
+//+------------------------------------------------------------------+
+string CRiskManager::EquityBandName(void) const
+  {
+   switch(EquityBand())
+     {
+      case 0: return("below $500 at 0.50%");
+      case 1: return("$500-2k at 0.75%");
+     }
+   return("above $2k at 1.00%");
   }
 
 //+------------------------------------------------------------------+

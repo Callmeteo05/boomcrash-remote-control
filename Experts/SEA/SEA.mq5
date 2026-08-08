@@ -217,6 +217,111 @@ string StructuralExplanation(const SSetup &s)
   }
 
 //+------------------------------------------------------------------+
+//| Report the account profile, and shout when it has CHANGED.        |
+//|                                                                   |
+//| The trading logic is identical on demo and live - account type is  |
+//| read once, in the guard above, and never again. But this EA is     |
+//| deliberately EQUITY-ADAPTIVE, so the same code behaves very        |
+//| differently at $300 and at $10,000:                                |
+//|                                                                   |
+//|   the ladder sets a different risk percentage                     |
+//|   micro mode may force VOLUME_MIN, no scale-ins, one position     |
+//|   affordableStop scales with equity, which decides WHICH SYMBOLS  |
+//|     are tradeable at all                                          |
+//|                                                                   |
+//| So a demo run at one equity tells you very little about a live     |
+//| account at another. That is not a bug and it is not the market     |
+//| turning against you - it is the affordability arithmetic doing     |
+//| its job on a different number.                                    |
+//|                                                                   |
+//| This prints the band every startup, and warns loudly when the      |
+//| login or the band has moved since last time.                      |
+//+------------------------------------------------------------------+
+void ReportAccountProfile(void)
+  {
+   const long   login  = AccountInfoInteger(ACCOUNT_LOGIN);
+   const double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   const int    band   = g_risk.EquityBand();
+   const bool   micro  = g_risk.IsMicroMode();
+
+   Print("--------------------------------------------------------");
+   Print("  ACCOUNT PROFILE - what the equity-adaptive rules will do");
+   Print("--------------------------------------------------------");
+   PrintFormat("  equity        %.2f %s",equity,AccountInfoString(ACCOUNT_CURRENCY));
+   PrintFormat("  ladder band   %s",g_risk.EquityBandName());
+   PrintFormat("  risk in force %.3f%% per trade",g_risk.CurrentRiskPercent());
+   PrintFormat("  micro mode    %s (ceiling %.2f)",
+               (micro ? "ACTIVE" : "off"),g_risk.MicroModeCeiling());
+
+   if(micro)
+     {
+      Print("");
+      Print("  MICRO MODE IS ACTIVE. Margin, not risk percentage, is the");
+      Print("  binding constraint:");
+      Print("    every trade is VOLUME_MIN - size is not a choice");
+      Print("    scale-ins forced to 0");
+      Print("    one position at a time");
+      Print("    any structural stop wider than the risk budget is SKIPPED");
+      Print("  Expect far fewer trades than a larger account would take.");
+     }
+
+   //--- has the account or the band moved since the last run?
+   const string loginKey = StringFormat("SEA_%d_LASTLOGIN",(int)InpMagicNumber);
+   const string bandKey  = StringFormat("SEA_%d_LASTBAND",(int)InpMagicNumber);
+   const string eqKey    = StringFormat("SEA_%d_LASTEQUITY",(int)InpMagicNumber);
+
+   bool haveHistory = GlobalVariableCheck(loginKey);
+   long  lastLogin  = (haveHistory ? (long)GlobalVariableGet(loginKey) : 0);
+   int   lastBand   = (GlobalVariableCheck(bandKey) ? (int)GlobalVariableGet(bandKey) : -1);
+   double lastEquity= (GlobalVariableCheck(eqKey)   ? GlobalVariableGet(eqKey)        : 0.0);
+
+   if(haveHistory && lastLogin!=login)
+     {
+      Print("");
+      Print("  ####################################################");
+      Print("  #  DIFFERENT ACCOUNT THAN LAST RUN                 #");
+      Print("  ####################################################");
+      PrintFormat("  last run on login %I64d, now on %I64d",lastLogin,login);
+      PrintFormat("  equity then %.2f, now %.2f",lastEquity,equity);
+      Print("");
+      Print("  The trading LOGIC is identical - but the equity-adaptive");
+      Print("  rules above are not, so results from the other account do");
+      Print("  NOT carry over. Risk percentage, micro mode and the");
+      Print("  tradeable universe are all recomputed from THIS equity.");
+      Print("");
+      Print("  Persisted state (drawdown high-water mark, halt flags,");
+      Print("  loss streak) is keyed on the MAGIC NUMBER, not the login,");
+      Print("  so it has followed you across. If that is not what you");
+      Print("  wanted, use a different InpMagicNumber for this account.");
+     }
+   else
+      if(haveHistory && lastBand!=band)
+        {
+         Print("");
+         Print("  ** EQUITY BAND CHANGED SINCE THE LAST RUN **");
+         PrintFormat("  equity moved %.2f -> %.2f, band is now %s",
+                     lastEquity,equity,g_risk.EquityBandName());
+         Print("  Risk percentage and the tradeable universe have shifted");
+         Print("  with it. This is the ladder working, not a fault.");
+        }
+
+   if(haveHistory && lastEquity>0.0)
+     {
+      double ratio=equity/lastEquity;
+      if(ratio>3.0 || ratio<0.34)
+         PrintFormat("  NOTE: equity is %.1fx the last run. Comparing results "
+                     "across that gap is not meaningful.",ratio);
+     }
+
+   GlobalVariableSet(loginKey,(double)login);
+   GlobalVariableSet(bandKey,(double)band);
+   GlobalVariableSet(eqKey,equity);
+   GlobalVariablesFlush();
+
+   Print("--------------------------------------------------------");
+  }
+
+//+------------------------------------------------------------------+
 //| Resolve AUTO style.                                               |
 //|                                                                   |
 //| Measures each candidate style at its OWN execution timeframe over  |
@@ -408,6 +513,10 @@ int OnInit()
       return(INIT_FAILED);
      }
    Print("[SEA] risk: ",g_risk.Describe());
+
+   //--- equity band, micro mode, and a loud warning if the account or
+   //--- the band has moved since the last run
+   ReportAccountProfile();
 
    //--- module 3: execution
    g_exec.SetVerbose(InpVerbose);
@@ -882,9 +991,18 @@ void OnTimer()
                                     g_risk.RollingProfitFactor(),
                                     g_risk.LossStreak()));
 
-      g_dashboard.Line(StringFormat("equity     %.2f  micro %s",
+      g_dashboard.Line(StringFormat("equity     %.2f %s",
                                     AccountInfoDouble(ACCOUNT_EQUITY),
-                                    (g_risk.IsMicroMode() ? "YES" : "no")));
+                                    AccountInfoString(ACCOUNT_CURRENCY)));
+
+      //--- the equity band is on the HUD because it silently changes what
+      //--- the EA will and will not trade
+      g_dashboard.Severity("ladder band",g_risk.EquityBandName(),0);
+      g_dashboard.Severity("micro mode",
+                           (g_risk.IsMicroMode()
+                            ? "ACTIVE - VOLUME_MIN, no scale-ins, 1 position"
+                            : "off"),
+                           (g_risk.IsMicroMode() ? 1 : 0));
 
       g_dashboard.Line(g_scanner.Describe());
 
