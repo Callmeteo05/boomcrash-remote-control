@@ -23,7 +23,7 @@ Copy from this repo into the `MQL5` folder you just opened:
 |---|---|
 | `Include/SEA/` (whole folder, 23 `.mqh` files) | `MQL5/Include/SEA/` |
 | `Experts/SEA/SEA.mq5` | `MQL5/Experts/SEA/` |
-| `Scripts/SEA/*.mq5` (3 files) | `MQL5/Scripts/SEA/` |
+| `Scripts/SEA/*.mq5` (8 files) | `MQL5/Scripts/SEA/` |
 
 Create the `SEA` subfolders if they do not exist. Do **not** copy `Files/` —
 the EA writes into the terminal's own `MQL5/Files/` at runtime.
