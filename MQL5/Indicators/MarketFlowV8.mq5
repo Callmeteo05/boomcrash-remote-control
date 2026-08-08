@@ -110,16 +110,18 @@ input int             InpRowsVisible    = 9;     // Visible rows
 input int             InpRowHeight      = 18;    // Row height (px)
 input string          InpFont           = "Consolas"; // Font
 input int             InpFontSize       = 8;     // Font size
-input bool            InpShowBias       = true;  // Show the BIAS column
-input bool            InpShowSmc        = true;  // Show the SMC confluence column
-input bool            InpShowScore      = true;  // Show the SCORE column
-input bool            InpShowWinRate    = true;  // Show the WR column
-input bool            InpShowStatus     = true;  // Show the STATUS column
+input bool            InpShowBias       = false; // Show the BIAS column
+input bool            InpShowSmc        = false; // Show the SMC confluence column
+input bool            InpShowScore      = false; // Show the SCORE column
+input bool            InpShowWinRate    = false; // Show the WR column
+input bool            InpShowStatus     = false; // Show the STATUS column
 
 input group "=== Chart drawing ==="
 input bool            InpShowChartTrade = true;  // Draw the chart symbol's setup
-input bool            InpShowZone       = true;  // Draw the POI (order block / FVG) zone
+input bool            InpShowSmcMarkup  = false; // Draw the SMC markup (POI zone, sweep line, BOS/CHoCH tag)
 input bool            InpShowWatermark  = true;  // Draw the symbol/timeframe watermark
+input bool            InpWatermarkTint  = true;  // Tint the watermark with the signal direction
+input bool            InpShowTradeDetail= false; // Extra legend line (bias, score, R:R, hit rate)
 input int             InpBoxExtendBars  = 6;     // Extend the trade box N bars past the last bar
 
 input group "=== Colors ==="
@@ -127,6 +129,7 @@ input color           InpClrPanelBg     = C'10,12,26';    // Panel background
 input color           InpClrPanelBorder = C'60,50,120';   // Panel border
 input color           InpClrRowA        = C'16,18,38';    // Row background A
 input color           InpClrRowB        = C'22,24,48';    // Row background B
+input color           InpClrRowActive   = C'42,34,88';    // Row background of the charted symbol
 input color           InpClrTitle       = C'190,180,255'; // Title text
 input color           InpClrHeader      = C'130,120,190'; // Column header text
 input color           InpClrText        = C'205,205,220'; // Row text
@@ -134,6 +137,7 @@ input color           InpClrDim         = C'110,110,130'; // Dimmed text
 input color           InpClrBuy         = C'0,210,140';   // Buy color
 input color           InpClrSell        = C'235,70,110';  // Sell color
 input color           InpClrEntryLine   = C'160,45,60';   // Entry line color
+input color           InpClrWatermark   = C'190,185,200'; // Watermark color (when not tinted)
 
 input group "=== Alerts ==="
 input bool            InpAlertPopup     = false; // Popup alert on a new setup
@@ -258,7 +262,7 @@ struct MFCtx
 #define C_CHART  14
 
 const string g_colTitle[NCOLS] = {"SYMBOL","TF","BIAS","SIGNAL","SMC","SCORE","WR","AGE","ENTRY","SL","TP1","TP2","TP3","STATUS","CHART"};
-const int    g_colWidth[NCOLS] = { 176,    40,  86,    84,      132,  50,     72,  88,   90,     90,  90,   90,   90,   76,      54 };
+const int    g_colWidth[NCOLS] = { 210,    46,  86,    78,      132,  50,     72,  88,   100,    96,  96,   96,   96,   76,      60 };
 
 bool  g_colOn[NCOLS];
 int   g_colX[NCOLS];
@@ -1347,7 +1351,7 @@ string SignalText(const MFSignal &s)
    if(!s.valid)
       return "-";
    string head = (s.dir > 0 ? ShortToString(0x25B2) + " BUY" : ShortToString(0x25BC) + " SELL");
-   return head + (s.choch ? "-" : "+");
+   return head + (s.choch ? "" : "+");          // CHoCH reversal plain, BOS continuation "+"
 }
 
 string BiasText(const MFSignal &s)
@@ -1456,18 +1460,19 @@ void DrawPanel()
    SetRect(g_prefix + "bg", InpPanelX, InpPanelY, g_panelW, H, InpClrPanelBg, InpClrPanelBorder);
 
    int nSyms = ArraySize(g_syms);
-   int nDone = 0, nSig = 0;
+   int nDone = 0;
    for(int i = 0; i < nSyms; i++)
-   {
-      if(g_syms[i].analysed)  nDone++;
-      if(g_syms[i].sig.valid) nSig++;
-   }
+      if(g_syms[i].analysed)
+         nDone++;
 
-   string title = StringFormat("%s MARKETFLOW V8  |  SMC DASHBOARD  |  %s + %s bias %s %s  |  %s  |  %d setups  |  analysed %d/%d",
-                               ShortToString(0x25C8), g_b1Text, g_b2Text,
-                               ShortToString(0x2192), g_tfText,
-                               TimeToString(TimeCurrent(), TIME_MINUTES),
-                               nSig, nDone, nSyms);
+   string title = StringFormat("%s MARKETFLOW V8  |  SIGNALS DASHBOARD  |  %s  |  %s",
+                               ShortToString(0x25C8), g_tfText,
+                               TimeToString(TimeCurrent(), TIME_MINUTES));
+   //--- the steady-state title matches the reference exactly; the scan counter
+   //--- only shows while symbols are still warming up, so a blank row is never
+   //--- ambiguous between "no setup" and "not looked at yet"
+   if(nDone < nSyms)
+      title += StringFormat("  |  scanning %d/%d", nDone, nSyms);
    SetLabel(g_prefix + "title", InpPanelX + 8, InpPanelY + H - g_titleH + 7, title,
             InpClrTitle, InpFontSize + 1);
 
@@ -1504,14 +1509,11 @@ void DrawPanel()
       bool   has  = (idx < total);
 
       string rowBg = g_prefix + "rowbg" + suf;
-      SetRect(rowBg, InpPanelX + 4, base - 4, g_panelW - 8, InpRowHeight,
-              ((i % 2) == 0 ? InpClrRowA : InpClrRowB), InpClrPanelBg);
-      ObjShow(rowBg, has);
-
-      string btn = g_prefix + "btn_open" + suf;
+      string btn   = g_prefix + "btn_open" + suf;
 
       if(!has)
       {
+         ObjShow(rowBg, false);
          for(int c = 0; c < NCOLS; c++)
             ObjShow(g_prefix + "c" + IntegerToString(c) + "_" + suf, false);
          ObjShow(btn, false);
@@ -1519,6 +1521,11 @@ void DrawPanel()
       }
 
       MFSymbol s  = g_syms[g_order[idx]];
+
+      color rowClr = ((i % 2) == 0 ? InpClrRowA : InpClrRowB);
+      if(s.name == _Symbol)
+         rowClr = InpClrRowActive;
+      SetRect(rowBg, InpPanelX + 4, base - 4, g_panelW - 8, InpRowHeight, rowClr, InpClrPanelBg);
       bool     sv = s.sig.valid;
       color    sc = (!sv ? InpClrDim : (s.sig.dir > 0 ? InpClrBuy : InpClrSell));
 
@@ -1639,7 +1646,7 @@ void DrawChartTrade()
 
    //--- POI zone the entry is taken from
    string zone = g_prefix + "tr_zone";
-   if(InpShowZone && EnsureObject(zone, OBJ_RECTANGLE))
+   if(InpShowSmcMarkup && EnsureObject(zone, OBJ_RECTANGLE))
    {
       ObjectSetInteger(0, zone, OBJPROP_TIME,  0, t1);
       ObjectSetDouble (0, zone, OBJPROP_PRICE, 0, sg.zoneLo);
@@ -1651,7 +1658,7 @@ void DrawChartTrade()
       ObjectSetInteger(0, zone, OBJPROP_FILL,  true);
       ObjectSetInteger(0, zone, OBJPROP_BACK,  true);
    }
-   else if(!InpShowZone)
+   else if(!InpShowSmcMarkup)
       ObjectDelete(0, zone);
 
    string box = g_prefix + "tr_box";
@@ -1700,23 +1707,35 @@ void DrawChartTrade()
    SetTradeText(g_prefix + "tr_txt_tp2", tTxt, sg.tp2, "TP2: " + DoubleToString(sg.tp2, s.digits), clr);
    SetTradeText(g_prefix + "tr_txt_tp3", tTxt, sg.tp3, "TP3: " + DoubleToString(sg.tp3, s.digits), clr);
 
-   //--- structure shift and swept liquidity
-   SetTradeText(g_prefix + "tr_txt_bos", t1,
-                (buy ? sg.zoneHi : sg.zoneLo),
-                (sg.choch ? "CHoCH" : "BOS"), clr);
+   //--- structure shift and swept liquidity: analysis markup, off by default so
+   //--- the chart carries only what the reference layout shows
+   string bosTag = g_prefix + "tr_txt_bos";
+   string sw     = g_prefix + "tr_sweep";
+   string swTag  = g_prefix + "tr_txt_sweep";
 
-   string sw = g_prefix + "tr_sweep";
-   if(sg.sweepPrice > 0.0)
+   if(InpShowSmcMarkup)
    {
-      SetTradeLine(sw, (datetime)(t1 - (long)ps * InpSweepWindow), t2, sg.sweepPrice,
-                   InpClrDim, STYLE_DASH);
-      SetTradeText(g_prefix + "tr_txt_sweep", (datetime)(t1 - (long)ps * InpSweepWindow),
-                   sg.sweepPrice, "SWEEP", InpClrDim);
+      SetTradeText(bosTag, t1, (buy ? sg.zoneHi : sg.zoneLo),
+                   (sg.choch ? "CHoCH" : "BOS"), clr);
+
+      if(sg.sweepPrice > 0.0)
+      {
+         SetTradeLine(sw, (datetime)(t1 - (long)ps * InpSweepWindow), t2, sg.sweepPrice,
+                      InpClrDim, STYLE_DASH);
+         SetTradeText(swTag, (datetime)(t1 - (long)ps * InpSweepWindow),
+                      sg.sweepPrice, "SWEEP", InpClrDim);
+      }
+      else
+      {
+         ObjectDelete(0, sw);
+         ObjectDelete(0, swTag);
+      }
    }
    else
    {
+      ObjectDelete(0, bosTag);
       ObjectDelete(0, sw);
-      ObjectDelete(0, g_prefix + "tr_txt_sweep");
+      ObjectDelete(0, swTag);
    }
 
    double hi  = iHigh(_Symbol, g_tf, sg.barIndex);
@@ -1733,23 +1752,31 @@ void DrawChartTrade()
       ObjectSetInteger(0, ar, OBJPROP_WIDTH,     3);
    }
 
+   //--- reference legend: "TRADE" over "<arrow> BUY+ CONTINUATION", nothing else.
+   //--- the SMC read moves to an opt-in third line so the default view matches.
    int legendY = InpPanelY + PanelHeight() + 8;
-   SetLabel(g_prefix + "tr_leg1", InpPanelX + 8, legendY + 32,
-            ShortToString(0x25C8) + " TRADE   " + BiasText(sg), InpClrTitle, InpFontSize + 1);
-   SetLabel(g_prefix + "tr_leg2", InpPanelX + 8, legendY + 16,
-            StringFormat("%s %s   %s   score %d   %s",
-                         SignalText(sg),
-                         (sg.choch ? "REVERSAL (CHoCH)" : "CONTINUATION (BOS)"),
-                         sg.tags, sg.score, StatusText(sg)),
+   int yTrade  = legendY + (InpShowTradeDetail ? 32 : 16);
+   int ySignal = legendY + (InpShowTradeDetail ? 16 : 0);
+
+   SetLabel(g_prefix + "tr_leg1", InpPanelX + 8, yTrade,
+            ShortToString(0x25C8) + " TRADE", InpClrTitle, InpFontSize + 1);
+   SetLabel(g_prefix + "tr_leg2", InpPanelX + 8, ySignal,
+            SignalText(sg) + "  " + (sg.choch ? "REVERSAL" : "CONTINUATION"),
             clr, InpFontSize + 1);
-   SetLabel(g_prefix + "tr_leg3", InpPanelX + 8, legendY,
-            StringFormat("risk %s   R:R to TP1 %.1f   targets %s   measured %s",
-                         DoubleToString(MathAbs(sg.entry - sg.sl), s.digits),
-                         (MathAbs(sg.entry - sg.sl) > 0.0
-                            ? MathAbs(sg.tp1 - sg.entry) / MathAbs(sg.entry - sg.sl) : 0.0),
-                         (sg.liquidityTp ? "liquidity" : "R fallback"),
-                         WinRateText(s)),
-            InpClrDim, InpFontSize);
+
+   string leg3 = g_prefix + "tr_leg3";
+   if(InpShowTradeDetail)
+      SetLabel(leg3, InpPanelX + 8, legendY,
+               StringFormat("%s  %s  score %d  %s   risk %s   R:R %.1f   targets %s   measured %s",
+                            BiasText(sg), sg.tags, sg.score, StatusText(sg),
+                            DoubleToString(MathAbs(sg.entry - sg.sl), s.digits),
+                            (MathAbs(sg.entry - sg.sl) > 0.0
+                               ? MathAbs(sg.tp1 - sg.entry) / MathAbs(sg.entry - sg.sl) : 0.0),
+                            (sg.liquidityTp ? "liquidity" : "R fallback"),
+                            WinRateText(s)),
+               InpClrDim, InpFontSize);
+   else
+      ObjectDelete(0, leg3);
 }
 
 void DrawWatermark()
@@ -1760,8 +1787,17 @@ void DrawWatermark()
       ObjectDelete(0, wm);
       return;
    }
+   color wc = InpClrWatermark;
+   if(InpWatermarkTint)
+      for(int i = 0; i < ArraySize(g_syms); i++)
+         if(g_syms[i].name == _Symbol && g_syms[i].sig.valid)
+         {
+            wc = (g_syms[i].sig.dir > 0 ? InpClrBuy : InpClrSell);
+            break;
+         }
+
    SetLabel(wm, 20, 24, _Symbol + "   |   " + TfToText((ENUM_TIMEFRAMES)_Period),
-            C'120,110,180', 14, CORNER_RIGHT_UPPER, ANCHOR_RIGHT_UPPER);
+            wc, 14, CORNER_RIGHT_UPPER, ANCHOR_RIGHT_UPPER);
 }
 
 //+------------------------------------------------------------------+

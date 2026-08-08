@@ -33,7 +33,7 @@ Swings are fractals of `InpSwingStrength` bars each side. A fractal is only used
 - **BOS** (break of structure): close beyond the last confirmed swing in the same direction as
   the current state — continuation. Shown as `BUY+` / `SELL+`.
 - **CHoCH** (change of character): the same break, but it flips the state — reversal. Shown as
-  `BUY-` / `SELL-`.
+  plain `BUY` / `SELL`.
 
 The same walk produces the **dealing range** (`rangeHigh`/`rangeLow`), whose midpoint is
 equilibrium. Below it is discount, above it is premium.
@@ -82,8 +82,8 @@ so you always know whether a target is a real level or a placeholder.
 | 15 / 10 | POI is an OB **and** FVG / only one of them |
 | 10 | entry on the right side of equilibrium |
 
-The `SMC` column shows which of these actually fired, e.g. `D1 H4 SW CH OB FVG DISC`, so a
-score is never just a number you have to trust.
+Turning on the `SMC` column (`InpShowSmc`) shows which of these actually fired, e.g.
+`D1 H4 SW CH OB FVG DISC`, so a score is never just a number you have to trust.
 
 `InpBiasMode` controls strictness: **Both** (D1 and H4 must agree — fewest, strongest setups),
 **H4 led** (default: H4 agrees, D1 must not oppose), or **Any**.
@@ -108,16 +108,50 @@ with its sample size, and treat a thin sample as no information.
 
 ## Dashboard
 
-`SYMBOL · TF · BIAS · SIGNAL · SMC · SCORE · WR · AGE · ENTRY · SL · TP1 · TP2 · TP3 · STATUS · CHART`
+The default view is the reference layout, exactly ten columns:
 
-`BIAS` reads `D▲ H▲` (green when both agree with the signal, dim when mixed). `OPEN` switches
-the chart to that symbol; ▲/▼ page through; rows sort signals-first so page 1 is the actionable
-page even with 250 symbols loaded. `InpShowBias/Smc/Score/WinRate/Status` switch columns off to
-get back to the original ten-column layout.
+`SYMBOL · TF · SIGNAL · AGE · ENTRY · SL · TP1 · TP2 · TP3 · CHART`
 
-On the chart: the POI zone, the entry/SL/TP box, entry line, TP levels, the swept liquidity
-line marked `SWEEP`, a `CHoCH`/`BOS` tag at the shift bar, the signal arrow, and a three-line
-legend with bias, confluence, score, status, R:R and the measured hit rate.
+Title reads `◈ MARKETFLOW V8 | SIGNALS DASHBOARD | M15 | 13:08`, with ▲/▼ and the `1-9 / 14`
+page counter on the right. `SIGNAL` shows `▲ BUY+` / `▼ SELL+` for a BOS continuation and
+`▲ BUY` / `▼ SELL` for a CHoCH reversal. `AGE` reads `current`, `1 bars ago`, … The row of the
+symbol currently on the chart is highlighted. `OPEN` switches the chart to that row's symbol.
+
+Rows sort signals-first, so page 1 is the actionable page even with 250 symbols loaded.
+
+**One deliberate deviation:** while symbols are still warming up the title appends
+`| scanning 84/132`. It disappears once every symbol has been analysed, so the steady-state
+title is the reference title — but a blank row is never ambiguous between "no setup" and
+"not looked at yet".
+
+The analysis columns are switched **off** by default and can be turned on individually:
+
+| Input | Adds |
+| --- | --- |
+| `InpShowBias` | `BIAS` — `D▲ H▲`, green only when both agree with the signal |
+| `InpShowSmc` | `SMC` — which confluences fired, e.g. `D1 H4 SW CH OB FVG DISC` |
+| `InpShowScore` | `SCORE` — the confluence total |
+| `InpShowWinRate` | `WR` — measured hit rate and sample size |
+| `InpShowStatus` | `STATUS` — `WAITING / ACTIVE / TP1 HIT / SL HIT / INVALID` |
+
+### Chart
+
+Default drawing matches the reference: the SL→TP3 box from the signal bar, the `ENTRY:`,
+`SL:`, `TP1:`, `TP2:`, `TP3:` labels inside it, the entry line across the chart, the dashed
+marker at the signal bar, the direction arrow, the top-right `Symbol | TF` watermark (tinted
+with the signal direction, `InpWatermarkTint`), and the two-line legend:
+
+```
+◈ TRADE
+▲ BUY+  CONTINUATION
+```
+
+Two opt-in extras:
+
+- `InpShowSmcMarkup` — draws the POI zone (order block / FVG), the swept-liquidity line marked
+  `SWEEP`, and the `CHoCH` / `BOS` tag at the shift bar.
+- `InpShowTradeDetail` — adds a third legend line with bias, confluence tags, score, status,
+  risk, R:R and the measured hit rate.
 
 ## Performance
 
@@ -146,13 +180,15 @@ legend with bias, confluence, score, status, R:R and the measured hit rate.
 | `InpPoiEntry` | CE | Zone midpoint, or proximal edge |
 | `InpMaxAge` | 25 | How long a setup stays on the board waiting for its fill |
 | `InpStatsBars` | 600 | Back-test window; `0` disables the WR column |
+| `InpShowSmcMarkup` | false | POI zone, sweep line and BOS/CHoCH tag on the chart |
+| `InpShowTradeDetail` | false | Third legend line with the full SMC read |
 
 ## Limitations
 
 - The on-chart drawing only appears when the chart timeframe matches the entry timeframe.
   Otherwise the box would anchor to the wrong bars, so it is hidden rather than drawn wrong.
-- The panel is pixel-laid-out for `Consolas` 8 / 18 px rows; with every column on it is about
-  1300 px wide. Turn columns off or lower the font for smaller screens.
+- The panel is pixel-laid-out for `Consolas` 8 / 18 px rows. The default ten columns are about
+  990 px wide; turning every analysis column on takes it to roughly 1300 px.
 - ATR is seeded from the oldest bar in the copied window, so it can differ from `iATR` in the
   last decimals on the oldest bars. Warm-up is `6 × ATR period` bars, far outside where signals
   are read.
