@@ -368,7 +368,7 @@ bool CTradeExec::PlacePending(const int specIndex,const ENUM_SEA_DIRECTION dir,
       int secs=PeriodSeconds(tf);
       if(secs>0)
         {
-         expiry=TimeCurrent()+(long)expiryBars*secs;
+         expiry=(datetime)(TimeCurrent()+(long)expiryBars*secs);
          timeType=ORDER_TIME_SPECIFIED;
         }
      }

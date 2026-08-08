@@ -814,7 +814,7 @@ void CRiskManager::RecordTrade(const double profit,const double rMultiple)
       m_lossStreak++;
       if(m_lossStreak>=m_maxConsecutiveLosses)
         {
-         m_breakerUntil=TimeCurrent()+(long)m_breakerHours*3600;
+         m_breakerUntil=(datetime)(TimeCurrent()+(long)m_breakerHours*3600);
          Print(StringFormat("[CRiskManager] consecutive-loss breaker armed after %d losses, "
                             "paused until %s",
                             m_lossStreak,TimeToString(m_breakerUntil,TIME_DATE|TIME_MINUTES)));

@@ -737,8 +737,8 @@ bool CSymbolSpec::ReadDynamic(SSymbolSpec &spec)
    spec.marginInitial    = SymbolInfoDouble(symbol,SYMBOL_MARGIN_INITIAL);
    spec.marginMaintenance= SymbolInfoDouble(symbol,SYMBOL_MARGIN_MAINTENANCE);
 
-   spec.longAllowed      = (spec.tradeMode==SYMBOL_TRADE_FULL || spec.tradeMode==SYMBOL_TRADE_LONGONLY);
-   spec.shortAllowed     = (spec.tradeMode==SYMBOL_TRADE_FULL || spec.tradeMode==SYMBOL_TRADE_SHORTONLY);
+   spec.longAllowed      = (spec.tradeMode==SYMBOL_TRADE_MODE_FULL || spec.tradeMode==SYMBOL_TRADE_MODE_LONGONLY);
+   spec.shortAllowed     = (spec.tradeMode==SYMBOL_TRADE_MODE_FULL || spec.tradeMode==SYMBOL_TRADE_MODE_SHORTONLY);
    spec.openAllowed      = (spec.longAllowed || spec.shortAllowed);
 
    spec.lastRefresh      = TimeCurrent();
@@ -1236,11 +1236,11 @@ string CSymbolSpec::TradeModeToString(const ENUM_SYMBOL_TRADE_MODE mode) const
   {
    switch(mode)
      {
-      case SYMBOL_TRADE_DISABLED:  return("DISABLED");
-      case SYMBOL_TRADE_LONGONLY:  return("LONGONLY");
-      case SYMBOL_TRADE_SHORTONLY: return("SHORTONLY");
-      case SYMBOL_TRADE_CLOSEONLY: return("CLOSEONLY");
-      case SYMBOL_TRADE_FULL:      return("FULL");
+      case SYMBOL_TRADE_MODE_DISABLED:  return("DISABLED");
+      case SYMBOL_TRADE_MODE_LONGONLY:  return("LONGONLY");
+      case SYMBOL_TRADE_MODE_SHORTONLY: return("SHORTONLY");
+      case SYMBOL_TRADE_MODE_CLOSEONLY: return("CLOSEONLY");
+      case SYMBOL_TRADE_MODE_FULL:      return("FULL");
      }
    return(StringFormat("UNKNOWN(%d)",(int)mode));
   }

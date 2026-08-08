@@ -464,7 +464,17 @@ bool CMTF::NearestUnswept(const double price,const ENUM_SEA_DIRECTION dir,
   {
    bool       found=false;
    double     bestDist=0.0;
+
+   //--- zero-initialised so the compiler can see it is never read
+   //--- before being written, and so a caller that ignores the return
+   //--- value gets a defined struct rather than stack garbage
    SLiquidity best;
+   best.price      = 0.0;
+   best.time       = 0;
+   best.isHigh     = false;
+   best.swept      = false;
+   best.touchCount = 0;
+   best.strength   = 0.0;
 
    for(int i=0; i<m_levels; i++)
      {
