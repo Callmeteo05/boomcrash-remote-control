@@ -203,7 +203,7 @@ public:
 CStructure::CStructure(void)
   {
    m_symbol      = "";
-   m_tf          = PERIOD_CURRENT;
+   m_tf          = SEA_TF_UNSET;
    m_fractalBars = 3;
    m_staleBars   = 50;
    m_lookback    = 500;

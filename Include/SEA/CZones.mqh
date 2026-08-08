@@ -114,7 +114,7 @@ public:
 CZones::CZones(void)
   {
    m_symbol      = "";
-   m_tf          = PERIOD_CURRENT;
+   m_tf          = SEA_TF_UNSET;
    m_atrHandle   = INVALID_HANDLE;
    m_atrPeriod   = 14;
    m_impulseATR  = 2.0;

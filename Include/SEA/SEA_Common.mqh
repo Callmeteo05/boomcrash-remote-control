@@ -16,6 +16,17 @@
 #define SEA_COMMON_MQH
 
 //+------------------------------------------------------------------+
+//| "Not bound to a timeframe yet" sentinel.                          |
+//|                                                                   |
+//| RULE 10 reserves PERIOD_ constants for CStyle. A constructor still |
+//| needs a neutral initial value for an unbound timeframe member, so  |
+//| this names one without selecting a timeframe. Numerically it is    |
+//| the terminal's "current period" value, which is exactly the        |
+//| "unspecified" slot.                                                |
+//+------------------------------------------------------------------+
+#define SEA_TF_UNSET ((ENUM_TIMEFRAMES)0)
+
+//+------------------------------------------------------------------+
 //| Direction of a structural decision.                               |
 //+------------------------------------------------------------------+
 enum ENUM_SEA_DIRECTION

@@ -88,11 +88,16 @@ and send it to me. Do not guess at fixes; several of these interlock.
 
 ## Step 5 — Compile the scripts
 
-| File | What it does |
-|---|---|
-| `Test_CSymbolSpec.mq5` | Broker spec, lot rounding, filling bitmask |
-| `Test_Repaint.mq5` | The mandatory repaint test |
-| `Test_RiskHalt.mq5` | Drawdown halt persistence and sizing |
+| File | What it does | Needs market data? |
+|---|---|---|
+| `Test_CSymbolSpec.mq5` | Broker spec, lot rounding, filling bitmask | live spec |
+| `Test_CGates.mq5` | All ten gates, no-compensation | **no** — pure unit test |
+| `Test_CScoring.mq5` | Every point value against the documented scale | **no** — pure unit test |
+| `Test_CScaling.mq5` | Decay ladder and every refusal | synthetic positions |
+| `Test_CZones.mq5` | Zones re-derived from raw bars | live bars |
+| `Test_CLiquidity.mq5` | Levels and sweeps re-derived from raw bars | live bars |
+| `Test_Repaint.mq5` | The mandatory repaint test | live bars |
+| `Test_RiskHalt.mq5` | Drawdown halt persistence and sizing | demo account |
 
 ---
 
@@ -106,40 +111,79 @@ Open `SEA.mq5`, press **F7**. If steps 4 and 5 were clean this should be too.
 
 This order matters. Each test gates the next.
 
-### 7a. Symbol spec
+### 7a. Pure unit tests — run these first, they need nothing
 
-Drag `Test_CSymbolSpec` onto any chart. Read the **Experts** tab.
+`Test_CGates` and `Test_CScoring` build every input by hand and know every
+expected answer. No market data, no account, no history. If either fails, the
+decision layer is wrong and nothing downstream is worth running.
 
-Look at **section 4** — the lot-rounding sweep. Any `FAIL` there means sizing
-is unsafe and you must stop. Everything else in the EA trusts this module's
-arithmetic.
+- **`Test_CGates`** — builds a context that passes all ten gates, then breaks
+  exactly one field at a time and asserts that *that* gate fails, that the
+  setup is rejected, and that **no other gate failed**. That last clause is
+  what catches a gate reading the wrong field. It also proves a maximal
+  score cannot buy a failed gate, and that with-spike entries stay permitted
+  at EXTREME hazard while counter-spike entries are refused.
 
-### 7b. Repaint
+- **`Test_CScoring`** — pins every point value against the scale in CLAUDE.md,
+  including the boundaries (RR exactly 3.0 earns the bonus, 2.99 does not) and
+  the rule that a noisy profile can *raise* the confluence threshold but never
+  lower it.
 
-Drag `Test_Repaint` onto a chart with plenty of history (scroll back first to
-force the download, or the script will abort saying so).
+### 7b. Symbol spec
 
-Every check must pass. A repaint failure means a module read a forming bar and
-the build is broken — not "slightly off". Send me the output if anything fails.
+Drag `Test_CSymbolSpec` onto any chart. **Section 4 is the one that matters** —
+the lot-rounding sweep. Any FAIL there means sizing is unsafe; stop.
 
-### 7c. Risk halt
+### 7c. Zones and liquidity — independent recomputation
+
+`Test_CZones` and `Test_CLiquidity` re-derive the answers straight from the raw
+`MqlRates` array using their own arithmetic and compare. Two engines agreeing
+by accident is unlikely; disagreement means one is wrong.
+
+`Test_CZones` checks that every FVG in the bars was found and no phantom exists,
+that each order block spans exactly its origin candle body and came from a
+candle of the right colour, that FRESH zones were genuinely never entered, and
+that a stricter impulse threshold never produces *more* order blocks.
+
+`Test_CLiquidity` re-reads PDH/PDL/PWH/PWL from the daily and weekly series and
+confirms they came from the **closed** bar, then re-derives every swept flag
+from the bars. It also verifies the sweep-versus-break distinction: a reported
+sweep must have both a wick beyond *and* a close back inside within the window.
+Get that wrong and CPhase sees false manipulation, which is how an EA ends up
+buying every dip out of a range.
+
+### 7d. Scaling — the martingale check
+
+`Test_CScaling` tracks positions **synthetically** — it places no orders and
+touches nothing live. Entry prices are set relative to the current market price
+so the winner and loser branches fire deterministically.
+
+It walks the decay ladder past the broker minimum looking for a rounding bug,
+and asserts every refusal: a position in drawdown, a winner before break-even,
+a direction mismatch, a changed structure, a leg ceiling, and NULL engines.
+
+Use a `InpTestMagic` that is **not** your EA's magic. The script refuses the
+default and cleans up its GlobalVariables afterwards.
+
+### 7e. Repaint
+
+Drag `Test_Repaint` onto a chart with plenty of history. Every check must pass.
+A repaint failure means a module read a forming bar — broken, not "slightly
+off".
+
+### 7f. Risk halt
 
 **Demo account only.** The script refuses to run on a live account.
 
-Run it in four passes using the `InpPhase` input:
-
-1. `InpPhase = 4` (SIZING) — sizing, ladder and the "losses never raise risk"
-   check. Run this first; it needs no restart.
+1. `InpPhase = 4` (SIZING) — sizing, ladder, and the "losses never raise risk"
+   check. Needs no restart.
 2. `InpPhase = 1` (ARM) — writes a hard-halt flag.
-3. **Fully close and reopen MetaTrader.** Not just the chart — the whole
-   terminal. The point is proving the kill switch survives a process restart.
+3. **Fully close and reopen MetaTrader.** Not just the chart.
 4. `InpPhase = 2` (VERIFY) — a fresh risk manager must come up already halted.
 5. `InpPhase = 3` (RESET) — clears the flag.
 
-If `InpMagicNumber` here does not match the EA's magic, the test writes to the
-wrong key and proves nothing. Keep them the same.
-
----
+Keep `InpMagicNumber` the same as the EA's, or the test writes to the wrong key
+and proves nothing.
 
 ## Step 8 — Attach the EA, on demo
 
@@ -176,6 +220,8 @@ clear it with `Test_RiskHalt` phase 3. That is deliberate.**
 | `AllocateWarm` took five unused parameters | Reduced to the one it uses |
 
 ---
+| `CZones`, `CLiquidity`, `CGates`, `CScoring`, `CScaling` had no correctness tests | Five new scripts. `CGates` and `CScoring` are pure unit tests; `CZones` and `CLiquidity` independently re-derive their answers from raw bars; `CScaling` walks the decay ladder and every refusal with synthetic positions |
+| `PERIOD_CURRENT` appeared as a member initialiser in five modules, against RULE 10 | Replaced with `SEA_TF_UNSET`. Only `CStyle` names a `PERIOD_` constant now |
 
 ## Errors I still expect
 
@@ -200,23 +246,19 @@ Honest list. None of this is hidden in the code.
    approximate across a broad universe.
 
 2. **Tier 1 (hot) is allocated but not driving anything.** `PromoteHot` and the
-   hot list work, but the tick path does not yet use hot membership to run
-   trigger checks between bars. Entries currently arm on the LTF close only.
-   That is safe — it just means the EA is slower to react than the tiering
-   design allows.
+   hot list work, but the tick path does not use hot membership to run trigger
+   checks between bars. Entries arm on the LTF close only — safe, just slower
+   than the tiering design allows.
 
-3. **`CZones` and `CLiquidity` have no dedicated test scripts.** They are
-   covered by `Test_Repaint` for determinism, but not for correctness of the
-   zones and levels themselves.
+3. **`CMTF`, `CProbabilityMap`, `CManagement`, `CSymbolProfiler` and
+   `CTradeExec` have no dedicated tests.** `CMTF` and `CProbabilityMap` are
+   exercised through the live pipeline; `CTradeExec` cannot be unit-tested
+   without placing orders, so its retcode paths are unverified until a demo
+   trade actually requotes or returns 10030.
 
-4. **`CGates`, `CScoring`, `CScaling` have no unit tests.** Their logic is
-   exercised only through the live pipeline.
-
-5. **Latency is unmeasured.** The instrumentation is in place and will print
-   overruns naming the phase, but nobody has seen a real number yet. Expect
-   the HTF pass to be the one that complains first on a wide universe.
-
----
+4. **Latency is unmeasured.** Instrumentation is in place and prints overruns
+   naming the phase, but nobody has seen a real number. Expect the HTF pass to
+   complain first on a wide universe.
 
 ## Before this touches real money
 

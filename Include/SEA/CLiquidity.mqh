@@ -129,9 +129,9 @@ public:
 CLiquidity::CLiquidity(void)
   {
    m_symbol         = "";
-   m_tf             = PERIOD_CURRENT;
-   m_dayTF          = PERIOD_CURRENT;
-   m_weekTF         = PERIOD_CURRENT;
+   m_tf             = SEA_TF_UNSET;
+   m_dayTF          = SEA_TF_UNSET;
+   m_weekTF         = SEA_TF_UNSET;
    m_lookback       = 300;
    m_equalTolerance = 0.10;
    m_atrHandle      = INVALID_HANDLE;

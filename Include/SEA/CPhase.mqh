@@ -152,7 +152,7 @@ public:
 CPhase::CPhase(void)
   {
    m_symbol          = "";
-   m_tf              = PERIOD_CURRENT;
+   m_tf              = SEA_TF_UNSET;
    m_atrFast         = INVALID_HANDLE;
    m_atrSlow         = INVALID_HANDLE;
    m_adxHandle       = INVALID_HANDLE;
