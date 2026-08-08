@@ -1,0 +1,99 @@
+; ===================================================================
+; SEA - MODERATE PRESET
+;
+; PURPOSE: fewer refusals than the defaults, but the architecture is
+; still doing its job. This is the one worth actually judging.
+;
+; What changed from default, and why:
+;   MinLocationScore 75 -> 65   still ABOVE NoLocationCeiling, so the
+;                               "LTF signal with no HTF zone" rule
+;                               still blocks. Location still gates.
+;   MinConfluenceScore 80 -> 65 accepts decent setups, not only
+;                               perfect ones
+;   MinRR 2.0 -> 1.5            more targets qualify
+;   StructureStaleBars 50 -> 80 slower to declare RANGING
+;   ProfileMinBars 1000 -> 400  so profiles complete in a backtest
+;
+; EVERY SAFETY RULE IS AT DEFAULT AND SHOULD STAY THERE.
+; ===================================================================
+
+InpAllowLiveTrading=false
+InpAcknowledgeUntested=false
+InpMagicNumber=20260808
+InpTradeComment=SEA
+InpTradingStyle=1
+
+; --- SAFETY: UNCHANGED ---
+InpMaxDDPercent=5.0
+InpDailyDDPercent=3.0
+InpMaxConsecutiveLosses=4
+InpBreakerHours=4
+InpMarginFloor=400.0
+InpMaxCurrencyExposure=2
+InpMicroModeCeiling=50.0
+InpMaxMarginUtil=0.25
+InpStopSafetyFactor=1.2
+
+; --- PROFILER ---
+InpProfileLookback=1000
+InpProfileMinBars=400
+InpSpikeDetectATR=5.0
+InpSpikeMinCount=30
+InpSpikeConsistency=0.90
+
+; --- STRUCTURE ---
+InpStructureStaleBars=80
+InpStructureLookback=500
+InpZoneMaxAge=500
+InpEqualTolerance=0.12
+
+; --- PHASE ---
+InpAccumATRRatio=0.70
+InpAccumADXMax=20.0
+InpAccumRangeATR=1.50
+InpSweepMaxBars=3
+InpChochWindow=12
+
+; --- REGIME ---
+InpADXTrending=25.0
+InpADXRanging=20.0
+InpExpansionRatio=1.50
+InpCompressionRatio=0.65
+InpATRPeriod=14
+InpATRSlowPeriod=50
+InpADXPeriod=14
+
+; --- SELECTIVITY: loosened, but location still gates the signal ---
+InpMinLocationScore=65.0
+InpNoLocationCeiling=40.0
+InpMinRR=1.5
+InpMinConfluenceScore=65.0
+InpMTFStackWeight=12.0
+
+; --- SCALING ---
+InpScaleTriggerR=1.0
+InpScaleDecay=0.5
+InpMaxBasketRisk=1.0
+
+; --- MANAGEMENT ---
+InpUsePartials=true
+InpPartialAtR=1.0
+InpPartialFraction=0.5
+
+; --- SCANNER ---
+InpMaxHotSymbols=5
+InpMaxWarmSymbols=8
+InpMaxConcurrent=3
+InpMarketWatchOnly=true
+
+; --- EXECUTION ---
+InpMaxDeviation=20
+InpMaxRetries=3
+
+; --- LOGGING ---
+InpPushNotifications=false
+InpTerminalAlerts=false
+InpAlertMinInterval=30
+InpJournalReviewBars=20
+InpShowDashboard=true
+InpVerbose=false

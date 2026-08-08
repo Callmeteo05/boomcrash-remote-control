@@ -1,0 +1,97 @@
+; ===================================================================
+; SEA - PLUMBING TEST PRESET
+;
+; PURPOSE: prove the EA can place a trade at all. Nothing more.
+;
+; This deliberately guts SELECTIVITY so trades appear in the tester.
+; A profitable result with these settings means NOTHING - the gates
+; that make the strategy work are effectively switched off. Use it to
+; answer "does the pipeline fire end to end", then throw the numbers
+; away.
+;
+; EVERY SAFETY RULE IS LEFT AT ITS DEFAULT. Drawdown halts, stop
+; safety factor, scale decay, margin caps - untouched.
+; ===================================================================
+
+InpAllowLiveTrading=false
+InpAcknowledgeUntested=false
+InpMagicNumber=20260808
+InpTradeComment=SEA-PLUMB
+InpTradingStyle=1
+
+; --- SAFETY: DO NOT LOOSEN THESE ---
+InpMaxDDPercent=5.0
+InpDailyDDPercent=3.0
+InpMaxConsecutiveLosses=4
+InpBreakerHours=4
+InpMarginFloor=400.0
+InpMaxCurrencyExposure=2
+InpMicroModeCeiling=50.0
+InpMaxMarginUtil=0.25
+InpStopSafetyFactor=1.2
+
+; --- PROFILER: short history so profiles complete inside a backtest ---
+InpProfileLookback=500
+InpProfileMinBars=200
+InpSpikeDetectATR=5.0
+InpSpikeMinCount=30
+InpSpikeConsistency=0.90
+
+; --- STRUCTURE: long stale window so RANGING vetoes less often ---
+InpStructureStaleBars=200
+InpStructureLookback=400
+InpZoneMaxAge=500
+InpEqualTolerance=0.15
+
+; --- PHASE ---
+InpAccumATRRatio=0.70
+InpAccumADXMax=20.0
+InpAccumRangeATR=1.50
+InpSweepMaxBars=3
+InpChochWindow=12
+
+; --- REGIME ---
+InpADXTrending=25.0
+InpADXRanging=20.0
+InpExpansionRatio=1.50
+InpCompressionRatio=0.50
+InpATRPeriod=14
+InpATRSlowPeriod=50
+InpADXPeriod=14
+
+; --- SELECTIVITY: GUTTED. This is the whole point of this preset. ---
+; MinLocationScore below NoLocationCeiling means the "no HTF zone"
+; cap no longer blocks anything. The location rule is OFF.
+InpMinLocationScore=35.0
+InpNoLocationCeiling=40.0
+InpMinRR=1.0
+InpMinConfluenceScore=25.0
+InpMTFStackWeight=12.0
+
+; --- SCALING ---
+InpScaleTriggerR=1.0
+InpScaleDecay=0.5
+InpMaxBasketRisk=1.0
+
+; --- MANAGEMENT ---
+InpUsePartials=true
+InpPartialAtR=1.0
+InpPartialFraction=0.5
+
+; --- SCANNER: tester runs one symbol, so keep the universe tiny ---
+InpMaxHotSymbols=5
+InpMaxWarmSymbols=4
+InpMaxConcurrent=2
+InpMarketWatchOnly=true
+
+; --- EXECUTION ---
+InpMaxDeviation=20
+InpMaxRetries=3
+
+; --- LOGGING: verbose so you can see WHY things are rejected ---
+InpPushNotifications=false
+InpTerminalAlerts=false
+InpAlertMinInterval=30
+InpJournalReviewBars=20
+InpShowDashboard=true
+InpVerbose=true
