@@ -1,87 +1,138 @@
-# MarketFlow V8 — MT5 signals dashboard
+# MarketFlow V8 — MT5 Market Watch scanner
 
-`MarketFlowV8.mq5` is a chart-window indicator that scans a list of symbols on one
-timeframe and renders:
+`MarketFlowV8.mq5` analyses **every symbol in your Market Watch** in the background and
+publishes signals with entry, SL and TP1/TP2/TP3, plus the trade projection on the chart.
 
-- a docked **signals dashboard** — `SYMBOL | TF | SIGNAL | AGE | ENTRY | SL | TP1 | TP2 | TP3 | CHART`,
-  paginated with ▲/▼ and a `1-9 / 14` counter, one `OPEN` button per row that switches the
-  chart to that symbol;
-- the **trade projection** for the chart symbol — box from SL to TP3, entry line across the
-  chart, SL/TP1/TP2/TP3 levels with price labels, an arrow on the signal bar, a dashed marker
-  at the signal bar, and a `◈ TRADE / ▲ BUY+ CONTINUATION` legend;
-- a symbol/timeframe watermark in the top-right corner.
+## What makes the numbers real
 
-## Install
+The indicator never prints a level it cannot justify from broker data:
 
-1. Copy `MarketFlowV8.mq5` into `<MT5 data folder>/MQL5/Indicators/`
-   (File → Open Data Folder in the terminal).
-2. In MetaEditor press **F7** to compile.
-3. Drag **MarketFlow V8** onto a chart. Enable *Allow Automated Trading* is **not** needed —
-   this is an indicator, it places no orders.
-
-Every symbol in the list must exist at the broker with that exact name. The indicator calls
-`SymbolSelect()` to pull each one into Market Watch; symbols the broker does not offer are
-shown as `n/a — not in market watch` instead of being silently dropped.
-
-## Signal engine
-
-Everything is evaluated on **closed bars only** (shift ≥ 1), on the scan timeframe.
-
-| Concept | Rule |
+| Concern | How it is handled |
 | --- | --- |
-| Trend | `EMA(21) > EMA(50)` = up, `<` = down |
-| **BUY+** (continuation) | uptrend, bar dipped to/through the fast EMA, closed back above it, bullish body |
-| **SELL+** (continuation) | downtrend, bar rallied to/through the fast EMA, closed back below it, bearish body |
-| **BUY-** (reversal) | downtrend, `RSI(14) ≤ 30`, bullish body closing above the previous bar's high |
-| **SELL-** (reversal) | uptrend, `RSI(14) ≥ 70`, bearish body closing below the previous bar's low |
+| Where symbols come from | `SymbolsTotal(true)` / `SymbolName(i, true)` — the live Market Watch, re-read every 30 s so added or removed symbols follow automatically |
+| Missing history | A row shows `LOADING` or `SHORT HIST` until enough bars have actually downloaded. It never falls back to a partial calculation |
+| Untradable symbols | `SYMBOL_TRADE_MODE_DISABLED` symbols are marked `DISABLED` and skipped |
+| Prices that can't be placed | Every level is rounded to `SYMBOL_TRADE_TICK_SIZE` and widened to clear `SYMBOL_TRADE_STOPS_LEVEL`. A level that had to be widened is flagged with `*` next to the SL |
+| "Did it work?" | The `STATUS` column replays the bars **after** the signal and reports what the trade actually did: `ACTIVE`, `TP1 HIT`, `TP2 HIT`, `TP3 HIT`, `SL HIT` |
+| "Is this setup any good on this symbol?" | The `WR` column back-tests the identical rule over the last `InpStatsBars` bars of that symbol and shows the measured TP1-before-SL rate and the sample size, e.g. `64% 28`. Below `InpStatsMinSamples` it shows `n/a 3` rather than a meaningless percentage |
+| Optimistic accounting | When one bar touches both the stop and a target, the **stop is counted first** — in the live status and in the back-test |
+| Look-ahead bias | Higher-timeframe confirmation maps each scan bar to the last **closed** HTF bar, so the back-test cannot see the future |
 
-The scan walks back up to `InpMaxAge` bars and reports the most recent hit, so a signal stays
-on the board while it is still tradable. `AGE` reads `current` on the last closed bar, then
-`1 bars ago`, `2 bars ago`, …
+The rule that gets published and the rule that gets measured are the same function
+(`EvaluateAt`), called from both paths. A `WR` figure therefore describes the signals you are
+actually being shown.
 
-Suffix in the `SIGNAL` cell: `+` = continuation, `-` = reversal.
+**What it still is:** a rules engine measuring its own historical hit rate. A `70% 30` reading
+means that rule resolved TP1 before SL on 21 of 30 past occurrences on that symbol — it is a
+track record, not a prediction, and synthetic indices in particular can change character. Read
+`WR` together with the sample size.
+
+## Signal rules
+
+Evaluated on **closed bars only**, on the scan timeframe.
+
+| | Rule |
+| --- | --- |
+| Trend | `EMA(21)` vs `EMA(50)` |
+| **BUY+** continuation | uptrend, bar dipped to/through the fast EMA, closed back above it, bullish body |
+| **SELL+** continuation | downtrend, bar rallied to/through the fast EMA, closed back below it, bearish body |
+| **BUY-** reversal | downtrend, `RSI(14) ≤ 30`, bullish body closing above the previous bar's high |
+| **SELL-** reversal | uptrend, `RSI(14) ≥ 70`, bearish body closing below the previous bar's low |
+
+`+` = continuation, `-` = reversal. The scanner reports the newest hit within `InpMaxAge` bars,
+so `AGE` reads `current`, then `1 bars ago`, `2 bars ago`, …
+
+### Score (0–100), gate `InpMinScore` (default 55)
+
+| Points | Test |
+| --- | --- |
+| 40 | the setup fired |
+| +20 | higher-timeframe EMA trend agrees with the direction |
+| +10 | signal-bar body ≥ 0.5 × ATR (real momentum, not a doji) |
+| +10 | tick volume ≥ 1.2 × its 20-bar average |
+| +10 | RSI in a healthy zone for the setup type |
+| +10 | no opposing swing level sitting between entry and TP1 |
+
+The HTF defaults to one step above the scan timeframe (M15 → H1) and is configurable.
 
 ## Risk model
 
 ```
-risk  = ATR(14) at the signal bar * InpSLAtrMult      (default 1.5)
-entry = close of the signal bar
-SL    = entry -/+ risk
-TP1   = entry +/- risk * 1.5
-TP2   = entry +/- risk * 2.5
-TP3   = entry +/- risk * 4.0
+entry = close of the signal bar          (or live ask/bid, frozen at signal time)
+stop  = ATR(14) × 1.5   or   swing structure ± buffer   or   whichever is further  (default)
+risk  = |entry − stop|
+TP1   = entry ± risk × 1.5
+TP2   = entry ± risk × 2.5
+TP3   = entry ± risk × 4.0
 ```
 
-The 1.5R / 2.5R / 4R ladder is the ratio the reference screenshots resolve to
-(e.g. Boom 1000: entry 13878.1610, SL 13843.7815 → risk 34.3795 → TP1 13929.7302,
-TP2 13964.1097, TP3 14015.6789). All four multipliers are inputs, so re-tune them if your
-own ladder differs.
+The 1.5R / 2.5R / 4R ladder is the ratio the reference screenshots resolve to (Boom 1000:
+entry 13878.1610, SL 13843.7815 → risk 34.3795 → TP1 13929.7302, TP2 13964.1097,
+TP3 14015.6789). Set `InpSLMode = ATR only` to reproduce those SL numbers exactly; the default
+`HYBRID` also respects swing structure, which moves the stop behind a real level rather than a
+fixed distance.
 
-## Inputs worth knowing
+## Performance
+
+Scanning 250 symbols cannot happen in one tick without freezing the terminal, so:
+
+- symbols are analysed **round-robin, `InpSymbolsPerTick` per second** (default 6), and only
+  when that symbol has printed a new bar — the rest of the time the cached result is displayed;
+- indicators (EMA/ATR/RSI, Wilder smoothing) are computed inline from `CopyRates` rather than
+  through `iMA`/`iATR`/`iRSI` handles, so the scan is not capped by the terminal's per-chart
+  indicator-handle limit — that limit is what makes big scanner dashboards show blank rows;
+- the panel title shows `analysed 128/132` so you can see the warm-up finish instead of
+  guessing whether a blank row means "no signal" or "not scanned yet".
+
+First attach on a fresh terminal takes a little while: MT5 has to download history for every
+symbol before anything can be computed. Rows fill in as that lands.
+
+## Columns
+
+`SYMBOL · TF · SIGNAL · SCORE · WR · AGE · ENTRY · SL · TP1 · TP2 · TP3 · STATUS · CHART`
+
+`SCORE`, `WR` and `STATUS` can be switched off (`InpShowScore`, `InpShowWinRate`,
+`InpShowStatus`) to get back to the original ten-column layout. `OPEN` switches the chart to
+that symbol. ▲/▼ page through the list; rows are sorted signals-first by default, so page 1 is
+the actionable page even with 250 symbols loaded.
+
+## Key inputs
 
 | Input | Default | Notes |
 | --- | --- | --- |
-| `InpSymbols` | Deriv synthetics + BTCUSD/ETHUSD/EURUSD/AUDCHF | Comma separated; spaces inside a name are kept |
-| `InpTimeframe` | `PERIOD_CURRENT` | Scan TF; `PERIOD_CURRENT` follows the chart |
-| `InpMaxAge` | 12 | How long a signal stays on the board |
-| `InpRefreshSeconds` | 2 | Rescan interval; the indicator also runs on a 1s timer so it updates on symbols the chart isn't showing |
-| `InpOnlySignals` | false | Hide rows with no live signal |
-| `InpSortFreshest` | false | Sort by age instead of list order |
-| `InpRowsVisible` | 9 | Rows per page |
-| `InpAlertPopup` / `InpAlertPush` | false | Fire once per symbol when a signal prints on the last closed bar |
+| `InpUseMarketWatch` | true | Off = use `InpSymbols` instead |
+| `InpFilterInclude` / `InpFilterExclude` | "" | Substring filters, e.g. include `Index` for Deriv synthetics only |
+| `InpMaxSymbols` | 250 | Hard cap |
+| `InpSymbolsPerTick` | 6 | Raise to warm up faster, lower if the terminal feels heavy |
+| `InpTimeframe` | `PERIOD_CURRENT` | Scan TF |
+| `InpHtfTimeframe` | `PERIOD_CURRENT` | `CURRENT` = one step above the scan TF |
+| `InpMinScore` | 55 | Raise for fewer, higher-quality signals |
+| `InpOnlySignals` | false | Hide symbols with no live signal |
+| `InpStatsBars` | 600 | Back-test window; `0` disables the WR column |
+| `InpAlertPopup` / `InpAlertPush` | false | Fire once when a signal prints on the last closed bar |
 
-## Known limitations
+## Limitations
 
-- The panel is laid out in pixels for `Consolas` at size 8. Changing `InpFontSize` or `InpFont`
-  much may need `InpRowHeight` and the panel origin adjusted to match.
-- The on-chart trade is drawn only when the chart symbol is in `InpSymbols`. If `InpTimeframe`
-  is pinned to something other than the chart period, the box anchors to bar times of the scan
-  timeframe and will look offset — keep them the same, or leave `InpTimeframe` on
-  `PERIOD_CURRENT`.
-- Scanning many symbols pulls history for each one; the first few seconds after attach can show
-  blank rows while the terminal downloads bars.
+- The on-chart trade box only draws when the chart timeframe matches the scan timeframe. If
+  they differ the box would anchor to the wrong bars, so it is hidden rather than drawn wrong.
+- The panel is pixel-laid-out for `Consolas` 8 / 18 px rows. Changing font size usually needs
+  `InpRowHeight` adjusted too; with all columns on it is about 1150 px wide.
+- Inline EMA/ATR/RSI are seeded from the oldest bar in the copied window rather than from the
+  full symbol history, so values can differ from `iMA`/`iATR`/`iRSI` in the last decimals on the
+  oldest bars of the window. Warm-up is `4 × slow EMA` bars, which puts the difference far
+  outside the range that signals are read from.
+- Back-tested trades that neither hit TP1 nor SL within `InpStatsMaxHold` bars are excluded from
+  `WR` rather than counted as wins.
+
+## Install
+
+1. Copy `MarketFlowV8.mq5` to `<MT5 data folder>/MQL5/Indicators/` (File → Open Data Folder).
+2. Compile with **F7** in MetaEditor.
+3. Drag **MarketFlow V8** onto any chart.
+
+It places no orders and needs no trading permissions.
 
 ## Relation to `config.json`
 
-`config.json` in the repository root is the remote-control state for the EA
-(`ea_status`, `mode`, `hedging`). This indicator is display-only and does not read or write it.
+`config.json` in the repository root is the remote-control state for the EA (`ea_status`,
+`mode`, `hedging`). This indicator is display-only and does not read or write it.
