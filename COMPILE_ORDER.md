@@ -6,30 +6,20 @@ and paste me whatever MetaEditor says.
 
 ---
 
-## Step 1 — Find your data folder
+## Steps 1-3 — Install the files
 
-In MetaTrader 5: **File → Open Data Folder**. A window opens. Inside it there
-is an `MQL5` folder. That folder is where everything goes.
+See **`INSTALL.md`** for downloading from GitHub, finding the MetaTrader data
+folder, and copying the files into place.
 
-Leave that window open. You will need it in step 2.
+Short version: **File → Open Data Folder** in MT5, then
 
----
+```
+Include/SEA/*.mqh   (23 files)  ->  MQL5/Include/SEA/
+Experts/SEA/SEA.mq5 (1 file)    ->  MQL5/Experts/SEA/
+Scripts/SEA/*.mq5   (8 files)   ->  MQL5/Scripts/SEA/
+```
 
-## Step 2 — Copy the files in
-
-Copy from this repo into the `MQL5` folder you just opened:
-
-| From the repo | To |
-|---|---|
-| `Include/SEA/` (whole folder, 23 `.mqh` files) | `MQL5/Include/SEA/` |
-| `Experts/SEA/SEA.mq5` | `MQL5/Experts/SEA/` |
-| `Scripts/SEA/*.mq5` (8 files) | `MQL5/Scripts/SEA/` |
-
-Create the `SEA` subfolders if they do not exist. Do **not** copy `Files/` —
-the EA writes into the terminal's own `MQL5/Files/` at runtime.
-
-Check afterwards that `MQL5/Include/SEA/CSymbolSpec.mqh` exists. If the path
-is wrong you will get `cannot open source file` on every compile.
+`MQL5/Include/SEA/CSymbolSpec.mqh` must exist before you go on.
 
 ---
 
