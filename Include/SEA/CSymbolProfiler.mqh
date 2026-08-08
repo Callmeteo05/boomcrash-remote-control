@@ -76,6 +76,23 @@ public:
    bool              Profile(const string symbol,const int styleId,
                              const ENUM_TIMEFRAMES execTF,CIndicatorPool &pool);
 
+   //! Measure how well one candidate style fits a symbol.
+   //!
+   //! Feeds CStyle::ScoreStyle for AUTO resolution. All three outputs
+   //! are measured at the candidate style's own execution timeframe -
+   //! the same instrument scores differently at M5 and H4, which is
+   //! the whole point of resolving per symbol.
+   //!
+   //!   spreadOverATR  median spread / median ATR
+   //!   ticksPerBar    average tick volume per bar
+   //!   cleanliness    confirmed swings / fractal candidates, 0..1
+   //!
+   //! Returns false when the series is unsynchronised or too short.
+   bool              MeasureStyleFitness(const string symbol,const ENUM_TIMEFRAMES execTF,
+                                         CIndicatorPool &pool,const int bars,
+                                         double &spreadOverATR,double &ticksPerBar,
+                                         double &cleanliness) const;
+
    //! Copy out a stored profile. Returns false when not measured.
    bool              Get(const string symbol,const int styleId,SProfile &out) const;
 
@@ -643,6 +660,79 @@ bool CSymbolProfiler::Profile(const string symbol,const int styleId,
 
    if(m_verbose)
       Print("[CSymbolProfiler] ",Describe(symbol,styleId));
+
+   return(true);
+  }
+
+//+------------------------------------------------------------------+
+//| Style fitness, measured at the candidate style's execution TF.    |
+//+------------------------------------------------------------------+
+bool CSymbolProfiler::MeasureStyleFitness(const string symbol,const ENUM_TIMEFRAMES execTF,
+                                          CIndicatorPool &pool,const int bars,
+                                          double &spreadOverATR,double &ticksPerBar,
+                                          double &cleanliness) const
+  {
+   spreadOverATR = 1.0;   // pessimistic defaults: an unmeasurable style
+   ticksPerBar   = 0.0;   // scores badly rather than winning by accident
+   cleanliness   = 0.0;
+
+   int want=(bars<100 ? 100 : (bars>5000 ? 5000 : bars));
+   int available=SeaAvailableBars(symbol,execTF);
+   if(available<100)
+      return(false);
+   if(available<want)
+      want=available;
+
+   MqlRates r[];
+   if(!SeaCopyRates(symbol,execTF,0,want,r))
+      return(false);
+
+   int total=ArraySize(r);
+
+   //--- ATR at this timeframe
+   int atrHandle=pool.AcquireATR(symbol,execTF,m_atrPeriod);
+   if(atrHandle==INVALID_HANDLE)
+      return(false);
+
+   double atr[];
+   int atrWant=total-m_atrPeriod-1;
+   if(atrWant<50)
+      atrWant=50;
+   bool gotATR=SeaCopyBuffer(atrHandle,0,1,atrWant,atr);
+   pool.Release(atrHandle);
+   if(!gotATR)
+      return(false);
+
+   double medianATR=SeaMedian(atr);
+   if(medianATR<=0.0)
+      return(false);
+
+   //--- median spread, in price units
+   double spreads[];
+   ArrayResize(spreads,total);
+   int sn=0;
+   double tickSum=0.0;
+   int    tickN=0;
+
+   for(int i=1; i<total; i++)
+     {
+      if(r[i].spread>0)
+         spreads[sn++]=(double)r[i].spread;
+      tickSum+=(double)r[i].tick_volume;
+      tickN++;
+     }
+
+   double point=SymbolInfoDouble(symbol,SYMBOL_POINT);
+   if(sn>0)
+     {
+      ArrayResize(spreads,sn);
+      spreadOverATR=SeaMedian(spreads)*point/medianATR;
+     }
+   else
+      spreadOverATR=SymbolInfoInteger(symbol,SYMBOL_SPREAD)*point/medianATR;
+
+   ticksPerBar=(tickN>0 ? tickSum/(double)tickN : 0.0);
+   cleanliness=StructuralCleanliness(r,total,3);
 
    return(true);
   }

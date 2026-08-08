@@ -93,7 +93,7 @@ public:
 
    //! Re-classify. Call per bar for any symbol holding an open position.
    //! New bar only unless forced.
-   bool              Update(const CStructure &structure,const bool force=false);
+   bool              Update(CStructure *structure,const bool force=false);
 
    //! True once a successful Update has run.
    bool              IsReady(void) const { return m_ready; }
@@ -231,8 +231,10 @@ int CRegime::CountInsideBars(const MqlRates &r[],const int total) const
 //| statements about displacement, and displacement overrides an ADX  |
 //| reading that lags it.                                             |
 //+------------------------------------------------------------------+
-bool CRegime::Update(const CStructure &structure,const bool force)
+bool CRegime::Update(CStructure *structure,const bool force)
   {
+   if(structure==NULL)
+      return(false);
    if(m_symbol=="" || m_atrFast==INVALID_HANDLE)
       return(false);
 

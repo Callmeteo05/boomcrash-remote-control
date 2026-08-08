@@ -111,7 +111,7 @@ public:
    //!
    //! Returns true when something was changed.
    bool              Manage(const ulong ticket,CSymbolSpec &spec,const int specIndex,
-                            CTradeExec &exec,CStructure &structure,CRegime &regime,
+                            CTradeExec &exec,CStructure *structure,CRegime *regime,
                             CSpikeHazard &hazard);
 
    //! Update the MFE/MAE excursion record. Cheap enough for the tick
@@ -278,9 +278,12 @@ double CManagement::OutcomeR(const SManagedPosition &p,const double closePrice) 
 
 //+------------------------------------------------------------------+
 bool CManagement::Manage(const ulong ticket,CSymbolSpec &spec,const int specIndex,
-                         CTradeExec &exec,CStructure &structure,CRegime &regime,
+                         CTradeExec &exec,CStructure *structure,CRegime *regime,
                          CSpikeHazard &hazard)
   {
+   if(regime==NULL)
+      return(false);
+
    int slot=Find(ticket);
    if(slot<0)
       return(false);
@@ -361,7 +364,7 @@ bool CManagement::Manage(const ulong ticket,CSymbolSpec &spec,const int specInde
 
    double newStop=0.0;
 
-   if(prof.trailStructural && structure.IsReady())
+   if(prof.trailStructural && structure!=NULL && structure.IsReady())
      {
       //--- trail to the most recent confirmed swing behind price
       SSwing sw;

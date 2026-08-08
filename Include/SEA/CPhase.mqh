@@ -69,7 +69,7 @@ private:
    bool              DetectRange(const MqlRates &r[],const int total,
                                  const double atrFast,const double atrSlow,const double adx);
    bool              DetectSweep(const MqlRates &r[],const int total);
-   bool              DetectDistribution(const CStructure &structure,const double adxNow,
+   bool              DetectDistribution(CStructure *structure,const double adxNow,
                                         const double adxPrev,const double atrFast,
                                         const double atrSlow) const;
 
@@ -103,7 +103,7 @@ public:
    //! Re-evaluate the phase. Needs CStructure for the CHoCH leg of the
    //! manipulation sequence and for distribution confirmation.
    //! New bar only unless forced.
-   bool              Update(const CStructure &structure,const bool force=false);
+   bool              Update(CStructure *structure,const bool force=false);
 
    //! True once a successful Update has run.
    bool              IsReady(void) const { return m_ready; }
@@ -367,10 +367,12 @@ bool CPhase::DetectSweep(const MqlRates &r[],const int total)
 //| Distribution: a confirmed BOS out of the range after a sweep,     |
 //| with ADX rising and ATR expanding.                                |
 //+------------------------------------------------------------------+
-bool CPhase::DetectDistribution(const CStructure &structure,const double adxNow,
+bool CPhase::DetectDistribution(CStructure *structure,const double adxNow,
                                 const double adxPrev,const double atrFast,
                                 const double atrSlow) const
   {
+   if(structure==NULL)
+      return(false);
    if(structure.LastBreak()!=SEA_BREAK_BOS)
       return(false);
    if(adxNow<=adxPrev)
@@ -390,8 +392,10 @@ bool CPhase::DetectDistribution(const CStructure &structure,const double adxNow,
   }
 
 //+------------------------------------------------------------------+
-bool CPhase::Update(const CStructure &structure,const bool force)
+bool CPhase::Update(CStructure *structure,const bool force)
   {
+   if(structure==NULL)
+      return(false);
    if(m_symbol=="" || m_atrFast==INVALID_HANDLE)
       return(false);
 

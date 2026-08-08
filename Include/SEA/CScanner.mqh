@@ -85,9 +85,7 @@ private:
    int               FindUniverse(const string symbol) const;
    int               FindWarm(const string symbol) const;
    int               FindHot(const string symbol) const;
-   bool              AllocateWarm(const string symbol,CStyle &style,CIndicatorPool &pool,
-                                  CSymbolProfiler &profiler,const SProfile &profile,
-                                  const int atrPeriod);
+   bool              AllocateWarm(const string symbol);
    void              FreeWarm(const int slot,CIndicatorPool &pool);
 
 public:
@@ -198,12 +196,25 @@ public:
    bool              LastGateResult(const string symbol,const ENUM_SEA_DIRECTION dir,
                                     SGateResult &out) const;
 
+   //! The full context behind that gate result: entry, stop, target and
+   //! score as they stood when the setup was judged. The journal needs
+   //! these to replay a rejection and decide whether it would have won.
+   bool              LastGateContext(const string symbol,const ENUM_SEA_DIRECTION dir,
+                                     SGateContext &out) const;
+
+   //! Number of gate evaluations recorded on the last collection pass.
+   int               GateRecordCount(void) const { return m_lastGateCount; }
+
+   //! Walk the recorded gate evaluations by index.
+   bool              GateRecordAt(const int index,SGateContext &ctx,SGateResult &result) const;
+
    //! One-line summary.
    string            Describe(void) const;
 
 private:
    //--- rejection buffer, drained by the journal
    SGateResult       m_lastGates[SEA_MAX_WARM*2];
+   SGateContext      m_lastGateCtx[SEA_MAX_WARM*2];
    string            m_lastGateSymbol[SEA_MAX_WARM*2];
    int               m_lastGateDir[SEA_MAX_WARM*2];
    int               m_lastGateCount;
@@ -434,9 +445,7 @@ int CScanner::RefreshCold(CSymbolSpec &spec,CStyle &style,CIndicatorPool &pool,
   }
 
 //+------------------------------------------------------------------+
-bool CScanner::AllocateWarm(const string symbol,CStyle &style,CIndicatorPool &pool,
-                            CSymbolProfiler &profiler,const SProfile &profile,
-                            const int atrPeriod)
+bool CScanner::AllocateWarm(const string symbol)
   {
    int slot=-1;
    for(int i=0; i<m_maxWarm; i++)
@@ -570,7 +579,7 @@ int CScanner::PromoteWarm(CSymbolSpec &spec,CStyle &style,CIndicatorPool &pool,
       if(!profiler.Get(m_universe[u].symbol,styleId,profile) || !profile.complete)
          continue;
 
-      if(!AllocateWarm(m_universe[u].symbol,style,pool,profiler,profile,atrPeriod))
+      if(!AllocateWarm(m_universe[u].symbol))
          continue;
 
       int slot=FindWarm(m_universe[u].symbol);
@@ -854,6 +863,7 @@ int CScanner::CollectCandidates(CSymbolSpec &spec,CStyle &style,
          if(m_lastGateCount<SEA_MAX_WARM*2)
            {
             m_lastGates[m_lastGateCount]      = gateResult;
+            m_lastGateCtx[m_lastGateCount]    = ctx;
             m_lastGateSymbol[m_lastGateCount] = symbol;
             m_lastGateDir[m_lastGateCount]    = (int)dir;
             m_lastGateCount++;
@@ -943,8 +953,20 @@ bool CScanner::GetCandidate(const int index,SSetup &out) const
   }
 
 //+------------------------------------------------------------------+
-//| One candidate per currency group. The highest score wins the      |
-//| group; the rest are discarded, not queued.                        |
+//| Correlation collapse.                                             |
+//|                                                                   |
+//| Exposure is counted per INDIVIDUAL CURRENCY, not per pair. Three  |
+//| candidates that each contain the same currency are three bets on  |
+//| that currency however different their symbols look, so the cap    |
+//| applies to the currency itself.                                   |
+//|                                                                   |
+//| Candidates arrive already sorted best-first, so the highest       |
+//| scorer claims the exposure and later ones are DISCARDED, not      |
+//| queued.                                                           |
+//|                                                                   |
+//| Instruments with no currency pair - synthetics, indices quoted    |
+//| in the deposit currency - are exempt, as the architecture         |
+//| requires.                                                         |
 //+------------------------------------------------------------------+
 int CScanner::ApplyCorrelationCollapse(CSymbolSpec &spec,const int maxPerGroup)
   {
@@ -953,57 +975,84 @@ int CScanner::ApplyCorrelationCollapse(CSymbolSpec &spec,const int maxPerGroup)
 
    int cap=(maxPerGroup<1 ? 1 : maxPerGroup);
 
-   string groups[SEA_MAX_CANDIDATES];
-   int    counts[SEA_MAX_CANDIDATES];
-   int    groupCount=0;
+   string currency[SEA_MAX_CANDIDATES*2];
+   int    used[SEA_MAX_CANDIDATES*2];
+   int    currencyCount=0;
 
    SSetup kept[];
    ArrayResize(kept,SEA_MAX_CANDIDATES);
    int keptCount=0;
 
-   //--- candidates are already sorted best first
    for(int i=0; i<m_candidateCount; i++)
      {
-      //--- the group key is the profit currency plus the base currency,
-      //--- so instruments sharing exposure collapse together.
-      //--- Synthetic instruments with no currency pair are exempt.
       string base  =spec.CurrencyBase(m_candidates[i].specIndex);
       string profit=spec.CurrencyProfit(m_candidates[i].specIndex);
 
-      if(base=="" || profit=="" || base==profit)
+      //--- a symbol that names no currency pair carries no shared
+      //--- currency exposure to cap
+      bool exempt=(base=="" || profit=="" || base==profit);
+
+      if(exempt)
         {
          kept[keptCount]=m_candidates[i];
          keptCount++;
          continue;
         }
 
-      string key=base+"/"+profit;
+      //--- locate or create a counter for each side
+      int slots[2];
+      string names[2];
+      names[0]=base;
+      names[1]=profit;
 
-      int g=-1;
-      for(int k=0; k<groupCount; k++)
-         if(groups[k]==key)
+      bool blocked=false;
+      string blockedBy="";
+
+      for(int k=0; k<2; k++)
+        {
+         int g=-1;
+         for(int c=0; c<currencyCount; c++)
+            if(currency[c]==names[k])
+              {
+               g=c;
+               break;
+              }
+
+         if(g<0)
            {
-            g=k;
-            break;
+            if(currencyCount>=SEA_MAX_CANDIDATES*2)
+              {
+               blocked=true;
+               blockedBy="currency table full";
+               break;
+              }
+            currency[currencyCount]=names[k];
+            used[currencyCount]=0;
+            g=currencyCount;
+            currencyCount++;
            }
 
-      if(g<0)
-        {
-         groups[groupCount]=key;
-         counts[groupCount]=0;
-         g=groupCount;
-         groupCount++;
+         slots[k]=g;
+
+         if(used[g]>=cap)
+           {
+            blocked=true;
+            blockedBy=names[k];
+           }
         }
 
-      if(counts[g]>=cap)
+      if(blocked)
         {
          if(m_verbose)
             PrintFormat("[CScanner] %s discarded: %s already at the %d exposure cap",
-                        m_candidates[i].symbol,key,cap);
+                        m_candidates[i].symbol,blockedBy,cap);
          continue;
         }
 
-      counts[g]++;
+      //--- claim the exposure on both sides
+      used[slots[0]]++;
+      used[slots[1]]++;
+
       kept[keptCount]=m_candidates[i];
       keptCount++;
      }
@@ -1040,6 +1089,29 @@ bool CScanner::LastGateResult(const string symbol,const ENUM_SEA_DIRECTION dir,
          return(true);
         }
    return(false);
+  }
+
+//+------------------------------------------------------------------+
+bool CScanner::LastGateContext(const string symbol,const ENUM_SEA_DIRECTION dir,
+                               SGateContext &out) const
+  {
+   for(int i=0; i<m_lastGateCount; i++)
+      if(m_lastGateSymbol[i]==symbol && m_lastGateDir[i]==(int)dir)
+        {
+         out=m_lastGateCtx[i];
+         return(true);
+        }
+   return(false);
+  }
+
+//+------------------------------------------------------------------+
+bool CScanner::GateRecordAt(const int index,SGateContext &ctx,SGateResult &result) const
+  {
+   if(index<0 || index>=m_lastGateCount)
+      return(false);
+   ctx=m_lastGateCtx[index];
+   result=m_lastGates[index];
+   return(true);
   }
 
 //+------------------------------------------------------------------+

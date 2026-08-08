@@ -107,7 +107,7 @@ public:
    //! `reason`. A false here is final for this bar.
    bool              MayAdd(const string symbol,const ENUM_SEA_DIRECTION dir,
                             const ulong ticket,CManagement &management,
-                            CStructure &structure,CRegime &regime,
+                            CStructure *structure,CRegime *regime,
                             CSpikeHazard &hazard,CRiskManager &risk,
                             const int styleMaxLegs,const int profileMaxLegs,
                             string &reason) const;
@@ -125,7 +125,7 @@ public:
    //! Trail every leg on a symbol to the most recent confirmed swing.
    //! Called after each add, per the architecture.
    int               TrailAllLegs(const string symbol,CSymbolSpec &spec,const int specIndex,
-                                  CTradeExec &exec,CStructure &structure) const;
+                                  CTradeExec &exec,CStructure *structure) const;
 
    //! One-line summary.
    string            Describe(const string symbol) const;
@@ -283,12 +283,18 @@ int CScaling::LegCount(const string symbol) const
 //+------------------------------------------------------------------+
 bool CScaling::MayAdd(const string symbol,const ENUM_SEA_DIRECTION dir,
                       const ulong ticket,CManagement &management,
-                      CStructure &structure,CRegime &regime,
+                      CStructure *structure,CRegime *regime,
                       CSpikeHazard &hazard,CRiskManager &risk,
                       const int styleMaxLegs,const int profileMaxLegs,
                       string &reason) const
   {
    reason="";
+
+   if(structure==NULL || regime==NULL)
+     {
+      reason="structure or regime engine unavailable";
+      return(false);
+     }
 
    int slot=Find(symbol);
    if(slot<0)
@@ -463,10 +469,10 @@ void CScaling::RecordLeg(const string symbol,const double lots,const double adde
 //| swing. Legs are never left behind on their original stops.        |
 //+------------------------------------------------------------------+
 int CScaling::TrailAllLegs(const string symbol,CSymbolSpec &spec,const int specIndex,
-                           CTradeExec &exec,CStructure &structure) const
+                           CTradeExec &exec,CStructure *structure) const
   {
    int i=Find(symbol);
-   if(i<0 || !structure.IsReady())
+   if(i<0 || structure==NULL || !structure.IsReady())
       return(0);
 
    bool isLong=(m_baskets[i].direction==SEA_DIR_LONG);

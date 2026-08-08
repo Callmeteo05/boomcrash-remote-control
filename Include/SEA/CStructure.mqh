@@ -359,33 +359,36 @@ void CStructure::ResolveState(const MqlRates &r[],const int total)
    bool   haveHigh=false, haveLow=false;
    int    lastBreakShift=-1;
 
+   //--- A swing at shift s is confirmed at bar i only once m_fractalBars
+   //--- bars have closed after it, i.e. once s >= i + m_fractalBars.
+   //--- As i walks DOWNWARD the confirmed set only ever GROWS, and each
+   //--- newly confirmed swing has a smaller shift than every swing
+   //--- confirmed before it - so the most recently activated swing of
+   //--- each side IS the active reference.
+   //---
+   //--- m_swings is ordered newest-first, so walking it from the back
+   //--- activates oldest-first. That makes this a single pass over the
+   //--- swing array across the whole scan: O(bars + swings) rather than
+   //--- O(bars x swings).
+   int nextToActivate=m_swingCount-1;
+
    //--- oldest closed bar first, newest last (shift 1)
    for(int i=total-1; i>=1; i--)
      {
-      //--- active references at bar i: the newest confirmed swing of each
-      //--- side whose confirmation was already complete by then.
-      //--- m_swings is ordered newest-first, so the FIRST match walking
-      //--- forward is the newest qualifying swing.
-      //--- A swing at shift s is confirmed once m_fractalBars bars have
-      //--- closed after it, i.e. only once i <= s - m_fractalBars.
-      haveHigh=false;
-      haveLow=false;
-      for(int s=0; s<m_swingCount; s++)
+      while(nextToActivate>=0 &&
+            m_swings[nextToActivate].shift>=i+m_fractalBars)
         {
-         if(m_swings[s].shift-m_fractalBars<i)
-            continue;                       // confirmation not complete at bar i
-         if(m_swings[s].isHigh && !haveHigh)
+         if(m_swings[nextToActivate].isHigh)
            {
-            refHigh=m_swings[s].price;
+            refHigh=m_swings[nextToActivate].price;
             haveHigh=true;
            }
-         if(!m_swings[s].isHigh && !haveLow)
+         else
            {
-            refLow=m_swings[s].price;
+            refLow=m_swings[nextToActivate].price;
             haveLow=true;
            }
-         if(haveHigh && haveLow)
-            break;
+         nextToActivate--;
         }
 
       double close=r[i].close;

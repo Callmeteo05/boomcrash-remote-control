@@ -45,10 +45,10 @@ private:
    double            m_noLocationCeiling; // score cap with no HTF zone
    bool              m_verbose;
 
-   double            ScoreReversal(CMTF &mtf,const double price,
+   double            ScoreReversal(CMTF *mtf,const double price,
                                    const ENUM_SEA_DIRECTION dir,const int execLevel,
                                    string &detail,bool &htfZone) const;
-   double            ScoreBreakout(CMTF &mtf,const double price,
+   double            ScoreBreakout(CMTF *mtf,const double price,
                                    const ENUM_SEA_DIRECTION dir,const int execLevel,
                                    string &detail) const;
 
@@ -72,11 +72,11 @@ public:
    //!
    //! execLevel is the cascade index of the execution timeframe. Levels
    //! above it count as HTF for the location test.
-   SProbability      Evaluate(CMTF &mtf,const double price,
+   SProbability      Evaluate(CMTF *mtf,const double price,
                               const ENUM_SEA_DIRECTION dir,const int execLevel) const;
 
    //! Convenience: score only, 0.0 when the evaluation is invalid.
-   double            ScoreAt(CMTF &mtf,const double price,
+   double            ScoreAt(CMTF *mtf,const double price,
                              const ENUM_SEA_DIRECTION dir,const int execLevel) const;
   };
 
@@ -107,12 +107,15 @@ void CProbabilityMap::Configure(const double stackWeight,const double noLocation
 //|   an LTF CHoCH                                                    |
 //|   impulse legs decreasing (exhaustion)                            |
 //+------------------------------------------------------------------+
-double CProbabilityMap::ScoreReversal(CMTF &mtf,const double price,
+double CProbabilityMap::ScoreReversal(CMTF *mtf,const double price,
                                       const ENUM_SEA_DIRECTION dir,const int execLevel,
                                       string &detail,bool &htfZone) const
   {
    detail="";
    htfZone=false;
+
+   if(mtf==NULL)
+      return(0.0);
 
    double score=0.0;
 
@@ -227,12 +230,15 @@ double CProbabilityMap::ScoreReversal(CMTF &mtf,const double price,
 //|   the range contracting                                           |
 //|   a prior sweep already taken                                     |
 //+------------------------------------------------------------------+
-double CProbabilityMap::ScoreBreakout(CMTF &mtf,const double price,
+double CProbabilityMap::ScoreBreakout(CMTF *mtf,const double price,
                                       const ENUM_SEA_DIRECTION dir,const int execLevel,
                                       string &detail) const
   {
    detail="";
    double score=0.0;
+
+   if(mtf==NULL)
+      return(0.0);
 
    //--- 1. the HTF trend agrees with the breakout direction
    ENUM_SEA_DIRECTION htfBias=mtf.HTFBias();
@@ -329,7 +335,7 @@ double CProbabilityMap::ScoreBreakout(CMTF &mtf,const double price,
   }
 
 //+------------------------------------------------------------------+
-SProbability CProbabilityMap::Evaluate(CMTF &mtf,const double price,
+SProbability CProbabilityMap::Evaluate(CMTF *mtf,const double price,
                                        const ENUM_SEA_DIRECTION dir,const int execLevel) const
   {
    SProbability out;
@@ -344,7 +350,7 @@ SProbability CProbabilityMap::Evaluate(CMTF &mtf,const double price,
    out.htfZonePresent = false;
    out.breakdown      = "";
 
-   if(dir==SEA_DIR_NONE || !mtf.IsReady())
+   if(mtf==NULL || dir==SEA_DIR_NONE || !mtf.IsReady())
       return(out);
 
    string revDetail,brkDetail;
@@ -404,7 +410,7 @@ SProbability CProbabilityMap::Evaluate(CMTF &mtf,const double price,
   }
 
 //+------------------------------------------------------------------+
-double CProbabilityMap::ScoreAt(CMTF &mtf,const double price,
+double CProbabilityMap::ScoreAt(CMTF *mtf,const double price,
                                 const ENUM_SEA_DIRECTION dir,const int execLevel) const
   {
    SProbability p=Evaluate(mtf,price,dir,execLevel);

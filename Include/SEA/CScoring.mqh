@@ -106,7 +106,7 @@ public:
 
    //! Build a scoring context from the live cascade. Convenience used
    //! by the scanner so the field mapping lives in one place.
-   SScoreContext     BuildContext(CMTF &mtf,CPhase &phase,
+   SScoreContext     BuildContext(CMTF *mtf,CPhase *phase,
                                   const string symbol,const ENUM_SEA_DIRECTION dir,
                                   const int execLevel,
                                   const double entry,const double stop,const double target,
@@ -292,7 +292,7 @@ SScoreResult CScoring::Score(const SScoreContext &ctx,const double profileMinCon
   }
 
 //+------------------------------------------------------------------+
-SScoreContext CScoring::BuildContext(CMTF &mtf,CPhase &phase,
+SScoreContext CScoring::BuildContext(CMTF *mtf,CPhase *phase,
                                      const string symbol,const ENUM_SEA_DIRECTION dir,
                                      const int execLevel,
                                      const double entry,const double stop,const double target,
@@ -310,6 +310,26 @@ SScoreContext CScoring::BuildContext(CMTF &mtf,CPhase &phase,
 
    double risk=MathAbs(entry-stop);
    c.rr=(risk>0.0 ? MathAbs(target-entry)/risk : 0.0);
+
+   //--- a missing engine yields a context with no confluence credited,
+   //--- which scores low and fails the threshold. It never invents one.
+   if(mtf==NULL || phase==NULL)
+     {
+      c.htfAligned              = false;
+      c.levelsAgreeing          = 0;
+      c.sweepPrecededChoch      = false;
+      c.entryInOTE              = false;
+      c.zoneFresh               = zoneFresh;
+      c.zoneUntested            = zoneUntested;
+      c.obFvgOverlap            = obFvgOverlap;
+      c.targetIsUnsweptLiquidity= targetIsLiquidity;
+      c.phase                   = SEA_PHASE_UNDEFINED;
+      c.manipulationConfirmed   = false;
+      c.distributionWithMove    = false;
+      c.accumulationUnresolved  = false;
+      c.rangeBreakWithoutSweep  = false;
+      return(c);
+     }
 
    c.htfAligned    = (mtf.HTFBias()==dir);
    c.levelsAgreeing= mtf.LevelsAgreeing(dir);

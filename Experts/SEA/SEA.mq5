@@ -212,6 +212,101 @@ string StructuralExplanation(const SSetup &s)
   }
 
 //+------------------------------------------------------------------+
+//| Resolve AUTO style.                                               |
+//|                                                                   |
+//| Measures each candidate style at its OWN execution timeframe over  |
+//| a sample of the universe, averages, and lets CStyle pick. Scoring  |
+//| weighs execution drag heaviest, then tick liquidity, then          |
+//| structural cleanliness.                                            |
+//|                                                                   |
+//| Sampling rather than measuring every symbol keeps init bounded;    |
+//| the style is a universe-wide setting, so a sample is the right     |
+//| granularity.                                                       |
+//+------------------------------------------------------------------+
+void ResolveAutoStyle(const int sampleSize)
+  {
+   if(InpTradingStyle!=SEA_STYLE_AUTO)
+      return;
+
+   Print("[SEA] AUTO style: measuring candidate styles across the universe");
+
+   //--- indexed by ENUM_SEA_STYLE ordinal: 0 SCALP, 1 INTRADAY, 2 SWING
+   double dragSum[3],tickSum[3],cleanSum[3];
+   int    samples[3];
+
+   for(int s=0; s<3; s++)
+     {
+      dragSum[s]=0.0;
+      tickSum[s]=0.0;
+      cleanSum[s]=0.0;
+      samples[s]=0;
+     }
+
+   //--- a probe CStyle, so we read each candidate's own exec timeframe
+   //--- rather than naming a PERIOD_ constant here (RULE 10)
+   CStyle probe;
+
+   int taken=0;
+   for(int i=0; i<g_scanner.UniverseSize() && taken<sampleSize; i++)
+     {
+      SScanEntry e;
+      if(!g_scanner.GetEntry(i,e))
+         continue;
+      if(e.specIndex<0 || e.exclusion!="")
+         continue;
+
+      bool contributed=false;
+
+      for(int s=0; s<3; s++)
+        {
+         probe.SetStyle((ENUM_SEA_STYLE)s);
+
+         double drag,ticks,clean;
+         if(!g_profiler.MeasureStyleFitness(e.symbol,probe.ExecTF(),g_pool,
+                                            1000,drag,ticks,clean))
+            continue;
+
+         dragSum[s] +=drag;
+         tickSum[s] +=ticks;
+         cleanSum[s]+=clean;
+         samples[s]++;
+         contributed=true;
+        }
+
+      if(contributed)
+         taken++;
+     }
+
+   double drag[3],ticks[3],clean[3];
+   for(int s=0; s<3; s++)
+     {
+      drag[s] =(samples[s]>0 ? dragSum[s]/(double)samples[s]  : 1.0);
+      ticks[s]=(samples[s]>0 ? tickSum[s]/(double)samples[s]  : 0.0);
+      clean[s]=(samples[s]>0 ? cleanSum[s]/(double)samples[s] : 0.0);
+     }
+
+   if(taken<1)
+     {
+      Print("[SEA] AUTO style: nothing measurable, holding INTRADAY");
+      return;
+     }
+
+   g_style.SetVerbose(true);
+   ENUM_SEA_STYLE chosen=g_style.ResolveAuto(drag,ticks,clean);
+   g_style.SetVerbose(InpVerbose);
+
+   PrintFormat("[SEA] AUTO style resolved to %s from %d sampled symbols",
+               g_style.Name(),taken);
+   PrintFormat("[SEA]   SCALP    drag %.4f ticks %.0f clean %.2f",drag[0],ticks[0],clean[0]);
+   PrintFormat("[SEA]   INTRADAY drag %.4f ticks %.0f clean %.2f",drag[1],ticks[1],clean[1]);
+   PrintFormat("[SEA]   SWING    drag %.4f ticks %.0f clean %.2f",drag[2],ticks[2],clean[2]);
+
+   //--- silence the unused-return warning while keeping the value visible
+   if(chosen==SEA_STYLE_AUTO)
+      Print("[SEA] AUTO failed to resolve - this should not happen");
+  }
+
+//+------------------------------------------------------------------+
 //| OnInit                                                            |
 //+------------------------------------------------------------------+
 int OnInit()
@@ -295,6 +390,12 @@ int OnInit()
    //--- build the universe
    int universe=g_scanner.BuildUniverse(g_spec,InpMarketWatchOnly);
    PrintFormat("[SEA] universe: %d symbols",universe);
+
+   //--- AUTO resolves against measured statistics before anything is
+   //--- profiled, because the profile is keyed by (symbol, style)
+   ResolveAutoStyle(12);
+   if(InpTradingStyle==SEA_STYLE_AUTO)
+      Print("[SEA] ",g_style.Describe());
 
    //--- first cold pass
    int tradeable=g_scanner.RefreshCold(g_spec,g_style,g_pool,g_profiler,
@@ -464,25 +565,20 @@ void OnLTFBarClose()
                                               g_scoring,g_hazard,g_afford,g_risk,
                                               g_profiler);
 
-   //--- 5. journal every rejection with its full gate results
-   for(int i=0; i<g_scanner.UniverseSize(); i++)
+   //--- 5. journal every rejection with its full gate results AND the
+   //--- prices it was judged at, so the 20-bar follow-up can replay it
+   for(int i=0; i<g_scanner.GateRecordCount(); i++)
      {
-      SScanEntry e;
-      if(!g_scanner.GetEntry(i,e) || e.tier!=SEA_TIER_WARM)
+      SGateContext ctx;
+      SGateResult  gr;
+      if(!g_scanner.GateRecordAt(i,ctx,gr))
+         continue;
+      if(gr.allPassed)
          continue;
 
-      for(int d=0; d<2; d++)
-        {
-         ENUM_SEA_DIRECTION dir=(d==0 ? SEA_DIR_LONG : SEA_DIR_SHORT);
-         SGateResult gr;
-         if(!g_scanner.LastGateResult(e.symbol,dir,gr))
-            continue;
-         if(gr.allPassed)
-            continue;
-
-         g_journal.LogRejection(e.symbol,g_style.ExecTF(),dir,0.0,0.0,0.0,
-                                0.0,InpMinConfluenceScore,gr,g_gates);
-        }
+      g_journal.LogRejection(ctx.symbol,g_style.ExecTF(),ctx.direction,
+                             ctx.entryPrice,ctx.stopPrice,ctx.targetPrice,
+                             ctx.probability,InpMinLocationScore,gr,g_gates);
      }
 
    //--- 6. collapse correlated candidates
