@@ -1,128 +1,163 @@
-# MarketFlow V8 — MT5 Market Watch scanner
+# MarketFlow V8 — top-down SMC scanner for MT5
 
-`MarketFlowV8.mq5` analyses **every symbol in your Market Watch** in the background and
-publishes signals with entry, SL and TP1/TP2/TP3, plus the trade projection on the chart.
+`MarketFlowV8.mq5` reads the market the way the setup is meant to be built: **Daily and H4
+bias first**, then it only looks for entry-timeframe setups pointing the same way, and only
+takes them when Smart Money Concepts confluence lines up.
 
-## What makes the numbers real
+## The top-down sequence
 
-The indicator never prints a level it cannot justify from broker data:
+```
+1. D1  bias    market structure (BOS / CHoCH) on the daily
+2. H4  bias    market structure on H4
+               -> direction is fixed here. Nothing trades against it.
+3. entry TF    a setup in that direction only:
+                 . liquidity sweep    - a prior swing raided, stops taken, close back inside
+                 . CHoCH / BOS        - structure actually shifts
+                 . displacement       - the break is driven (body >= 1.0 x ATR), not drifted
+                 . POI                - order block and/or fair value gap left by that leg
+                 . premium / discount - buy in discount, sell in premium of the dealing range
+4. entry       a LIMIT at the POI. The setup WAITS for price to return to the zone.
+5. targets     resting liquidity - prior swing highs / lows - not arbitrary multiples
+```
 
-| Concern | How it is handled |
+Step 4 is the part that "takes advantage of the market" rather than chasing it: the entry sits
+at the order block / FVG and the dashboard shows `WAITING` until price comes back to it.
+If the stop is taken out before price ever reaches the entry, the row reads `INVALID` — the
+setup died without a trade, and it is excluded from the hit rate rather than booked as a loss.
+
+## Market structure
+
+Swings are fractals of `InpSwingStrength` bars each side. A fractal is only used once it is
+**confirmed** — i.e. once enough newer bars exist — so no part of this can see the future.
+
+- **BOS** (break of structure): close beyond the last confirmed swing in the same direction as
+  the current state — continuation. Shown as `BUY+` / `SELL+`.
+- **CHoCH** (change of character): the same break, but it flips the state — reversal. Shown as
+  `BUY-` / `SELL-`.
+
+The same walk produces the **dealing range** (`rangeHigh`/`rangeLow`), whose midpoint is
+equilibrium. Below it is discount, above it is premium.
+
+The bias timeframes get their own independent structure walk, and each entry bar is mapped to
+the **last closed** D1/H4 bar — so the back-test cannot peek at a bias that had not formed yet.
+
+## POI selection
+
+| Found | Zone used |
 | --- | --- |
-| Where symbols come from | `SymbolsTotal(true)` / `SymbolName(i, true)` — the live Market Watch, re-read every 30 s so added or removed symbols follow automatically |
-| Missing history | A row shows `LOADING` or `SHORT HIST` until enough bars have actually downloaded. It never falls back to a partial calculation |
-| Untradable symbols | `SYMBOL_TRADE_MODE_DISABLED` symbols are marked `DISABLED` and skipped |
-| Prices that can't be placed | Every level is rounded to `SYMBOL_TRADE_TICK_SIZE` and widened to clear `SYMBOL_TRADE_STOPS_LEVEL`. A level that had to be widened is flagged with `*` next to the SL |
-| "Did it work?" | The `STATUS` column replays the bars **after** the signal and reports what the trade actually did: `ACTIVE`, `TP1 HIT`, `TP2 HIT`, `TP3 HIT`, `SL HIT` |
-| "Is this setup any good on this symbol?" | The `WR` column back-tests the identical rule over the last `InpStatsBars` bars of that symbol and shows the measured TP1-before-SL rate and the sample size, e.g. `64% 28`. Below `InpStatsMinSamples` it shows `n/a 3` rather than a meaningless percentage |
-| Optimistic accounting | When one bar touches both the stop and a target, the **stop is counted first** — in the live status and in the back-test |
-| Look-ahead bias | Higher-timeframe confirmation maps each scan bar to the last **closed** HTF bar, so the back-test cannot see the future |
+| Order block **and** FVG that overlap | the overlap — the strongest POI |
+| Both, but disjoint | the order block |
+| FVG only | the gap |
+| Order block only | the candle range |
+| Neither | no setup — the bar is rejected |
 
-The rule that gets published and the rule that gets measured are the same function
-(`EvaluateAt`), called from both paths. A `WR` figure therefore describes the signals you are
-actually being shown.
+Order block = last opposing candle before the impulse. FVG = three-candle imbalance
+(`low[k-1] > high[k+1]` for bullish). Entry defaults to **consequent encroachment** (zone
+midpoint); `InpPoiEntry = Proximal` enters at the near edge instead.
 
-**What it still is:** a rules engine measuring its own historical hit rate. A `70% 30` reading
-means that rule resolved TP1 before SL on 21 of 30 past occurrences on that symbol — it is a
-track record, not a prediction, and synthetic indices in particular can change character. Read
-`WR` together with the sample size.
+## Stops and targets
 
-## Signal rules
+```
+stop    = behind the POI, and behind the swept low/high if a sweep occurred, ± ATR buffer
+          floored at InpMinRiskAtr × ATR, then widened if the broker stop level demands it
+risk    = |entry − stop|
+TP1     = nearest resting liquidity at least InpMinTp1R (1R) beyond entry
+TP2     = the next liquidity level beyond TP1
+TP3     = the H4 dealing-range extreme when it sits beyond TP2
+fallback= 1.5R / 2.5R / 4R whenever no liquidity is found in range
+```
 
-Evaluated on **closed bars only**, on the scan timeframe.
+The legend on the chart says which was used — `targets liquidity` or `targets R fallback` —
+so you always know whether a target is a real level or a placeholder.
 
-| | Rule |
-| --- | --- |
-| Trend | `EMA(21)` vs `EMA(50)` |
-| **BUY+** continuation | uptrend, bar dipped to/through the fast EMA, closed back above it, bullish body |
-| **SELL+** continuation | downtrend, bar rallied to/through the fast EMA, closed back below it, bearish body |
-| **BUY-** reversal | downtrend, `RSI(14) ≤ 30`, bullish body closing above the previous bar's high |
-| **SELL-** reversal | uptrend, `RSI(14) ≥ 70`, bearish body closing below the previous bar's low |
-
-`+` = continuation, `-` = reversal. The scanner reports the newest hit within `InpMaxAge` bars,
-so `AGE` reads `current`, then `1 bars ago`, `2 bars ago`, …
-
-### Score (0–100), gate `InpMinScore` (default 55)
+## Confluence score (gate: `InpMinScore`, default 60)
 
 | Points | Test |
 | --- | --- |
-| 40 | the setup fired |
-| +20 | higher-timeframe EMA trend agrees with the direction |
-| +10 | signal-bar body ≥ 0.5 × ATR (real momentum, not a doji) |
-| +10 | tick volume ≥ 1.2 × its 20-bar average |
-| +10 | RSI in a healthy zone for the setup type |
-| +10 | no opposing swing level sitting between entry and TP1 |
+| 20 | D1 bias agrees |
+| 20 | H4 bias agrees |
+| 15 | liquidity sweep before the shift |
+| 10 / 5 | CHoCH / BOS |
+| 10 | displacement |
+| 15 / 10 | POI is an OB **and** FVG / only one of them |
+| 10 | entry on the right side of equilibrium |
 
-The HTF defaults to one step above the scan timeframe (M15 → H1) and is configurable.
+The `SMC` column shows which of these actually fired, e.g. `D1 H4 SW CH OB FVG DISC`, so a
+score is never just a number you have to trust.
 
-## Risk model
+`InpBiasMode` controls strictness: **Both** (D1 and H4 must agree — fewest, strongest setups),
+**H4 led** (default: H4 agrees, D1 must not oppose), or **Any**.
 
-```
-entry = close of the signal bar          (or live ask/bid, frozen at signal time)
-stop  = ATR(14) × 1.5   or   swing structure ± buffer   or   whichever is further  (default)
-risk  = |entry − stop|
-TP1   = entry ± risk × 1.5
-TP2   = entry ± risk × 2.5
-TP3   = entry ± risk × 4.0
-```
+## Why the numbers are real
 
-The 1.5R / 2.5R / 4R ladder is the ratio the reference screenshots resolve to (Boom 1000:
-entry 13878.1610, SL 13843.7815 → risk 34.3795 → TP1 13929.7302, TP2 13964.1097,
-TP3 14015.6789). Set `InpSLMode = ATR only` to reproduce those SL numbers exactly; the default
-`HYBRID` also respects swing structure, which moves the stop behind a real level rather than a
-fixed distance.
+| Concern | How it is handled |
+| --- | --- |
+| Symbol list | Live Market Watch (`SymbolsTotal(true)`), re-read every 30 s |
+| Missing history | Row shows `LOADING`, `LOADING D1`, `SHORT HIST` — never a partial calculation |
+| Untradable symbols | `SYMBOL_TRADE_MODE_DISABLED` → `DISABLED`, skipped |
+| Unplaceable prices | Every level rounded to `SYMBOL_TRADE_TICK_SIZE` and widened past `SYMBOL_TRADE_STOPS_LEVEL`; `*` on the SL marks an adjusted level |
+| "Did it work?" | `STATUS` replays the bars after the setup: `WAITING → ACTIVE → TP1/TP2/TP3 HIT`, or `SL HIT`, or `INVALID` |
+| Optimistic accounting | If one bar touches both stop and target, the **stop counts first** — live and in the back-test |
+| "Is this any good here?" | `WR` back-tests this identical rule (same `EvaluateAt` function) over the last `InpStatsBars` bars and shows the measured TP1-before-SL rate **and sample size**: `64% 28`, or `n/a 5` when too thin to mean anything |
+
+**What it is not:** a predictor. `WR 64% 28` means this rule filled and then reached TP1 before
+SL on 18 of 28 past occurrences on that symbol. It is a measured track record of a fixed rule,
+which is a far better basis than an unbacked signal — but past structure is not future
+structure, and synthetic indices in particular change character. Read the percentage together
+with its sample size, and treat a thin sample as no information.
+
+## Dashboard
+
+`SYMBOL · TF · BIAS · SIGNAL · SMC · SCORE · WR · AGE · ENTRY · SL · TP1 · TP2 · TP3 · STATUS · CHART`
+
+`BIAS` reads `D▲ H▲` (green when both agree with the signal, dim when mixed). `OPEN` switches
+the chart to that symbol; ▲/▼ page through; rows sort signals-first so page 1 is the actionable
+page even with 250 symbols loaded. `InpShowBias/Smc/Score/WinRate/Status` switch columns off to
+get back to the original ten-column layout.
+
+On the chart: the POI zone, the entry/SL/TP box, entry line, TP levels, the swept liquidity
+line marked `SWEEP`, a `CHoCH`/`BOS` tag at the shift bar, the signal arrow, and a three-line
+legend with bias, confluence, score, status, R:R and the measured hit rate.
 
 ## Performance
 
-Scanning 250 symbols cannot happen in one tick without freezing the terminal, so:
-
-- symbols are analysed **round-robin, `InpSymbolsPerTick` per second** (default 6), and only
-  when that symbol has printed a new bar — the rest of the time the cached result is displayed;
-- indicators (EMA/ATR/RSI, Wilder smoothing) are computed inline from `CopyRates` rather than
-  through `iMA`/`iATR`/`iRSI` handles, so the scan is not capped by the terminal's per-chart
-  indicator-handle limit — that limit is what makes big scanner dashboards show blank rows;
-- the panel title shows `analysed 128/132` so you can see the warm-up finish instead of
-  guessing whether a blank row means "no signal" or "not scanned yet".
-
-First attach on a fresh terminal takes a little while: MT5 has to download history for every
-symbol before anything can be computed. Rows fill in as that lands.
-
-## Columns
-
-`SYMBOL · TF · SIGNAL · SCORE · WR · AGE · ENTRY · SL · TP1 · TP2 · TP3 · STATUS · CHART`
-
-`SCORE`, `WR` and `STATUS` can be switched off (`InpShowScore`, `InpShowWinRate`,
-`InpShowStatus`) to get back to the original ten-column layout. `OPEN` switches the chart to
-that symbol. ▲/▼ page through the list; rows are sorted signals-first by default, so page 1 is
-the actionable page even with 250 symbols loaded.
+- Symbols are analysed **round-robin, `InpSymbolsPerTick` per second** (default 6), and only
+  when that symbol prints a new bar; otherwise the cached result is shown.
+- Three `CopyRates` per symbol per new bar (entry TF + D1 + H4). ATR and all structure walks
+  are computed inline rather than through `iMA`/`iATR` handles, so the scan is not capped by
+  the terminal's per-chart indicator-handle limit — that limit is what makes large scanner
+  panels show blank rows.
+- The back-test only evaluates bars where a structure break actually occurred, so the window
+  costs far less than a per-bar scan.
+- The title shows `analysed 128/132`, so a blank row is never ambiguous between "no setup" and
+  "not scanned yet". First attach on a fresh terminal takes a while: MT5 must download D1, H4
+  and entry-TF history for every symbol.
 
 ## Key inputs
 
 | Input | Default | Notes |
 | --- | --- | --- |
-| `InpUseMarketWatch` | true | Off = use `InpSymbols` instead |
-| `InpFilterInclude` / `InpFilterExclude` | "" | Substring filters, e.g. include `Index` for Deriv synthetics only |
-| `InpMaxSymbols` | 250 | Hard cap |
-| `InpSymbolsPerTick` | 6 | Raise to warm up faster, lower if the terminal feels heavy |
-| `InpTimeframe` | `PERIOD_CURRENT` | Scan TF |
-| `InpHtfTimeframe` | `PERIOD_CURRENT` | `CURRENT` = one step above the scan TF |
-| `InpMinScore` | 55 | Raise for fewer, higher-quality signals |
-| `InpOnlySignals` | false | Hide symbols with no live signal |
+| `InpBiasTF1` / `InpBiasTF2` | D1 / H4 | A bias TF at or below the entry TF is ignored automatically |
+| `InpBiasMode` | H4 led | Strictness of the bias filter |
+| `InpMinScore` | 60 | Raise for fewer, higher-conviction setups |
+| `InpRequireSweep` | false | Set true to demand a liquidity sweep on every setup |
+| `InpRequireDisp` | true | Reject breaks without displacement |
+| `InpRequirePD` | false | Set true to refuse entries on the wrong side of equilibrium |
+| `InpPoiEntry` | CE | Zone midpoint, or proximal edge |
+| `InpMaxAge` | 25 | How long a setup stays on the board waiting for its fill |
 | `InpStatsBars` | 600 | Back-test window; `0` disables the WR column |
-| `InpAlertPopup` / `InpAlertPush` | false | Fire once when a signal prints on the last closed bar |
 
 ## Limitations
 
-- The on-chart trade box only draws when the chart timeframe matches the scan timeframe. If
-  they differ the box would anchor to the wrong bars, so it is hidden rather than drawn wrong.
-- The panel is pixel-laid-out for `Consolas` 8 / 18 px rows. Changing font size usually needs
-  `InpRowHeight` adjusted too; with all columns on it is about 1150 px wide.
-- Inline EMA/ATR/RSI are seeded from the oldest bar in the copied window rather than from the
-  full symbol history, so values can differ from `iMA`/`iATR`/`iRSI` in the last decimals on the
-  oldest bars of the window. Warm-up is `4 × slow EMA` bars, which puts the difference far
-  outside the range that signals are read from.
-- Back-tested trades that neither hit TP1 nor SL within `InpStatsMaxHold` bars are excluded from
-  `WR` rather than counted as wins.
+- The on-chart drawing only appears when the chart timeframe matches the entry timeframe.
+  Otherwise the box would anchor to the wrong bars, so it is hidden rather than drawn wrong.
+- The panel is pixel-laid-out for `Consolas` 8 / 18 px rows; with every column on it is about
+  1300 px wide. Turn columns off or lower the font for smaller screens.
+- ATR is seeded from the oldest bar in the copied window, so it can differ from `iATR` in the
+  last decimals on the oldest bars. Warm-up is `6 × ATR period` bars, far outside where signals
+  are read.
+- Back-tested setups that never filled, or that were still open after `InpStatsMaxHold` bars,
+  are excluded from `WR` rather than counted either way.
 
 ## Install
 

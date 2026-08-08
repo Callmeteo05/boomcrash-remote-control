@@ -1,26 +1,31 @@
 //+------------------------------------------------------------------+
 //|                                                 MarketFlowV8.mq5 |
-//|              Market Watch signals scanner + trade projection (MT5) |
+//|        Top-down SMC scanner: D1 + H4 bias -> entry timeframe setup |
 //+------------------------------------------------------------------+
-//| Every number this indicator prints is derived from broker data:   |
-//|                                                                   |
-//|  * symbols come from Market Watch, not from a hardcoded list;     |
-//|  * a row only shows a signal once its history is actually loaded  |
-//|    - otherwise it says LOADING or NO DATA;                        |
-//|  * SL/TP are normalised to the symbol tick size and pushed out to |
-//|    respect SYMBOL_TRADE_STOPS_LEVEL, so they are placeable;       |
-//|  * STATUS replays the bars after the signal and reports what the  |
-//|    trade actually did (TP1/TP2/TP3/SL/ACTIVE);                    |
-//|  * WR back-tests the identical rule over the last N bars of that  |
-//|    symbol and shows the measured TP1-before-SL hit rate and the   |
-//|    sample size, or n/a when the sample is too small to mean       |
-//|    anything.                                                      |
+//| Read top-down, exactly the way the setup is meant to be built:     |
+//|                                                                    |
+//|  1. DAILY  bias   - market structure (BOS / CHoCH) on D1           |
+//|  2. H4     bias   - market structure on H4                         |
+//|  3. entry TF      - only setups pointing the same way as the bias  |
+//|       . liquidity sweep of a prior swing (stops taken)             |
+//|       . CHoCH / BOS with displacement (intent)                     |
+//|       . POI to enter from: order block and/or fair value gap       |
+//|       . premium / discount check against the dealing range         |
+//|  4. entry is a LIMIT at the POI, not a market chase - the setup    |
+//|     waits for price to come back to it (WAITING -> ACTIVE)         |
+//|  5. targets are resting liquidity (prior swing highs / lows), with |
+//|     R multiples only as a fallback when no liquidity is in range   |
+//|                                                                    |
+//| Nothing is printed that the data does not support: rows say        |
+//| LOADING until history is really there, levels are tick-normalised  |
+//| and stop-level aware, STATUS replays what the trade actually did,  |
+//| and WR back-tests this identical rule and shows its sample size.   |
 //+------------------------------------------------------------------+
 #property copyright "MarketFlow"
-#property version   "8.10"
-#property description "MarketFlow V8 - scans every Market Watch symbol in the background and"
-#property description "publishes verified signals with entry, SL, TP1/TP2/TP3, live outcome"
-#property description "status and a back-tested hit rate per symbol."
+#property version   "8.20"
+#property description "MarketFlow V8 - D1/H4 bias + SMC (sweep, CHoCH/BOS, order block, FVG,"
+#property description "premium/discount) scanner over the whole Market Watch, with liquidity"
+#property description "based targets, live trade status and a measured hit rate per symbol."
 #property indicator_chart_window
 #property indicator_buffers 0
 #property indicator_plots   0
@@ -28,166 +33,232 @@
 //+------------------------------------------------------------------+
 //| Enums                                                            |
 //+------------------------------------------------------------------+
-enum ENUM_MF_SL
+enum ENUM_MF_BIAS
 {
-   MF_SL_ATR       = 0,  // ATR only
-   MF_SL_STRUCTURE = 1,  // Swing structure only
-   MF_SL_HYBRID    = 2   // Whichever of the two is further (safest)
+   MF_BIAS_BOTH   = 0,  // D1 and H4 must both agree
+   MF_BIAS_H4LED  = 1,  // H4 must agree, D1 must not oppose
+   MF_BIAS_ANY    = 2   // either one agrees
+};
+
+enum ENUM_MF_POI
+{
+   MF_POI_CE      = 0,  // Consequent encroachment (zone midpoint)
+   MF_POI_PROXIMAL= 1   // Proximal edge (first touch)
 };
 
 enum ENUM_MF_SORT
 {
-   MF_SORT_LIST   = 0,   // Market Watch order
-   MF_SORT_FRESH  = 1,   // Signals first, freshest, then score
-   MF_SORT_SCORE  = 2    // Signals first, highest score
-};
-
-enum ENUM_MF_ENTRY
-{
-   MF_ENTRY_CLOSE  = 0,  // Close of the signal bar
-   MF_ENTRY_MARKET = 1   // Live ask/bid captured when the signal prints
+   MF_SORT_LIST   = 0,  // Market Watch order
+   MF_SORT_FRESH  = 1,  // Signals first, freshest, then score
+   MF_SORT_SCORE  = 2   // Signals first, highest score
 };
 
 //+------------------------------------------------------------------+
 //| Inputs                                                           |
 //+------------------------------------------------------------------+
 input group "=== Universe ==="
-input bool              InpUseMarketWatch  = true;   // Scan every symbol in Market Watch
-input string            InpSymbols         = "";     // Manual list (used when Market Watch is off)
-input string            InpFilterInclude   = "";     // Only symbols containing this text ("" = all)
-input string            InpFilterExclude   = "";     // Skip symbols containing this text
-input bool              InpSkipUntradable  = true;   // Skip symbols with trading disabled
-input int               InpMaxSymbols      = 250;    // Hard cap on scanned symbols
-input int               InpSymbolsPerTick  = 6;      // Symbols analysed per second (background load)
+input bool            InpUseMarketWatch = true;  // Scan every symbol in Market Watch
+input string          InpSymbols        = "";    // Manual list (used when Market Watch is off)
+input string          InpFilterInclude  = "";    // Only symbols containing this text
+input string          InpFilterExclude  = "";    // Skip symbols containing this text
+input bool            InpSkipUntradable = true;  // Skip symbols with trading disabled
+input int             InpMaxSymbols     = 250;   // Hard cap on scanned symbols
+input int             InpSymbolsPerTick = 6;     // Symbols analysed per second
 
-input group "=== Scan ==="
-input ENUM_TIMEFRAMES   InpTimeframe       = PERIOD_CURRENT; // Scan timeframe
-input ENUM_TIMEFRAMES   InpHtfTimeframe    = PERIOD_CURRENT; // Confirmation timeframe (CURRENT = one step up)
-input int               InpMaxAge          = 12;     // Keep a signal on the board for N bars
-input int               InpMinScore        = 55;     // Minimum score to publish a signal (0-100)
-input bool              InpOnlySignals     = false;  // Show only symbols that currently have a signal
-input ENUM_MF_SORT      InpSortMode        = MF_SORT_FRESH; // Row order
+input group "=== Timeframes ==="
+input ENUM_TIMEFRAMES InpTimeframe      = PERIOD_CURRENT; // Entry timeframe
+input ENUM_TIMEFRAMES InpBiasTF1        = PERIOD_D1;      // Primary bias timeframe
+input ENUM_TIMEFRAMES InpBiasTF2        = PERIOD_H4;      // Secondary bias timeframe
+input ENUM_MF_BIAS    InpBiasMode       = MF_BIAS_H4LED;  // How strict the bias must be
 
-input group "=== Signal engine ==="
-input int               InpEmaFast         = 21;     // Fast EMA
-input int               InpEmaSlow         = 50;     // Slow EMA
-input int               InpAtrPeriod       = 14;     // ATR period
-input int               InpRsiPeriod       = 14;     // RSI period
-input double            InpRsiOverbought   = 70.0;   // RSI overbought (reversal sell)
-input double            InpRsiOversold     = 30.0;   // RSI oversold (reversal buy)
-input int               InpSwingLookback   = 12;     // Swing lookback for structure (bars)
+input group "=== Market structure (SMC) ==="
+input int             InpSwingStrength  = 2;     // Fractal strength (bars each side)
+input int             InpSweepWindow    = 6;     // Sweep must be within N bars of the shift
+input int             InpSweepLookback  = 20;    // Liquidity pool lookback for the sweep
+input bool            InpRequireSweep   = false; // Reject setups with no liquidity sweep
+input double          InpDispAtrMult    = 1.0;   // Displacement body >= ATR x
+input bool            InpRequireDisp    = true;  // Reject setups without displacement
+input int             InpPoiLookback    = 10;    // Bars back to find the OB / FVG
+input ENUM_MF_POI     InpPoiEntry       = MF_POI_CE; // Where in the zone to enter
+input bool            InpRequirePD      = false; // Reject entries on the wrong side of equilibrium
 
-input group "=== Risk model ==="
-input ENUM_MF_ENTRY     InpEntryMode       = MF_ENTRY_CLOSE; // Entry price source
-input ENUM_MF_SL        InpSLMode          = MF_SL_HYBRID;   // Stop loss placement
-input double            InpSLAtrMult       = 1.5;    // ATR multiple for the stop
-input double            InpTP1R            = 1.5;    // TP1 (R multiple)
-input double            InpTP2R            = 2.5;    // TP2 (R multiple)
-input double            InpTP3R            = 4.0;    // TP3 (R multiple)
+input group "=== Signal selection ==="
+input int             InpMaxAge         = 25;    // Keep a setup on the board for N bars
+input int             InpMinScore       = 60;    // Minimum confluence score (0-100)
+input bool            InpOnlySignals    = false; // Show only symbols with a live setup
+input ENUM_MF_SORT    InpSortMode       = MF_SORT_FRESH; // Row order
+
+input group "=== Risk and targets ==="
+input int             InpAtrPeriod      = 14;    // ATR period
+input double          InpMinRiskAtr     = 0.5;   // Minimum stop distance in ATR
+input double          InpSlBufferAtr    = 0.15;  // Extra stop buffer in ATR
+input double          InpMinTp1R        = 1.0;   // TP1 must be at least this many R away
+input int             InpLiquidityLook  = 150;   // Bars searched for target liquidity
+input double          InpTP1R           = 1.5;   // TP1 fallback (R multiple)
+input double          InpTP2R           = 2.5;   // TP2 fallback (R multiple)
+input double          InpTP3R           = 4.0;   // TP3 fallback (R multiple)
 
 input group "=== Measured hit rate ==="
-input int               InpStatsBars       = 600;    // Back-test window in bars (0 = off)
-input int               InpStatsMaxHold    = 60;     // Bars a back-tested trade may stay open
-input int               InpStatsMinSamples = 8;      // Below this sample size WR shows n/a
+input int             InpStatsBars      = 600;   // Back-test window in bars (0 = off)
+input int             InpStatsMaxHold   = 60;    // Bars a back-tested setup may stay open
+input int             InpStatsMinSamples= 8;     // Below this sample size WR shows n/a
 
 input group "=== Panel ==="
-input int               InpPanelX          = 6;      // Panel X (px from left)
-input int               InpPanelY          = 6;      // Panel Y (px from bottom)
-input int               InpRowsVisible     = 9;      // Visible rows
-input int               InpRowHeight       = 18;     // Row height (px)
-input string            InpFont            = "Consolas"; // Font
-input int               InpFontSize        = 8;      // Font size
-input bool              InpShowScore       = true;   // Show the SCORE column
-input bool              InpShowWinRate     = true;   // Show the WR column
-input bool              InpShowStatus      = true;   // Show the STATUS column
+input int             InpPanelX         = 6;     // Panel X (px from left)
+input int             InpPanelY         = 6;     // Panel Y (px from bottom)
+input int             InpRowsVisible    = 9;     // Visible rows
+input int             InpRowHeight      = 18;    // Row height (px)
+input string          InpFont           = "Consolas"; // Font
+input int             InpFontSize       = 8;     // Font size
+input bool            InpShowBias       = true;  // Show the BIAS column
+input bool            InpShowSmc        = true;  // Show the SMC confluence column
+input bool            InpShowScore      = true;  // Show the SCORE column
+input bool            InpShowWinRate    = true;  // Show the WR column
+input bool            InpShowStatus     = true;  // Show the STATUS column
 
-input group "=== Chart trade ==="
-input bool              InpShowChartTrade  = true;   // Draw the chart symbol's trade
-input bool              InpShowWatermark   = true;   // Draw the symbol/timeframe watermark
-input int               InpBoxExtendBars   = 6;      // Extend the trade box N bars past the last bar
+input group "=== Chart drawing ==="
+input bool            InpShowChartTrade = true;  // Draw the chart symbol's setup
+input bool            InpShowZone       = true;  // Draw the POI (order block / FVG) zone
+input bool            InpShowWatermark  = true;  // Draw the symbol/timeframe watermark
+input int             InpBoxExtendBars  = 6;     // Extend the trade box N bars past the last bar
 
 input group "=== Colors ==="
-input color             InpClrPanelBg      = C'10,12,26';    // Panel background
-input color             InpClrPanelBorder  = C'60,50,120';   // Panel border
-input color             InpClrRowA         = C'16,18,38';    // Row background A
-input color             InpClrRowB         = C'22,24,48';    // Row background B
-input color             InpClrTitle        = C'190,180,255'; // Title text
-input color             InpClrHeader       = C'130,120,190'; // Column header text
-input color             InpClrText         = C'205,205,220'; // Row text
-input color             InpClrDim          = C'110,110,130'; // Dimmed text
-input color             InpClrBuy          = C'0,210,140';   // Buy color
-input color             InpClrSell         = C'235,70,110';  // Sell color
-input color             InpClrEntryLine    = C'160,45,60';   // Entry line color
+input color           InpClrPanelBg     = C'10,12,26';    // Panel background
+input color           InpClrPanelBorder = C'60,50,120';   // Panel border
+input color           InpClrRowA        = C'16,18,38';    // Row background A
+input color           InpClrRowB        = C'22,24,48';    // Row background B
+input color           InpClrTitle       = C'190,180,255'; // Title text
+input color           InpClrHeader      = C'130,120,190'; // Column header text
+input color           InpClrText        = C'205,205,220'; // Row text
+input color           InpClrDim         = C'110,110,130'; // Dimmed text
+input color           InpClrBuy         = C'0,210,140';   // Buy color
+input color           InpClrSell        = C'235,70,110';  // Sell color
+input color           InpClrEntryLine   = C'160,45,60';   // Entry line color
 
 input group "=== Alerts ==="
-input bool              InpAlertPopup      = false;  // Popup alert on a new signal
-input bool              InpAlertPush       = false;  // Push notification on a new signal
+input bool            InpAlertPopup     = false; // Popup alert on a new setup
+input bool            InpAlertPush      = false; // Push notification on a new setup
+
+//+------------------------------------------------------------------+
+//| Status codes                                                     |
+//+------------------------------------------------------------------+
+#define ST_INVALID -2   // stop taken out before price ever reached the entry
+#define ST_SL      -1
+#define ST_WAIT     0   // limit not filled yet
+#define ST_ACTIVE   1
+#define ST_TP1      2
+#define ST_TP2      3
+#define ST_TP3      4
 
 //+------------------------------------------------------------------+
 //| Types                                                            |
 //+------------------------------------------------------------------+
-#define ST_SL      -1
-#define ST_ACTIVE   0
-#define ST_TP1      1
-#define ST_TP2      2
-#define ST_TP3      3
+struct MFPoi
+{
+   bool     valid;
+   double   hi;
+   double   lo;
+   bool     isOB;
+   bool     isFVG;
+   datetime time;
+};
 
 struct MFSignal
 {
    bool     valid;
-   int      dir;           // +1 buy, -1 sell
-   bool     continuation;  // true continuation, false reversal
-   int      barIndex;      // shift of the signal bar (1 = last closed bar)
+   int      dir;            // +1 buy, -1 sell
+   bool     choch;          // true CHoCH (reversal), false BOS (continuation)
+   int      barIndex;       // shift of the structure-shift bar
    datetime time;
    double   entry;
    double   sl;
    double   tp1;
    double   tp2;
    double   tp3;
-   int      score;         // 0..100
-   bool     adjusted;      // levels widened to respect the broker stops level
-   int      status;        // ST_*
+   double   zoneHi;
+   double   zoneLo;
+   double   sweepPrice;     // 0 when no sweep
+   int      biasD1;
+   int      biasH4;
+   bool     hasOB;
+   bool     hasFVG;
+   bool     hasSweep;
+   bool     pdOk;
+   bool     displaced;
+   bool     liquidityTp;    // targets came from real liquidity, not R fallback
+   int      score;
+   bool     adjusted;       // levels widened for the broker stop level
+   int      status;
+   string   tags;
 };
 
 struct MFSymbol
 {
    string   name;
-   bool     ok;            // resolved, selected, tradable
-   bool     analysed;      // at least one completed analysis
+   bool     ok;
+   bool     analysed;
    int      digits;
    double   point;
    double   tickSize;
-   double   stopDist;      // SYMBOL_TRADE_STOPS_LEVEL in price units
-   datetime lastBar;       // bar 0 time at the last full analysis
-   datetime frozenSigTime; // signal the frozen market entry belongs to
-   double   frozenEntry;
+   double   stopDist;
+   datetime lastBar;
    int      statWins;
    int      statLosses;
    datetime lastAlert;
-   string   note;          // LOADING / NO DATA / DISABLED, "" when analysed
+   string   note;
    MFSignal sig;
+};
+
+//--- working set for one symbol; holds dynamic arrays so it is only ever
+//--- passed by reference, never copied
+struct MFCtx
+{
+   int      n;
+   MqlRates r[];
+   double   atr[];
+   int      bias[];
+   int      evDir[];
+   int      evChoch[];
+   double   rHigh[];
+   double   rLow[];
+
+   int      n1;             // bias timeframe 1 (daily by default)
+   MqlRates r1[];
+   int      bias1[];
+   double   rHigh1[];
+   double   rLow1[];
+   int      idx1[];
+
+   int      n2;             // bias timeframe 2 (H4 by default)
+   MqlRates r2[];
+   int      bias2[];
+   double   rHigh2[];
+   double   rLow2[];
+   int      idx2[];
 };
 
 //+------------------------------------------------------------------+
 //| Column layout                                                    |
 //+------------------------------------------------------------------+
-#define NCOLS 13
+#define NCOLS 15
 #define C_SYMBOL 0
 #define C_TF     1
-#define C_SIGNAL 2
-#define C_SCORE  3
-#define C_WR     4
-#define C_AGE    5
-#define C_ENTRY  6
-#define C_SL     7
-#define C_TP1    8
-#define C_TP2    9
-#define C_TP3    10
-#define C_STATUS 11
-#define C_CHART  12
+#define C_BIAS   2
+#define C_SIGNAL 3
+#define C_SMC    4
+#define C_SCORE  5
+#define C_WR     6
+#define C_AGE    7
+#define C_ENTRY  8
+#define C_SL     9
+#define C_TP1    10
+#define C_TP2    11
+#define C_TP3    12
+#define C_STATUS 13
+#define C_CHART  14
 
-const string g_colTitle[NCOLS] = {"SYMBOL","TF","SIGNAL","SCORE","WR","AGE","ENTRY","SL","TP1","TP2","TP3","STATUS","CHART"};
-const int    g_colWidth[NCOLS] = { 190,    44,  86,      52,     76,  92,   94,     94,  94,   94,   94,   76,      56 };
+const string g_colTitle[NCOLS] = {"SYMBOL","TF","BIAS","SIGNAL","SMC","SCORE","WR","AGE","ENTRY","SL","TP1","TP2","TP3","STATUS","CHART"};
+const int    g_colWidth[NCOLS] = { 176,    40,  86,    84,      132,  50,     72,  88,   90,     90,  90,   90,   90,   76,      54 };
 
 bool  g_colOn[NCOLS];
 int   g_colX[NCOLS];
@@ -196,17 +267,22 @@ int   g_panelW = 900;
 //+------------------------------------------------------------------+
 //| Globals                                                          |
 //+------------------------------------------------------------------+
-const string      g_prefix   = "MFV8_";
-const int         g_titleH   = 24;
-const int         g_headerH  = 20;
+const string      g_prefix  = "MFV8_";
+const int         g_titleH  = 24;
+const int         g_headerH = 20;
 
 MFSymbol          g_syms[];
 int               g_order[];
-int               g_cursor   = 0;      // round-robin scan cursor
-int               g_scroll   = 0;
-ENUM_TIMEFRAMES   g_tf       = PERIOD_M15;
-ENUM_TIMEFRAMES   g_htf      = PERIOD_H1;
-string            g_tfText   = "";
+int               g_cursor  = 0;
+int               g_scroll  = 0;
+ENUM_TIMEFRAMES   g_tf      = PERIOD_M15;
+ENUM_TIMEFRAMES   g_bias1   = PERIOD_D1;
+ENUM_TIMEFRAMES   g_bias2   = PERIOD_H4;
+bool              g_use1    = true;
+bool              g_use2    = true;
+string            g_tfText  = "";
+string            g_b1Text  = "D1";
+string            g_b2Text  = "H4";
 datetime          g_lastUniverse = 0;
 
 //+------------------------------------------------------------------+
@@ -219,32 +295,11 @@ string TfToText(const ENUM_TIMEFRAMES tf)
    return (p >= 0 ? StringSubstr(s, p + 1) : s);
 }
 
-ENUM_TIMEFRAMES NextTimeframeUp(const ENUM_TIMEFRAMES tf)
+string ArrowFor(const int dir)
 {
-   switch(tf)
-   {
-      case PERIOD_M1:  return PERIOD_M5;
-      case PERIOD_M2:  return PERIOD_M10;
-      case PERIOD_M3:  return PERIOD_M15;
-      case PERIOD_M4:  return PERIOD_M20;
-      case PERIOD_M5:  return PERIOD_M30;
-      case PERIOD_M6:  return PERIOD_M30;
-      case PERIOD_M10: return PERIOD_H1;
-      case PERIOD_M12: return PERIOD_H1;
-      case PERIOD_M15: return PERIOD_H1;
-      case PERIOD_M20: return PERIOD_H2;
-      case PERIOD_M30: return PERIOD_H2;
-      case PERIOD_H1:  return PERIOD_H4;
-      case PERIOD_H2:  return PERIOD_H8;
-      case PERIOD_H3:  return PERIOD_H12;
-      case PERIOD_H4:  return PERIOD_D1;
-      case PERIOD_H6:  return PERIOD_D1;
-      case PERIOD_H8:  return PERIOD_D1;
-      case PERIOD_H12: return PERIOD_D1;
-      case PERIOD_D1:  return PERIOD_W1;
-      case PERIOD_W1:  return PERIOD_MN1;
-      default:         return PERIOD_MN1;
-   }
+   if(dir > 0) return ShortToString(0x25B2);
+   if(dir < 0) return ShortToString(0x25BC);
+   return "-";
 }
 
 int PanelHeight()
@@ -339,7 +394,7 @@ void SetButton(const string name, const int x, const int y, const int w, const i
 }
 
 //+------------------------------------------------------------------+
-//| Universe - Market Watch enumeration                              |
+//| Universe                                                         |
 //+------------------------------------------------------------------+
 bool PassesFilter(const string sym)
 {
@@ -356,7 +411,7 @@ void CollectNames(string &names[])
 
    if(InpUseMarketWatch)
    {
-      int total = SymbolsTotal(true);          // true = Market Watch only
+      int total = SymbolsTotal(true);
       for(int i = 0; i < total; i++)
       {
          string s = SymbolName(i, true);
@@ -389,18 +444,15 @@ void CollectNames(string &names[])
       ArrayResize(names, 1);
       names[0] = _Symbol;
    }
-
    if(InpMaxSymbols > 0 && ArraySize(names) > InpMaxSymbols)
       ArrayResize(names, InpMaxSymbols);
 }
 
-//--- returns true when the universe changed and rows were rebuilt
-bool BuildUniverse()
+void BuildUniverse()
 {
    string names[];
    CollectNames(names);
 
-   //--- unchanged?
    if(ArraySize(names) == ArraySize(g_syms))
    {
       bool same = true;
@@ -411,7 +463,7 @@ bool BuildUniverse()
             break;
          }
       if(same)
-         return false;
+         return;
    }
 
    MFSymbol old[];
@@ -423,27 +475,23 @@ bool BuildUniverse()
    for(int i = 0; i < ArraySize(names); i++)
    {
       MFSymbol r;
-      r.name          = names[i];
-      r.analysed      = false;
-      r.lastBar       = 0;
-      r.frozenSigTime = 0;
-      r.frozenEntry   = 0.0;
-      r.statWins      = 0;
-      r.statLosses    = 0;
-      r.lastAlert     = 0;
-      r.note          = "LOADING";
-      r.sig.valid     = false;
-      r.sig.status    = ST_ACTIVE;
+      r.name       = names[i];
+      r.analysed   = false;
+      r.lastBar    = 0;
+      r.statWins   = 0;
+      r.statLosses = 0;
+      r.lastAlert  = 0;
+      r.note       = "LOADING";
+      r.sig.valid  = false;
+      r.sig.status = ST_WAIT;
+      r.sig.tags   = "";
 
       r.ok = SymbolSelect(names[i], true);
-      if(r.ok && InpSkipUntradable)
+      if(r.ok && InpSkipUntradable &&
+         SymbolInfoInteger(names[i], SYMBOL_TRADE_MODE) == SYMBOL_TRADE_MODE_DISABLED)
       {
-         long mode = SymbolInfoInteger(names[i], SYMBOL_TRADE_MODE);
-         if(mode == SYMBOL_TRADE_MODE_DISABLED)
-         {
-            r.ok   = false;
-            r.note = "DISABLED";
-         }
+         r.ok   = false;
+         r.note = "DISABLED";
       }
 
       r.digits   = r.ok ? (int)SymbolInfoInteger(names[i], SYMBOL_DIGITS) : _Digits;
@@ -453,19 +501,16 @@ bool BuildUniverse()
          r.tickSize = r.point;
       r.stopDist = r.ok ? (double)SymbolInfoInteger(names[i], SYMBOL_TRADE_STOPS_LEVEL) * r.point : 0.0;
 
-      //--- carry over anything we already computed for this symbol
       for(int j = 0; j < ArraySize(old); j++)
          if(old[j].name == r.name && old[j].analysed)
          {
-            r.analysed      = old[j].analysed;
-            r.lastBar       = old[j].lastBar;
-            r.frozenSigTime = old[j].frozenSigTime;
-            r.frozenEntry   = old[j].frozenEntry;
-            r.statWins      = old[j].statWins;
-            r.statLosses    = old[j].statLosses;
-            r.lastAlert     = old[j].lastAlert;
-            r.note          = old[j].note;
-            r.sig           = old[j].sig;
+            r.analysed   = old[j].analysed;
+            r.lastBar    = old[j].lastBar;
+            r.statWins   = old[j].statWins;
+            r.statLosses = old[j].statLosses;
+            r.lastAlert  = old[j].lastAlert;
+            r.note       = old[j].note;
+            r.sig        = old[j].sig;
             break;
          }
 
@@ -474,25 +519,13 @@ bool BuildUniverse()
 
    g_cursor = 0;
    g_scroll = 0;
-   return true;
 }
 
 //+------------------------------------------------------------------+
-//| Indicator math - computed inline so the scanner is not bound by   |
-//| the terminal's per-chart indicator handle limit                   |
-//| All arrays are series ordered: index 0 = newest bar               |
+//| ATR (Wilder), computed inline so the scanner is not limited by    |
+//| the terminal's per-chart indicator handle count                   |
+//| Arrays are series ordered: index 0 = newest bar                   |
 //+------------------------------------------------------------------+
-void CalcEMA(const double &src[], const int n, const int period, double &out[])
-{
-   ArrayResize(out, n);
-   if(n <= 0)
-      return;
-   double k = 2.0 / (period + 1.0);
-   out[n - 1] = src[n - 1];
-   for(int i = n - 2; i >= 0; i--)
-      out[i] = src[i] * k + out[i + 1] * (1.0 - k);
-}
-
 void CalcATR(const MqlRates &r[], const int n, const int period, double &out[])
 {
    ArrayResize(out, n);
@@ -509,71 +542,249 @@ void CalcATR(const MqlRates &r[], const int n, const int period, double &out[])
    }
 }
 
-void CalcRSI(const double &close[], const int n, const int period, double &out[])
+//+------------------------------------------------------------------+
+//| Fractals                                                         |
+//+------------------------------------------------------------------+
+bool IsFractalHigh(const MqlRates &r[], const int n, const int j, const int s)
 {
-   ArrayResize(out, n);
+   if(j - s < 0 || j + s >= n)
+      return false;
+   for(int k = 1; k <= s; k++)
+      if(r[j].high <= r[j - k].high || r[j].high <= r[j + k].high)
+         return false;
+   return true;
+}
+
+bool IsFractalLow(const MqlRates &r[], const int n, const int j, const int s)
+{
+   if(j - s < 0 || j + s >= n)
+      return false;
+   for(int k = 1; k <= s; k++)
+      if(r[j].low >= r[j - k].low || r[j].low >= r[j + k].low)
+         return false;
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Market structure walk                                             |
+//|                                                                   |
+//| Produces, for every bar, the structural state AS OF THAT BAR:      |
+//|   bias[i]    +1 bullish / -1 bearish / 0 undecided                 |
+//|   evDir[i]   +1 / -1 when a break happened on that bar             |
+//|   evChoch[i] 1 when that break flipped the state (CHoCH), else 0   |
+//|   rHigh/rLow the current dealing range                             |
+//|                                                                   |
+//| A fractal at bar j is only used once it is confirmed, i.e. once s  |
+//| newer bars exist - so nothing here can see the future.             |
+//+------------------------------------------------------------------+
+void StructureSeries(const MqlRates &r[], const int n, const int s,
+                     int &bias[], int &evDir[], int &evChoch[],
+                     double &rHigh[], double &rLow[])
+{
+   ArrayResize(bias,    n);
+   ArrayResize(evDir,   n);
+   ArrayResize(evChoch, n);
+   ArrayResize(rHigh,   n);
+   ArrayResize(rLow,    n);
    if(n <= 0)
       return;
-   double p  = (double)period;
-   double ag = 0.0, al = 0.0;
-   out[n - 1] = 50.0;
-   for(int i = n - 2; i >= 0; i--)
+
+   double lastH = 0.0, lastL = 0.0;
+   bool   haveH = false, haveL = false;
+   int    state = 0;
+   double rh = r[n - 1].high, rl = r[n - 1].low;
+
+   for(int i = n - 1; i >= 0; i--)
    {
-      double d = close[i] - close[i + 1];
-      ag = (ag * (p - 1.0) + (d > 0.0 ?  d : 0.0)) / p;
-      al = (al * (p - 1.0) + (d < 0.0 ? -d : 0.0)) / p;
-      out[i] = (al <= 0.0) ? 100.0 : 100.0 - 100.0 / (1.0 + ag / al);
+      int j = i + s;                      // fractal candidate confirmed by bar i
+      if(j + s < n)
+      {
+         if(IsFractalHigh(r, n, j, s)) { lastH = r[j].high; haveH = true; }
+         if(IsFractalLow (r, n, j, s)) { lastL = r[j].low;  haveL = true; }
+      }
+
+      int ev = 0, ch = 0;
+
+      if(haveH && r[i].close > lastH)
+      {
+         ch    = (state == -1 ? 1 : 0);
+         state = +1;
+         ev    = +1;
+         if(haveL) rl = lastL;
+         rh    = r[i].high;
+         haveH = false;
+      }
+      else if(haveL && r[i].close < lastL)
+      {
+         ch    = (state == +1 ? 1 : 0);
+         state = -1;
+         ev    = -1;
+         if(haveH) rh = lastH;
+         rl    = r[i].low;
+         haveL = false;
+      }
+      else
+      {
+         if(state > 0) rh = MathMax(rh, r[i].high);
+         if(state < 0) rl = MathMin(rl, r[i].low);
+      }
+
+      bias[i]    = state;
+      evDir[i]   = ev;
+      evChoch[i] = ch;
+      rHigh[i]   = rh;
+      rLow[i]    = rl;
+   }
+}
+
+//--- map every entry-TF bar to the last CLOSED bar of a higher timeframe
+void MapHigher(const MqlRates &lo[], const int n, const MqlRates &hi[], const int m, int &idx[])
+{
+   ArrayResize(idx, n);
+   if(m <= 0)
+   {
+      ArrayInitialize(idx, 0);
+      return;
+   }
+   int j = m - 1;
+   for(int i = n - 1; i >= 0; i--)
+   {
+      while(j > 0 && hi[j - 1].time <= lo[i].time)
+         j--;
+      idx[i] = (int)MathMin(j + 1, m - 1);
    }
 }
 
 //+------------------------------------------------------------------+
-//| Structure helpers                                                |
+//| SMC building blocks                                              |
 //+------------------------------------------------------------------+
-double SwingLow(const MqlRates &r[], const int n, const int i, const int look)
+//--- did bar k raid the liquidity resting beyond the last `look` bars
+//--- and close back inside? (stop hunt / sweep)
+bool SweepAt(const MqlRates &r[], const int n, const int k, const int dir, const int look)
 {
-   double v = r[i].low;
-   for(int k = i; k < MathMin(n, i + look); k++)
-      v = MathMin(v, r[k].low);
-   return v;
-}
-
-double SwingHigh(const MqlRates &r[], const int n, const int i, const int look)
-{
-   double v = r[i].high;
-   for(int k = i; k < MathMin(n, i + look); k++)
-      v = MathMax(v, r[k].high);
-   return v;
-}
-
-bool IsSwingHigh(const MqlRates &r[], const int n, const int k)
-{
-   if(k < 2 || k > n - 3)
+   int last = MathMin(n - 1, k + look);
+   if(last <= k)
       return false;
-   return (r[k].high > r[k - 1].high && r[k].high > r[k - 2].high &&
-           r[k].high > r[k + 1].high && r[k].high > r[k + 2].high);
+
+   if(dir > 0)                                   // bullish: sell-side liquidity taken
+   {
+      double pool = r[k + 1].low;
+      for(int q = k + 1; q <= last; q++)
+         pool = MathMin(pool, r[q].low);
+      return (r[k].low < pool && r[k].close > pool);
+   }
+
+   double pool = r[k + 1].high;                  // bearish: buy-side liquidity taken
+   for(int q = k + 1; q <= last; q++)
+      pool = MathMax(pool, r[q].high);
+   return (r[k].high > pool && r[k].close < pool);
 }
 
-bool IsSwingLow(const MqlRates &r[], const int n, const int k)
+//--- order block + fair value gap left behind by the leg that broke structure
+MFPoi FindPoi(const MqlRates &r[], const int n, const int i, const int dir)
 {
-   if(k < 2 || k > n - 3)
-      return false;
-   return (r[k].low < r[k - 1].low && r[k].low < r[k - 2].low &&
-           r[k].low < r[k + 1].low && r[k].low < r[k + 2].low);
-}
+   MFPoi p;
+   p.valid = false;
+   p.isOB  = false;
+   p.isFVG = false;
+   p.hi    = 0.0;
+   p.lo    = 0.0;
+   p.time  = 0;
 
-//--- is the path from entry to TP1 free of an opposing swing level?
-bool PathIsClear(const MqlRates &r[], const int n, const int i, const int dir,
-                 const double entry, const double tp1)
-{
-   int last = MathMin(n - 3, i + 50);
+   int last = MathMin(n - 2, i + InpPoiLookback);
+
+   //--- order block: last opposing candle before the impulse
+   double obHi = 0.0, obLo = 0.0;
+   datetime obT = 0;
+   for(int k = i; k <= last; k++)
+   {
+      bool opposing = (dir > 0 ? r[k].close < r[k].open : r[k].close > r[k].open);
+      if(opposing)
+      {
+         obHi = r[k].high;
+         obLo = r[k].low;
+         obT  = r[k].time;
+         break;
+      }
+   }
+
+   //--- fair value gap inside the impulse (three-candle imbalance)
+   double fvHi = 0.0, fvLo = 0.0;
+   datetime fvT = 0;
    for(int k = i + 1; k <= last; k++)
    {
-      if(dir > 0 && IsSwingHigh(r, n, k) && r[k].high > entry && r[k].high < tp1)
-         return false;
-      if(dir < 0 && IsSwingLow(r, n, k) && r[k].low < entry && r[k].low > tp1)
-         return false;
+      if(k - 1 < 0 || k + 1 >= n)
+         continue;
+      if(dir > 0 && r[k - 1].low > r[k + 1].high)
+      {
+         fvLo = r[k + 1].high;
+         fvHi = r[k - 1].low;
+         fvT  = r[k].time;
+         break;
+      }
+      if(dir < 0 && r[k - 1].high < r[k + 1].low)
+      {
+         fvLo = r[k - 1].high;
+         fvHi = r[k + 1].low;
+         fvT  = r[k].time;
+         break;
+      }
    }
-   return true;
+
+   bool hasOB  = (obHi > obLo);
+   bool hasFVG = (fvHi > fvLo);
+
+   if(hasOB && hasFVG)
+   {
+      //--- prefer the overlap of the two: the strongest kind of POI
+      double lo = MathMax(obLo, fvLo);
+      double hi = MathMin(obHi, fvHi);
+      if(hi > lo)
+      {
+         p.valid = true; p.isOB = true; p.isFVG = true;
+         p.lo = lo; p.hi = hi; p.time = (obT > fvT ? obT : fvT);
+         return p;
+      }
+      p.valid = true; p.isOB = true; p.isFVG = true;      // both exist but disjoint
+      p.lo = obLo; p.hi = obHi; p.time = obT;
+      return p;
+   }
+   if(hasFVG)
+   {
+      p.valid = true; p.isFVG = true;
+      p.lo = fvLo; p.hi = fvHi; p.time = fvT;
+      return p;
+   }
+   if(hasOB)
+   {
+      p.valid = true; p.isOB = true;
+      p.lo = obLo; p.hi = obHi; p.time = obT;
+      return p;
+   }
+   return p;
+}
+
+//--- nearest resting liquidity (confirmed swing) beyond a price
+double LiquidityAbove(const MqlRates &r[], const int n, const int i, const int s, const double from)
+{
+   double best = 0.0;
+   int last = MathMin(n - s - 1, i + InpLiquidityLook);
+   for(int k = i + s; k <= last; k++)
+      if(IsFractalHigh(r, n, k, s) && r[k].high > from)
+         if(best == 0.0 || r[k].high < best)
+            best = r[k].high;
+   return best;
+}
+
+double LiquidityBelow(const MqlRates &r[], const int n, const int i, const int s, const double from)
+{
+   double best = 0.0;
+   int last = MathMin(n - s - 1, i + InpLiquidityLook);
+   for(int k = i + s; k <= last; k++)
+      if(IsFractalLow(r, n, k, s) && r[k].low < from)
+         if(best == 0.0 || r[k].low > best)
+            best = r[k].low;
+   return best;
 }
 
 //+------------------------------------------------------------------+
@@ -588,210 +799,309 @@ double NormPrice(const MFSymbol &s, const double p)
 }
 
 //+------------------------------------------------------------------+
-//| Setup detection - one place, used by both the live scan and the   |
-//| back-test, so the published rule and the measured rule are the    |
-//| same rule                                                         |
+//| Full evaluation at bar i - the single source of truth, called by  |
+//| the live scan and by the back-test alike                          |
 //+------------------------------------------------------------------+
-bool DetectSetup(const MqlRates &r[], const double &emaF[], const double &emaS[],
-                 const double &rsi[], const int n, const int i,
-                 int &dir, bool &cont)
-{
-   if(i < 0 || i + 1 >= n)
-      return false;
-
-   bool up   = (emaF[i] > emaS[i]);
-   bool down = (emaF[i] < emaS[i]);
-
-   dir  = 0;
-   cont = false;
-
-   if(up && rsi[i] >= InpRsiOverbought &&
-      r[i].close < r[i].open && r[i].close < r[i + 1].low)
-   {
-      dir = -1; cont = false;                       // reversal sell
-   }
-   else if(down && rsi[i] <= InpRsiOversold &&
-           r[i].close > r[i].open && r[i].close > r[i + 1].high)
-   {
-      dir = +1; cont = false;                       // reversal buy
-   }
-   else if(up && r[i].low <= emaF[i] &&
-           r[i].close > emaF[i] && r[i].close > r[i].open)
-   {
-      dir = +1; cont = true;                        // continuation buy
-   }
-   else if(down && r[i].high >= emaF[i] &&
-           r[i].close < emaF[i] && r[i].close < r[i].open)
-   {
-      dir = -1; cont = true;                        // continuation sell
-   }
-
-   return (dir != 0);
-}
-
-//+------------------------------------------------------------------+
-//| Full evaluation at bar i: levels + score                          |
-//+------------------------------------------------------------------+
-bool EvaluateAt(const MFSymbol &s, const MqlRates &r[], const int n, const int i,
-                const double &emaF[], const double &emaS[],
-                const double &rsi[], const double &atr[],
-                const int &htfIdx[], const double &htfEmaF[], const double &htfEmaS[],
-                const int m, MFSignal &out)
+bool EvaluateAt(const MFSymbol &s, MFCtx &c, const int i, MFSignal &out)
 {
    out.valid = false;
 
-   int  dir  = 0;
-   bool cont = false;
-   if(!DetectSetup(r, emaF, emaS, rsi, n, i, dir, cont))
-      return false;
-   if(atr[i] <= 0.0)
+   int n = c.n;
+   if(i < 1 || i + 2 >= n)
       return false;
 
-   //--- entry
-   double entry = r[i].close;
+   //--- 1. a structure shift has to happen on this bar
+   int dir = c.evDir[i];
+   if(dir == 0)
+      return false;
+   if(c.atr[i] <= 0.0)
+      return false;
 
-   //--- stop: ATR distance, structure distance, or the wider of the two
-   double atrStop = atr[i] * InpSLAtrMult;
-   double slPrice = 0.0;
-   double buffer  = atr[i] * 0.15;
+   bool choch = (c.evChoch[i] != 0);
 
-   if(dir > 0)
+   //--- 2. higher timeframe bias, read from the last CLOSED bias bar
+   int b1 = 0, b2 = 0;
+   if(g_use1 && c.n1 > 0) b1 = c.bias1[c.idx1[i]];
+   if(g_use2 && c.n2 > 0) b2 = c.bias2[c.idx2[i]];
+
+   bool agree1 = (b1 == dir);
+   bool agree2 = (b2 == dir);
+
+   if(InpBiasMode == MF_BIAS_BOTH)
    {
-      double byAtr    = entry - atrStop;
-      double byStruct = SwingLow(r, n, i, InpSwingLookback) - buffer;
-      if(InpSLMode == MF_SL_ATR)            slPrice = byAtr;
-      else if(InpSLMode == MF_SL_STRUCTURE) slPrice = byStruct;
-      else                                  slPrice = MathMin(byAtr, byStruct);
+      if(g_use1 && !agree1) return false;
+      if(g_use2 && !agree2) return false;
+   }
+   else if(InpBiasMode == MF_BIAS_H4LED)
+   {
+      if(g_use2 && !agree2) return false;          // secondary (H4) must agree
+      if(g_use1 && b1 == -dir) return false;       // primary (D1) must not oppose
    }
    else
    {
-      double byAtr    = entry + atrStop;
-      double byStruct = SwingHigh(r, n, i, InpSwingLookback) + buffer;
-      if(InpSLMode == MF_SL_ATR)            slPrice = byAtr;
-      else if(InpSLMode == MF_SL_STRUCTURE) slPrice = byStruct;
-      else                                  slPrice = MathMax(byAtr, byStruct);
+      bool any = (g_use1 && agree1) || (g_use2 && agree2);
+      if((g_use1 || g_use2) && !any) return false;
    }
 
-   double risk = MathAbs(entry - slPrice);
-   if(risk <= 0.0)
+   //--- 3. displacement: the break has to be driven, not drifted into
+   double body = MathAbs(c.r[i].close - c.r[i].open);
+   bool displaced = (body >= c.atr[i] * InpDispAtrMult);
+   if(InpRequireDisp && !displaced)
       return false;
 
-   //--- respect the broker's minimum stop distance so the levels are placeable
+   //--- 4. liquidity sweep shortly before the shift
+   bool   hasSweep    = false;
+   double sweepPrice  = 0.0;
+   int    sweepEnd    = (int)MathMin(n - 2, i + InpSweepWindow);
+   for(int k = i; k <= sweepEnd; k++)
+      if(SweepAt(c.r, n, k, dir, InpSweepLookback))
+      {
+         hasSweep   = true;
+         sweepPrice = (dir > 0 ? c.r[k].low : c.r[k].high);
+         break;
+      }
+   if(InpRequireSweep && !hasSweep)
+      return false;
+
+   //--- 5. point of interest to enter from
+   MFPoi poi = FindPoi(c.r, n, i, dir);
+   if(!poi.valid || poi.hi <= poi.lo)
+      return false;
+
+   double entry = (InpPoiEntry == MF_POI_CE)
+                  ? (poi.hi + poi.lo) * 0.5
+                  : (dir > 0 ? poi.hi : poi.lo);
+
+   //--- 6. premium / discount against the current dealing range
+   double eq    = (c.rHigh[i] + c.rLow[i]) * 0.5;
+   bool   pdOk  = (c.rHigh[i] > c.rLow[i]) && (dir > 0 ? entry <= eq : entry >= eq);
+   if(InpRequirePD && !pdOk)
+      return false;
+
+   //--- 7. stop behind the zone and behind the swept low/high
+   double buffer = c.atr[i] * InpSlBufferAtr;
+   double sl;
+   if(dir > 0)
+   {
+      sl = poi.lo;
+      if(hasSweep && sweepPrice > 0.0)
+         sl = MathMin(sl, sweepPrice);
+      sl -= buffer;
+   }
+   else
+   {
+      sl = poi.hi;
+      if(hasSweep && sweepPrice > 0.0)
+         sl = MathMax(sl, sweepPrice);
+      sl += buffer;
+   }
+
+   double risk = MathAbs(entry - sl);
+   double minRisk = c.atr[i] * InpMinRiskAtr;
+   if(risk < minRisk)
+   {
+      risk = minRisk;
+      sl   = entry - dir * risk;
+   }
+
    bool adjusted = false;
    if(s.stopDist > 0.0 && risk < s.stopDist)
    {
       risk     = s.stopDist;
-      slPrice  = entry - dir * risk;
+      sl       = entry - dir * risk;
       adjusted = true;
    }
+   if(risk <= 0.0)
+      return false;
 
-   double tp1 = entry + dir * risk * InpTP1R;
-   double tp2 = entry + dir * risk * InpTP2R;
-   double tp3 = entry + dir * risk * InpTP3R;
+   //--- 8. targets: resting liquidity first, R multiples only as fallback
+   double minTp1 = entry + dir * risk * InpMinTp1R;
+   double tp1 = 0.0, tp2 = 0.0, tp3 = 0.0;
+   bool   liqTp = false;
 
-   if(s.stopDist > 0.0)
+   if(dir > 0)
    {
-      if(MathAbs(tp1 - entry) < s.stopDist) { tp1 = entry + dir * s.stopDist; adjusted = true; }
-      if(MathAbs(tp2 - tp1)   < s.stopDist) { tp2 = tp1   + dir * s.stopDist; adjusted = true; }
-      if(MathAbs(tp3 - tp2)   < s.stopDist) { tp3 = tp2   + dir * s.stopDist; adjusted = true; }
-   }
-
-   //--- score
-   int score = 40;
-
-   int jj = MathMin(htfIdx[i] + 1, m - 1);          // last CLOSED htf bar: no look-ahead
-   if(m > 1 && jj >= 0)
-   {
-      bool htfUp = (htfEmaF[jj] > htfEmaS[jj]);
-      if((dir > 0 && htfUp) || (dir < 0 && !htfUp))
-         score += 20;
-   }
-
-   double body = MathAbs(r[i].close - r[i].open);
-   if(body >= atr[i] * 0.5)
-      score += 10;
-
-   double volAvg = 0.0;
-   int    volN   = 0;
-   for(int k = i + 1; k <= MathMin(n - 1, i + 20); k++)
-   {
-      volAvg += (double)r[k].tick_volume;
-      volN++;
-   }
-   if(volN > 0)
-   {
-      volAvg /= volN;
-      if(volAvg > 0.0 && (double)r[i].tick_volume >= volAvg * 1.2)
-         score += 10;
-   }
-
-   if(cont)
-   {
-      if((dir > 0 && rsi[i] >= 45.0 && rsi[i] <= 70.0) ||
-         (dir < 0 && rsi[i] >= 30.0 && rsi[i] <= 55.0))
-         score += 10;
+      tp1 = LiquidityAbove(c.r, n, i, InpSwingStrength, minTp1);
+      if(tp1 > 0.0)
+      {
+         liqTp = true;
+         tp2 = LiquidityAbove(c.r, n, i, InpSwingStrength, tp1 + risk * 0.25);
+         if(g_use2 && c.n2 > 0)
+         {
+            double hr = c.rHigh2[c.idx2[i]];
+            if(hr > MathMax(tp1, tp2) + risk * 0.25)
+               tp3 = hr;
+         }
+      }
    }
    else
    {
-      if((dir > 0 && rsi[i] <= 25.0) || (dir < 0 && rsi[i] >= 75.0))
-         score += 10;
+      tp1 = LiquidityBelow(c.r, n, i, InpSwingStrength, minTp1);
+      if(tp1 > 0.0)
+      {
+         liqTp = true;
+         tp2 = LiquidityBelow(c.r, n, i, InpSwingStrength, tp1 - risk * 0.25);
+         if(g_use2 && c.n2 > 0)
+         {
+            double lr = c.rLow2[c.idx2[i]];
+            if(lr > 0.0 && lr < MathMin(tp1, (tp2 > 0.0 ? tp2 : tp1)) - risk * 0.25)
+               tp3 = lr;
+         }
+      }
    }
 
-   if(PathIsClear(r, n, i, dir, entry, tp1))
-      score += 10;
+   if(tp1 <= 0.0) tp1 = entry + dir * risk * InpTP1R;
+   if(tp2 <= 0.0) tp2 = entry + dir * risk * InpTP2R;
+   if(tp3 <= 0.0) tp3 = entry + dir * risk * InpTP3R;
 
-   out.valid        = true;
-   out.dir          = dir;
-   out.continuation = cont;
-   out.barIndex     = i;
-   out.time         = r[i].time;
-   out.entry        = NormPrice(s, entry);
-   out.sl           = NormPrice(s, slPrice);
-   out.tp1          = NormPrice(s, tp1);
-   out.tp2          = NormPrice(s, tp2);
-   out.tp3          = NormPrice(s, tp3);
-   out.score        = (int)MathMin(100, score);
-   out.adjusted     = adjusted;
-   out.status       = ST_ACTIVE;
+   //--- keep the ladder ordered and each step meaningful
+   if(dir > 0)
+   {
+      tp2 = MathMax(tp2, tp1 + risk * 0.25);
+      tp3 = MathMax(tp3, tp2 + risk * 0.25);
+   }
+   else
+   {
+      tp2 = MathMin(tp2, tp1 - risk * 0.25);
+      tp3 = MathMin(tp3, tp2 - risk * 0.25);
+   }
+
+   if(s.stopDist > 0.0 && MathAbs(tp1 - entry) < s.stopDist)
+   {
+      tp1 = entry + dir * s.stopDist;
+      adjusted = true;
+   }
+
+   //--- 9. confluence score
+   int score = 0;
+   if(agree1) score += 20;
+   if(agree2) score += 20;
+   if(hasSweep) score += 15;
+   score += (choch ? 10 : 5);
+   if(displaced) score += 10;
+   score += ((poi.isOB && poi.isFVG) ? 15 : 10);
+   if(pdOk) score += 10;
+   if(score > 100) score = 100;
+
+   //--- 10. compact confluence tags for the dashboard
+   string tags = "";
+   if(agree1) tags += g_b1Text + " ";
+   if(agree2) tags += g_b2Text + " ";
+   if(hasSweep) tags += "SW ";
+   tags += (choch ? "CH " : "BOS ");
+   if(poi.isOB)  tags += "OB ";
+   if(poi.isFVG) tags += "FVG ";
+   if(pdOk) tags += (dir > 0 ? "DISC" : "PREM");
+   StringTrimRight(tags);
+
+   out.valid       = true;
+   out.dir         = dir;
+   out.choch       = choch;
+   out.barIndex    = i;
+   out.time        = c.r[i].time;
+   out.entry       = NormPrice(s, entry);
+   out.sl          = NormPrice(s, sl);
+   out.tp1         = NormPrice(s, tp1);
+   out.tp2         = NormPrice(s, tp2);
+   out.tp3         = NormPrice(s, tp3);
+   out.zoneHi      = NormPrice(s, poi.hi);
+   out.zoneLo      = NormPrice(s, poi.lo);
+   out.sweepPrice  = (hasSweep ? NormPrice(s, sweepPrice) : 0.0);
+   out.biasD1      = b1;
+   out.biasH4      = b2;
+   out.hasOB       = poi.isOB;
+   out.hasFVG      = poi.isFVG;
+   out.hasSweep    = hasSweep;
+   out.pdOk        = pdOk;
+   out.displaced   = displaced;
+   out.liquidityTp = liqTp;
+   out.score       = score;
+   out.adjusted    = adjusted;
+   out.status      = ST_WAIT;
+   out.tags        = tags;
    return true;
 }
 
 //+------------------------------------------------------------------+
-//| Replay the bars after a signal and report what actually happened  |
-//| When a single bar touches both the stop and a target, the stop is |
-//| counted first - the pessimistic reading, never the flattering one |
+//| Replay the bars after the setup and report what really happened.  |
+//| The entry is a limit: price must come back to it first. If the    |
+//| stop is taken out before that, the setup died without a trade.    |
+//| When one bar touches both the stop and a target, the stop counts  |
+//| first - the pessimistic reading, never the flattering one.        |
 //+------------------------------------------------------------------+
-int ReplayStatus(const MqlRates &r[], const int n, const MFSignal &sg, const int untilIndex)
+int ReplayStatus(const MqlRates &r[], const int n, const MFSignal &sg)
 {
-   int st = ST_ACTIVE;
-   for(int k = sg.barIndex - 1; k >= untilIndex; k--)
+   bool entered = false;
+   int  st = ST_WAIT;
+
+   for(int k = sg.barIndex - 1; k >= 0; k--)
    {
-      if(k < 0 || k >= n)
+      if(k >= n)
          continue;
+
+      if(!entered)
+      {
+         if(sg.dir > 0)
+         {
+            if(r[k].low <= sg.sl)     return ST_INVALID;
+            if(r[k].low <= sg.entry)  entered = true;
+         }
+         else
+         {
+            if(r[k].high >= sg.sl)    return ST_INVALID;
+            if(r[k].high >= sg.entry) entered = true;
+         }
+         if(!entered)
+            continue;
+         st = ST_ACTIVE;
+      }
+
       if(sg.dir > 0)
       {
          if(r[k].low  <= sg.sl)  return ST_SL;
          if(r[k].high >= sg.tp3) return ST_TP3;
-         if(r[k].high >= sg.tp2) st = MathMax(st, ST_TP2);
-         else if(r[k].high >= sg.tp1) st = MathMax(st, ST_TP1);
+         if(r[k].high >= sg.tp2) st = (int)MathMax(st, ST_TP2);
+         else if(r[k].high >= sg.tp1) st = (int)MathMax(st, ST_TP1);
       }
       else
       {
          if(r[k].high >= sg.sl)  return ST_SL;
          if(r[k].low  <= sg.tp3) return ST_TP3;
-         if(r[k].low  <= sg.tp2) st = MathMax(st, ST_TP2);
-         else if(r[k].low <= sg.tp1) st = MathMax(st, ST_TP1);
+         if(r[k].low  <= sg.tp2) st = (int)MathMax(st, ST_TP2);
+         else if(r[k].low <= sg.tp1) st = (int)MathMax(st, ST_TP1);
       }
    }
    return st;
 }
 
-//--- +1 target first, -1 stop first, 0 unresolved inside the hold window
+//--- +1 target first, -1 stop first, 0 no trade (never filled, killed
+//--- before fill, or still open at the end of the hold window)
 int BacktestOutcome(const MqlRates &r[], const int n, const MFSignal &sg)
 {
-   int stop = MathMax(0, sg.barIndex - InpStatsMaxHold);
+   bool entered = false;
+   int  stop = (int)MathMax(0, sg.barIndex - InpStatsMaxHold);
+
    for(int k = sg.barIndex - 1; k >= stop; k--)
    {
+      if(k >= n)
+         continue;
+
+      if(!entered)
+      {
+         if(sg.dir > 0)
+         {
+            if(r[k].low <= sg.sl)     return 0;
+            if(r[k].low <= sg.entry)  entered = true;
+         }
+         else
+         {
+            if(r[k].high >= sg.sl)    return 0;
+            if(r[k].high >= sg.entry) entered = true;
+         }
+         if(!entered)
+            continue;
+      }
+
       if(sg.dir > 0)
       {
          if(r[k].low  <= sg.sl)  return -1;
@@ -807,7 +1117,7 @@ int BacktestOutcome(const MqlRates &r[], const int n, const MFSignal &sg)
 }
 
 //+------------------------------------------------------------------+
-//| Full analysis of one symbol (runs in the background scheduler)    |
+//| Analysis of one symbol                                           |
 //+------------------------------------------------------------------+
 void AnalyseSymbol(MFSymbol &s)
 {
@@ -820,123 +1130,99 @@ void AnalyseSymbol(MFSymbol &s)
       return;
    }
 
-   int warmup   = MathMax(InpEmaSlow * 4, 120);
-   int statsWin = (InpStatsBars > 0 ? InpStatsBars + InpStatsMaxHold : 0);
-   int need     = MathMax(InpMaxAge + warmup, statsWin + warmup);
+   MFCtx c;
+   c.n = 0; c.n1 = 0; c.n2 = 0;
 
-   MqlRates r[];
-   ArraySetAsSeries(r, true);
-   int got = CopyRates(s.name, g_tf, 0, need, r);
+   int warmup = (int)MathMax(InpAtrPeriod * 6, 150);
+   int stats  = (InpStatsBars > 0 ? InpStatsBars + InpStatsMaxHold : 0);
+   int want   = (int)MathMax(InpMaxAge + InpLiquidityLook + warmup, stats + warmup);
 
-   //--- never invent a signal from history we do not have
-   if(got < warmup + InpMaxAge + 2)
+   ArraySetAsSeries(c.r, true);
+   int got = CopyRates(s.name, g_tf, 0, want, c.r);
+   if(got < warmup + InpMaxAge + 4)
    {
       s.note = (got <= 0 ? "LOADING" : "SHORT HIST");
       return;
    }
-   int n = got;
+   c.n = got;
 
-   double close[];
-   ArrayResize(close, n);
-   for(int i = 0; i < n; i++)
-      close[i] = r[i].close;
+   CalcATR(c.r, c.n, InpAtrPeriod, c.atr);
 
-   double emaF[], emaS[], rsi[], atr[];
-   CalcEMA(close, n, InpEmaFast, emaF);
-   CalcEMA(close, n, InpEmaSlow, emaS);
-   CalcRSI(close, n, InpRsiPeriod, rsi);
-   CalcATR(r,     n, InpAtrPeriod, atr);
+   //--- entry timeframe structure
+   StructureSeries(c.r, c.n, InpSwingStrength, c.bias, c.evDir, c.evChoch, c.rHigh, c.rLow);
 
-   //--- higher timeframe trend, mapped bar by bar without look-ahead
-   MqlRates hr[];
-   ArraySetAsSeries(hr, true);
-   int m = CopyRates(s.name, g_htf, 0, (int)MathMax(120, need / 3), hr);
-
-   double htfEmaF[], htfEmaS[];
-   int    htfIdx[];
-   ArrayResize(htfIdx, n);
-
-   if(m > InpEmaSlow + 2)
+   //--- bias timeframes, each with its own structure walk, then mapped
+   //--- onto the entry bars using the last CLOSED bias bar
+   if(g_use1)
    {
-      double hclose[];
-      ArrayResize(hclose, m);
-      for(int i = 0; i < m; i++)
-         hclose[i] = hr[i].close;
-      CalcEMA(hclose, m, InpEmaFast, htfEmaF);
-      CalcEMA(hclose, m, InpEmaSlow, htfEmaS);
-
-      int j = m - 1;
-      for(int i = n - 1; i >= 0; i--)
+      ArraySetAsSeries(c.r1, true);
+      int g1 = CopyRates(s.name, g_bias1, 0, 400, c.r1);
+      if(g1 >= 80)
       {
-         while(j > 0 && hr[j - 1].time <= r[i].time)
-            j--;
-         htfIdx[i] = j;
+         c.n1 = g1;
+         int ed1[], ec1[];
+         StructureSeries(c.r1, g1, InpSwingStrength, c.bias1, ed1, ec1, c.rHigh1, c.rLow1);
+         MapHigher(c.r, c.n, c.r1, c.n1, c.idx1);
+      }
+      else
+      {
+         s.note = "LOADING " + g_b1Text;
+         return;
       }
    }
-   else
+
+   if(g_use2)
    {
-      m = 0;
-      ArrayResize(htfEmaF, 1);
-      ArrayResize(htfEmaS, 1);
-      htfEmaF[0] = 0.0;
-      htfEmaS[0] = 0.0;
-      ArrayInitialize(htfIdx, 0);
+      ArraySetAsSeries(c.r2, true);
+      int g2 = CopyRates(s.name, g_bias2, 0, 600, c.r2);
+      if(g2 >= 80)
+      {
+         c.n2 = g2;
+         int ed2[], ec2[];
+         StructureSeries(c.r2, g2, InpSwingStrength, c.bias2, ed2, ec2, c.rHigh2, c.rLow2);
+         MapHigher(c.r, c.n, c.r2, c.n2, c.idx2);
+      }
+      else
+      {
+         s.note = "LOADING " + g_b2Text;
+         return;
+      }
    }
 
-   //--- newest qualifying signal
+   //--- newest qualifying setup
    MFSignal sg;
    for(int i = 1; i <= InpMaxAge; i++)
    {
-      if(!EvaluateAt(s, r, n, i, emaF, emaS, rsi, atr, htfIdx, htfEmaF, htfEmaS, m, sg))
+      if(c.evDir[i] == 0)
+         continue;
+      if(!EvaluateAt(s, c, i, sg))
          continue;
       if(sg.score < InpMinScore)
          continue;
 
-      //--- optional live entry, captured once and then frozen
-      if(InpEntryMode == MF_ENTRY_MARKET && i == 1)
-      {
-         if(s.frozenSigTime != sg.time)
-         {
-            double px = (sg.dir > 0 ? SymbolInfoDouble(s.name, SYMBOL_ASK)
-                                    : SymbolInfoDouble(s.name, SYMBOL_BID));
-            if(px > 0.0)
-            {
-               s.frozenSigTime = sg.time;
-               s.frozenEntry   = px;
-            }
-         }
-         if(s.frozenSigTime == sg.time && s.frozenEntry > 0.0)
-         {
-            double shift = s.frozenEntry - sg.entry;
-            sg.entry = NormPrice(s, s.frozenEntry);
-            sg.sl    = NormPrice(s, sg.sl  + shift);
-            sg.tp1   = NormPrice(s, sg.tp1 + shift);
-            sg.tp2   = NormPrice(s, sg.tp2 + shift);
-            sg.tp3   = NormPrice(s, sg.tp3 + shift);
-         }
-      }
+      sg.status = ReplayStatus(c.r, c.n, sg);
+      if(sg.status == ST_INVALID)      // the setup already died, keep looking
+         continue;
 
-      sg.status = ReplayStatus(r, n, sg, 0);
-      s.sig     = sg;
+      s.sig = sg;
       break;
    }
 
-   //--- measured hit rate of the exact same rule over the back-test window
+   //--- measured hit rate of this exact rule on this symbol
    if(InpStatsBars > 0)
    {
       int wins = 0, losses = 0;
-      int from = MathMin(n - 3, InpStatsBars + InpStatsMaxHold);
+      int from = (int)MathMin(c.n - InpSwingStrength - 3, InpStatsBars + InpStatsMaxHold);
       MFSignal bs;
       int i = from;
       while(i > InpStatsMaxHold)
       {
-         if(EvaluateAt(s, r, n, i, emaF, emaS, rsi, atr, htfIdx, htfEmaF, htfEmaS, m, bs) &&
-            bs.score >= InpMinScore)
+         if(c.evDir[i] != 0 && EvaluateAt(s, c, i, bs) && bs.score >= InpMinScore)
          {
-            int res = BacktestOutcome(r, n, bs);
+            int res = BacktestOutcome(c.r, c.n, bs);
             if(res > 0)      wins++;
             else if(res < 0) losses++;
-            i -= 3;                    // small cooldown so one move is not counted repeatedly
+            i -= 3;
             continue;
          }
          i--;
@@ -947,17 +1233,16 @@ void AnalyseSymbol(MFSymbol &s)
 
    s.analysed = true;
    s.note     = "";
-   s.lastBar  = r[0].time;
+   s.lastBar  = c.r[0].time;
 
-   //--- alert once, only for a signal that printed on the last closed bar
-   if(s.sig.valid && s.sig.barIndex == 1 && s.sig.time != s.lastAlert)
+   if(s.sig.valid && s.sig.barIndex <= 2 && s.sig.time != s.lastAlert)
    {
       s.lastAlert = s.sig.time;
-      string msg = StringFormat("MarketFlow V8 | %s %s | %s %s (score %d) | entry %s  SL %s  TP1 %s",
+      string msg = StringFormat("MarketFlow V8 | %s %s | %s %s | %s | score %d | entry %s  SL %s  TP1 %s",
                                 s.name, g_tfText,
                                 (s.sig.dir > 0 ? "BUY" : "SELL"),
-                                (s.sig.continuation ? "CONTINUATION" : "REVERSAL"),
-                                s.sig.score,
+                                (s.sig.choch ? "CHoCH" : "BOS"),
+                                s.sig.tags, s.sig.score,
                                 DoubleToString(s.sig.entry, s.digits),
                                 DoubleToString(s.sig.sl,    s.digits),
                                 DoubleToString(s.sig.tp1,   s.digits));
@@ -966,7 +1251,7 @@ void AnalyseSymbol(MFSymbol &s)
    }
 }
 
-//--- cheap intrabar refresh of the outcome status only
+//--- cheap intrabar refresh of the outcome only
 void RefreshStatus(MFSymbol &s)
 {
    if(!s.ok || !s.sig.valid)
@@ -976,7 +1261,7 @@ void RefreshStatus(MFSymbol &s)
    ArraySetAsSeries(r, true);
    if(CopyRates(s.name, g_tf, 0, need, r) < need)
       return;
-   s.sig.status = ReplayStatus(r, need, s.sig, 0);
+   s.sig.status = ReplayStatus(r, need, s.sig);
 }
 
 //+------------------------------------------------------------------+
@@ -988,7 +1273,7 @@ void RunScanBudget()
    if(total == 0)
       return;
 
-   int budget = MathMax(1, InpSymbolsPerTick);
+   int budget = (int)MathMax(1, InpSymbolsPerTick);
    int looked = 0;
 
    while(budget > 0 && looked < total)
@@ -1002,20 +1287,19 @@ void RunScanBudget()
 
       datetime bar0 = (datetime)SeriesInfoInteger(g_syms[i].name, g_tf, SERIES_LASTBAR_DATE);
       if(g_syms[i].analysed && bar0 != 0 && bar0 == g_syms[i].lastBar)
-         continue;                       // nothing new on this symbol
+         continue;
 
       AnalyseSymbol(g_syms[i]);
       budget--;
    }
 
-   //--- keep the live outcome column honest between bars
    for(int i = 0; i < total; i++)
       if(g_syms[i].sig.valid)
          RefreshStatus(g_syms[i]);
 }
 
 //+------------------------------------------------------------------+
-//| Row ordering                                                     |
+//| Ordering                                                         |
 //+------------------------------------------------------------------+
 int RankOf(const MFSymbol &s)
 {
@@ -1063,7 +1347,29 @@ string SignalText(const MFSignal &s)
    if(!s.valid)
       return "-";
    string head = (s.dir > 0 ? ShortToString(0x25B2) + " BUY" : ShortToString(0x25BC) + " SELL");
-   return head + (s.continuation ? "+" : "-");
+   return head + (s.choch ? "-" : "+");
+}
+
+string BiasText(const MFSignal &s)
+{
+   if(!s.valid)
+      return "-";
+   string t = "";
+   if(g_use1) t += StringSubstr(g_b1Text, 0, 1) + ArrowFor(s.biasD1) + " ";
+   if(g_use2) t += StringSubstr(g_b2Text, 0, 1) + ArrowFor(s.biasH4);
+   StringTrimRight(t);
+   return t;
+}
+
+color BiasColor(const MFSignal &s)
+{
+   if(!s.valid)
+      return InpClrDim;
+   bool a1 = (!g_use1 || s.biasD1 == s.dir);
+   bool a2 = (!g_use2 || s.biasH4 == s.dir);
+   if(a1 && a2)
+      return (s.dir > 0 ? InpClrBuy : InpClrSell);
+   return InpClrDim;
 }
 
 string AgeText(const MFSignal &s)
@@ -1081,10 +1387,12 @@ string StatusText(const MFSignal &s)
       return "-";
    switch(s.status)
    {
-      case ST_SL:  return "SL HIT";
-      case ST_TP1: return "TP1 HIT";
-      case ST_TP2: return "TP2 HIT";
-      case ST_TP3: return "TP3 HIT";
+      case ST_INVALID: return "INVALID";
+      case ST_SL:      return "SL HIT";
+      case ST_WAIT:    return "WAITING";
+      case ST_TP1:     return "TP1 HIT";
+      case ST_TP2:     return "TP2 HIT";
+      case ST_TP3:     return "TP3 HIT";
    }
    return "ACTIVE";
 }
@@ -1093,10 +1401,12 @@ color StatusColor(const MFSignal &s)
 {
    if(!s.valid)
       return InpClrDim;
-   if(s.status == ST_SL)
+   if(s.status == ST_SL || s.status == ST_INVALID)
       return InpClrSell;
-   if(s.status > ST_ACTIVE)
+   if(s.status >= ST_TP1)
       return InpClrBuy;
+   if(s.status == ST_WAIT)
+      return InpClrDim;
    return InpClrText;
 }
 
@@ -1124,6 +1434,8 @@ void LayoutColumns()
 {
    for(int c = 0; c < NCOLS; c++)
       g_colOn[c] = true;
+   g_colOn[C_BIAS]   = InpShowBias;
+   g_colOn[C_SMC]    = InpShowSmc;
    g_colOn[C_SCORE]  = InpShowScore;
    g_colOn[C_WR]     = InpShowWinRate;
    g_colOn[C_STATUS] = InpShowStatus;
@@ -1143,17 +1455,17 @@ void DrawPanel()
    int H = PanelHeight();
    SetRect(g_prefix + "bg", InpPanelX, InpPanelY, g_panelW, H, InpClrPanelBg, InpClrPanelBorder);
 
-   //--- counters, so the panel always says what it has and has not done
    int nSyms = ArraySize(g_syms);
    int nDone = 0, nSig = 0;
    for(int i = 0; i < nSyms; i++)
    {
-      if(g_syms[i].analysed) nDone++;
+      if(g_syms[i].analysed)  nDone++;
       if(g_syms[i].sig.valid) nSig++;
    }
 
-   string title = StringFormat("%s MARKETFLOW V8  |  SIGNALS DASHBOARD  |  %s  |  %s  |  %d signals  |  analysed %d/%d",
-                               ShortToString(0x25C8), g_tfText,
+   string title = StringFormat("%s MARKETFLOW V8  |  SMC DASHBOARD  |  %s + %s bias %s %s  |  %s  |  %d setups  |  analysed %d/%d",
+                               ShortToString(0x25C8), g_b1Text, g_b2Text,
+                               ShortToString(0x2192), g_tfText,
                                TimeToString(TimeCurrent(), TIME_MINUTES),
                                nSig, nDone, nSyms);
    SetLabel(g_prefix + "title", InpPanelX + 8, InpPanelY + H - g_titleH + 7, title,
@@ -1213,9 +1525,11 @@ void DrawPanel()
       string cell[NCOLS];
       cell[C_SYMBOL] = s.name;
       cell[C_TF]     = g_tfText;
+      cell[C_BIAS]   = (s.note != "" ? "" : BiasText(s.sig));
       cell[C_SIGNAL] = (s.note != "" ? s.note : SignalText(s.sig));
-      cell[C_SCORE]  = sv ? IntegerToString(s.sig.score) : "-";
-      cell[C_WR]     = s.analysed ? WinRateText(s) : "-";
+      cell[C_SMC]    = (sv ? s.sig.tags : "-");
+      cell[C_SCORE]  = (sv ? IntegerToString(s.sig.score) : "-");
+      cell[C_WR]     = (s.analysed ? WinRateText(s) : "-");
       cell[C_AGE]    = (s.note != "" ? "" : AgeText(s.sig));
       cell[C_ENTRY]  = PriceText(s, s.sig.entry);
       cell[C_SL]     = PriceText(s, s.sig.sl) + (sv && s.sig.adjusted ? "*" : "");
@@ -1235,13 +1549,15 @@ void DrawPanel()
          }
 
          color clr = InpClrText;
-         if(c == C_SYMBOL)                       clr = (sv ? InpClrTitle : InpClrDim);
-         if(c == C_SIGNAL)                       clr = (s.note != "" ? InpClrDim : sc);
-         if(c == C_SCORE || c == C_AGE)          clr = sc;
-         if(c >= C_ENTRY && c <= C_TP3)          clr = (sv ? sc : InpClrDim);
-         if(c == C_SL && sv)                     clr = InpClrSell;
-         if(c == C_WR)                           clr = InpClrText;
-         if(c == C_STATUS)                       clr = StatusColor(s.sig);
+         if(c == C_SYMBOL)                    clr = (sv ? InpClrTitle : InpClrDim);
+         if(c == C_BIAS)                      clr = BiasColor(s.sig);
+         if(c == C_SIGNAL)                    clr = (s.note != "" ? InpClrDim : sc);
+         if(c == C_SMC)                       clr = (sv ? InpClrHeader : InpClrDim);
+         if(c == C_SCORE || c == C_AGE)       clr = sc;
+         if(c >= C_ENTRY && c <= C_TP3)       clr = (sv ? sc : InpClrDim);
+         if(c == C_SL && sv)                  clr = InpClrSell;
+         if(c == C_WR)                        clr = InpClrText;
+         if(c == C_STATUS)                    clr = StatusColor(s.sig);
 
          SetLabel(cn, InpPanelX + g_colX[c], base, cell[c], clr, InpFontSize);
       }
@@ -1252,7 +1568,7 @@ void DrawPanel()
 }
 
 //+------------------------------------------------------------------+
-//| Chart trade projection                                           |
+//| Chart drawing                                                    |
 //+------------------------------------------------------------------+
 void ClearChartTrade()
 {
@@ -1321,6 +1637,23 @@ void DrawChartTrade()
    datetime t1  = sg.time;
    datetime t2  = (datetime)(TimeCurrent() + (long)ps * InpBoxExtendBars);
 
+   //--- POI zone the entry is taken from
+   string zone = g_prefix + "tr_zone";
+   if(InpShowZone && EnsureObject(zone, OBJ_RECTANGLE))
+   {
+      ObjectSetInteger(0, zone, OBJPROP_TIME,  0, t1);
+      ObjectSetDouble (0, zone, OBJPROP_PRICE, 0, sg.zoneLo);
+      ObjectSetInteger(0, zone, OBJPROP_TIME,  1, t2);
+      ObjectSetDouble (0, zone, OBJPROP_PRICE, 1, sg.zoneHi);
+      ObjectSetInteger(0, zone, OBJPROP_COLOR, clr);
+      ObjectSetInteger(0, zone, OBJPROP_STYLE, STYLE_DOT);
+      ObjectSetInteger(0, zone, OBJPROP_WIDTH, 1);
+      ObjectSetInteger(0, zone, OBJPROP_FILL,  true);
+      ObjectSetInteger(0, zone, OBJPROP_BACK,  true);
+   }
+   else if(!InpShowZone)
+      ObjectDelete(0, zone);
+
    string box = g_prefix + "tr_box";
    if(EnsureObject(box, OBJ_RECTANGLE))
    {
@@ -1367,6 +1700,25 @@ void DrawChartTrade()
    SetTradeText(g_prefix + "tr_txt_tp2", tTxt, sg.tp2, "TP2: " + DoubleToString(sg.tp2, s.digits), clr);
    SetTradeText(g_prefix + "tr_txt_tp3", tTxt, sg.tp3, "TP3: " + DoubleToString(sg.tp3, s.digits), clr);
 
+   //--- structure shift and swept liquidity
+   SetTradeText(g_prefix + "tr_txt_bos", t1,
+                (buy ? sg.zoneHi : sg.zoneLo),
+                (sg.choch ? "CHoCH" : "BOS"), clr);
+
+   string sw = g_prefix + "tr_sweep";
+   if(sg.sweepPrice > 0.0)
+   {
+      SetTradeLine(sw, (datetime)(t1 - (long)ps * InpSweepWindow), t2, sg.sweepPrice,
+                   InpClrDim, STYLE_DASH);
+      SetTradeText(g_prefix + "tr_txt_sweep", (datetime)(t1 - (long)ps * InpSweepWindow),
+                   sg.sweepPrice, "SWEEP", InpClrDim);
+   }
+   else
+   {
+      ObjectDelete(0, sw);
+      ObjectDelete(0, g_prefix + "tr_txt_sweep");
+   }
+
    double hi  = iHigh(_Symbol, g_tf, sg.barIndex);
    double lo  = iLow (_Symbol, g_tf, sg.barIndex);
    double pad = MathAbs(sg.entry - sg.sl) * 0.35;
@@ -1383,18 +1735,19 @@ void DrawChartTrade()
 
    int legendY = InpPanelY + PanelHeight() + 8;
    SetLabel(g_prefix + "tr_leg1", InpPanelX + 8, legendY + 32,
-            ShortToString(0x25C8) + " TRADE", InpClrTitle, InpFontSize + 1);
+            ShortToString(0x25C8) + " TRADE   " + BiasText(sg), InpClrTitle, InpFontSize + 1);
    SetLabel(g_prefix + "tr_leg2", InpPanelX + 8, legendY + 16,
-            StringFormat("%s %s   score %d   %s",
+            StringFormat("%s %s   %s   score %d   %s",
                          SignalText(sg),
-                         (sg.continuation ? "CONTINUATION" : "REVERSAL"),
-                         sg.score, StatusText(sg)),
+                         (sg.choch ? "REVERSAL (CHoCH)" : "CONTINUATION (BOS)"),
+                         sg.tags, sg.score, StatusText(sg)),
             clr, InpFontSize + 1);
    SetLabel(g_prefix + "tr_leg3", InpPanelX + 8, legendY,
-            StringFormat("risk %s   R:R to TP1 %.1f   measured %s",
+            StringFormat("risk %s   R:R to TP1 %.1f   targets %s   measured %s",
                          DoubleToString(MathAbs(sg.entry - sg.sl), s.digits),
                          (MathAbs(sg.entry - sg.sl) > 0.0
                             ? MathAbs(sg.tp1 - sg.entry) / MathAbs(sg.entry - sg.sl) : 0.0),
+                         (sg.liquidityTp ? "liquidity" : "R fallback"),
                          WinRateText(s)),
             InpClrDim, InpFontSize);
 }
@@ -1417,22 +1770,27 @@ void DrawWatermark()
 int OnInit()
 {
    g_tf     = (InpTimeframe == PERIOD_CURRENT ? (ENUM_TIMEFRAMES)_Period : InpTimeframe);
-   g_htf    = (InpHtfTimeframe == PERIOD_CURRENT ? NextTimeframeUp(g_tf) : InpHtfTimeframe);
+   g_bias1  = InpBiasTF1;
+   g_bias2  = InpBiasTF2;
    g_tfText = TfToText(g_tf);
+   g_b1Text = TfToText(g_bias1);
+   g_b2Text = TfToText(g_bias2);
+
+   //--- a bias timeframe must actually be higher than the entry timeframe
+   g_use1 = (PeriodSeconds(g_bias1) > PeriodSeconds(g_tf));
+   g_use2 = (PeriodSeconds(g_bias2) > PeriodSeconds(g_tf));
+   if(!g_use1 && !g_use2)
+      Print("MarketFlow V8: both bias timeframes are at or below the entry timeframe - ",
+            "running on entry-timeframe structure only.");
 
    if(InpRowsVisible < 1 || InpRowHeight < 8)
    {
       Print("MarketFlow V8: invalid panel geometry.");
       return INIT_PARAMETERS_INCORRECT;
    }
-   if(InpEmaFast < 1 || InpEmaSlow < 1 || InpEmaFast >= InpEmaSlow)
+   if(InpSwingStrength < 1 || InpAtrPeriod < 1 || InpMaxAge < 1 || InpPoiLookback < 2)
    {
-      Print("MarketFlow V8: fast EMA must be shorter than slow EMA.");
-      return INIT_PARAMETERS_INCORRECT;
-   }
-   if(InpMaxAge < 1 || InpAtrPeriod < 1 || InpRsiPeriod < 1 || InpSwingLookback < 2)
-   {
-      Print("MarketFlow V8: invalid signal engine parameters.");
+      Print("MarketFlow V8: invalid structure parameters.");
       return INIT_PARAMETERS_INCORRECT;
    }
    if(InpStatsBars > 0 && InpStatsMaxHold < 1)
@@ -1480,7 +1838,6 @@ int OnCalculate(const int rates_total,
 
 void OnTimer()
 {
-   //--- Market Watch can change while we run
    if(TimeCurrent() - g_lastUniverse >= 30)
    {
       g_lastUniverse = TimeCurrent();
