@@ -214,3 +214,62 @@ The indicator writes signals to a JSON file; the EA reads and executes them when
 7. Remaining models.
 8. Stats panel + dashboard.
 9. EA + config.json remote control.
+
+---
+
+## 14. Decisions (locked)
+
+| Question | Decision |
+|---|---|
+| Primary market | Synthetics first: Boom / Crash / Step (Deriv) |
+| Style | All three presets selectable: Scalp / Intraday / Swing |
+| Scope | Indicator + alerts (MT5 popup, push, Telegram). No auto-execution in v1 |
+| First model | Sweep -> MSS -> FVG |
+
+### 14.1 What changes for synthetics
+
+Synthetic indices are algorithmically generated. They have no sessions, no news, no
+correlated instruments and no institutional order flow. So:
+
+**Disabled on synthetics**
+- Killzones / Silver Bullet windows / Power of 3 (no sessions exist)
+- SMT divergence (no correlated series)
+- PDH/PDL treated as "liquidity pools" in the stop-run sense
+
+**Still valid on synthetics** (these are pure price geometry and transfer cleanly)
+- Swing structure, BOS / CHoCH / MSS with displacement
+- Fair value gaps — spikes leave very large, very clean ones
+- Dealing-range premium / discount, equilibrium, OTE
+- Equal highs / lows as resting-order clusters
+- Nearest opposing swing as the realistic profit target
+
+**Added for synthetics**
+- **Spike detection**: bar range >= k x ATR in the instrument's spike direction.
+- **Directional asymmetry**: Crash spikes down and grinds up; Boom spikes up and grinds
+  down. The engine auto-detects this from the symbol name and scores with the
+  asymmetry rather than against it. A symmetric indicator on Boom/Crash is simply wrong.
+- **Two sub-modes** — *drip* (trade the grind: high hit rate, small target, tail risk)
+  and *spike* (catch the spike: low hit rate, small stop, large R, positive skew).
+- **Spike-cycle hazard estimator**: Deriv documents "one spike on average every 1000
+  ticks". If that arrival process is memoryless, ticks-since-last-spike carries **no**
+  predictive information and any indicator claiming otherwise is selling a myth. So the
+  engine *measures* the empirical hazard from collected data and reports whether the
+  edge exists, instead of assuming it. If the hazard is flat, it says so.
+
+### 14.2 Style presets
+
+Presets set the bias/entry timeframe pair and the structure lookbacks. On synthetics
+they are additionally calibrated in **ticks**, not clock time, because spike frequency
+is defined per tick and does not care what the candle duration is.
+
+| Preset | Bias TF | Entry TF | Expected frequency |
+|---|---|---|---|
+| Scalp | M15 | M1 / M5 | many per day |
+| Intraday | H4 | M15 | 1-3 per day per symbol |
+| Swing | D1/W1 | H4 | a few per week |
+
+### 14.3 Alert timing contract
+
+- **WATCH** — setup armed, entry zone published, price approaching. Zero repaint risk.
+- **TRIGGER** — entry conditions met on the **close** of the entry-timeframe bar. Never
+  mid-bar. This is the tradeable alert.
