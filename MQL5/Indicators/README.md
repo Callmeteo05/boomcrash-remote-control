@@ -349,6 +349,9 @@ Two opt-in extras:
 - Data per symbol is kept lean: ~325 entry bars and `InpBiasBars` (260) per bias timeframe.
   Warm-up is `3 × slow EMA`, which leaves about 0.3% of the seed in EMA50 — far outside where
   any signal is read — and lets a symbol qualify sooner after its history lands.
+- A symbol the broker lists but never supplies history for is marked `NO DATA` after
+  `InpMaxTries` attempts and stops holding the scanner in warm-up mode. It is still retried in
+  the normal rotation, so it recovers by itself if the data turns up later.
 - Symbols are analysed **round-robin, `InpSymbolsPerTick` per second** (default 6), and only
   when that symbol prints a new bar; otherwise the cached result is shown.
 - Three `CopyRates` per symbol per new bar (entry TF + D1 + H4). ATR and all structure walks
@@ -376,6 +379,7 @@ Two opt-in extras:
 | `InpSymbolsPerTick` | 10 | Maintenance scan rate once every symbol has been analysed |
 | `InpWarmupPerTick` | 60 | Burst rate during the first fill |
 | `InpBiasBars` | 260 | Bars fetched per bias timeframe |
+| `InpMaxTries` | 25 | Attempts before a symbol stops holding up the warm-up |
 | `InpMaxSymbols` | 0 | 0 = every Market Watch symbol, no cap |
 | `InpPdMaxPct` | 0.50 | Lower it for deeper discount / higher premium |
 | `InpRequireBothLegs` | false | true = only A+ setups |

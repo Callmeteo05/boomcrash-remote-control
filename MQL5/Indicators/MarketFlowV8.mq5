@@ -82,6 +82,7 @@ input int             InpMaxSymbols     = 0;     // Cap on scanned symbols (0 = 
 input int             InpSymbolsPerTick = 10;    // Symbols analysed per second once warm
 input int             InpWarmupPerTick  = 60;    // Symbols analysed per second during first fill
 input int             InpBiasBars       = 260;   // Bars fetched per bias timeframe
+input int             InpMaxTries       = 25;    // Attempts before a symbol stops holding up the warm-up
 
 input group "=== Timeframes ==="
 input ENUM_TIMEFRAMES InpTimeframe      = PERIOD_CURRENT; // Entry timeframe
@@ -257,6 +258,7 @@ struct MFSymbol
    datetime curBar;         // newest bar time, refreshed every cycle
    int      statWins;
    int      statLosses;
+   int      tries;           // consecutive analyses that found no usable history
    datetime lastAlert;       // heads-up already sent for this setup
    datetime alertedEntry;    // entry alert already sent for this setup
    int      scoutDir;        // directional read when there is no tradable setup
@@ -332,8 +334,9 @@ const string      g_prefix  = "MFV8_";
 const int         g_titleH  = 24;
 const int         g_headerH = 20;
 
-int               g_win     = 0;   // sub-window this indicator occupies
+int               g_win     = -1;  // sub-window this indicator occupies (-1 = not resolved)
 int               g_objWin   = 0;  // window new objects are created in
+bool              g_tradeDrawn = false;  // are the price-chart trade objects up?
 
 MFSymbol          g_syms[];
 int               g_order[];
@@ -576,6 +579,7 @@ void BuildUniverse()
       r.curBar     = 0;
       r.statWins   = 0;
       r.statLosses = 0;
+      r.tries        = 0;
       r.lastAlert    = 0;
       r.alertedEntry = 0;
       r.scoutDir     = 0;
@@ -610,6 +614,7 @@ void BuildUniverse()
             r.lastBar    = old[j].lastBar;
             r.statWins   = old[j].statWins;
             r.statLosses = old[j].statLosses;
+            r.tries        = old[j].tries;
             r.lastAlert    = old[j].lastAlert;
             r.alertedEntry = old[j].alertedEntry;
             r.scoutDir     = old[j].scoutDir;
@@ -1430,7 +1435,8 @@ void AnalyseSymbol(MFSymbol &s)
    int got = CopyRates(s.name, g_tf, 0, want, c.r);
    if(got < warmup + InpMaxAge + 4)
    {
-      s.note = (got <= 0 ? "LOADING" : "SHORT HIST");
+      s.tries++;
+      s.note = (got <= 0 ? (s.tries >= InpMaxTries ? "NO DATA" : "LOADING") : "SHORT HIST");
       return;
    }
    c.n = got;
@@ -1458,7 +1464,8 @@ void AnalyseSymbol(MFSymbol &s)
       }
       else
       {
-         s.note = "LOADING " + g_b1Text;
+         s.tries++;
+         s.note = (s.tries >= InpMaxTries ? "NO " + g_b1Text : "LOADING " + g_b1Text);
          return;
       }
    }
@@ -1476,7 +1483,8 @@ void AnalyseSymbol(MFSymbol &s)
       }
       else
       {
-         s.note = "LOADING " + g_b2Text;
+         s.tries++;
+         s.note = (s.tries >= InpMaxTries ? "NO " + g_b2Text : "LOADING " + g_b2Text);
          return;
       }
    }
@@ -1570,6 +1578,7 @@ void AnalyseSymbol(MFSymbol &s)
    }
 
    s.analysed = true;
+   s.tries    = 0;
    s.note     = "";
    s.lastBar  = c.r[0].time;
 
@@ -1670,7 +1679,7 @@ void RunScanBudget()
    //--- board fills quickly; after that only new bars need work, so drop back
    bool warm = true;
    for(int i = 0; i < total; i++)
-      if(g_syms[i].ok && !g_syms[i].analysed)
+      if(g_syms[i].ok && !g_syms[i].analysed && g_syms[i].tries < InpMaxTries)
       {
          warm = false;
          break;
@@ -1686,7 +1695,7 @@ void RunScanBudget()
       MqlRates probe[];
       for(int i = 0; i < total; i++)
       {
-         if(!g_syms[i].ok || g_syms[i].analysed)
+         if(!g_syms[i].ok || g_syms[i].analysed || g_syms[i].tries >= InpMaxTries)
             continue;
          CopyRates(g_syms[i].name, g_tf, 0, 1, probe);
          if(g_use1) CopyRates(g_syms[i].name, g_bias1, 0, 1, probe);
@@ -1879,7 +1888,7 @@ string WinRateText(const MFSymbol &s)
    if(InpStatsBars <= 0)
       return "off";
    int total = s.statWins + s.statLosses;
-   if(total < InpStatsMinSamples)
+   if(total <= 0 || total < InpStatsMinSamples)
       return StringFormat("n/a %d", total);
    return StringFormat("%d%% %d", (int)MathRound(100.0 * s.statWins / total), total);
 }
@@ -2052,7 +2061,10 @@ void DrawPanel()
 //+------------------------------------------------------------------+
 void ClearChartTrade()
 {
+   if(!g_tradeDrawn)
+      return;                     // nothing up: skip the sweep entirely
    ObjectsDeleteAll(0, g_prefix + "tr_");
+   g_tradeDrawn = false;
 }
 
 void SetTradeLine(const string name, const datetime t1, const datetime t2, const double price,
@@ -2228,7 +2240,11 @@ void DrawChartTrade()
 
    //--- reference legend: "TRADE" over "<arrow> BUY+ CONTINUATION", nothing else.
    //--- the SMC read moves to an opt-in third line so the default view matches.
-   int legendY = InpPanelY + PanelHeight() + 8;
+   g_tradeDrawn = true;
+
+   //--- the legend sits on the price chart, so it is measured from that chart's
+   //--- bottom edge - the panel's height is in a different window now
+   int legendY = InpPanelY + 4;
    int yTrade  = legendY + (InpShowTradeDetail ? 32 : 16);
    int ySignal = legendY + (InpShowTradeDetail ? 16 : 0);
 
@@ -2328,9 +2344,7 @@ int OnInit()
 
    IndicatorSetString(INDICATOR_SHORTNAME, "MarketFlow V8");
 
-   g_win = ChartWindowFind();
-   if(g_win < 0)
-      g_win = 0;
+   g_win = ChartWindowFind();      // may still be -1 here; the timer resolves it
 
    LayoutColumns();
    ArrayResize(g_syms, 0);
@@ -2338,9 +2352,12 @@ int OnInit()
    g_lastUniverse = TimeCurrent();
 
    BuildOrder();
-   DrawPanel();
-   DrawWatermark();
-   ChartRedraw();
+   if(g_win >= 0)
+   {
+      DrawPanel();
+      DrawWatermark();
+      ChartRedraw();
+   }
 
    EventSetTimer(1);
    return INIT_SUCCEEDED;
@@ -2380,20 +2397,25 @@ int OnCalculate(const int rates_total,
    return rates_total;
 }
 
-void SyncWindow()
+bool SyncWindow()
 {
    int w = ChartWindowFind();
-   if(w >= 0 && w != g_win)
+   if(w < 0)
+      return false;               // sub-window not established yet, do not draw
+   if(w != g_win)
    {
       //--- our sub-window moved; objects cannot change window, so rebuild them
       g_win = w;
       ObjectsDeleteAll(0, g_prefix);
+      g_tradeDrawn = false;
    }
+   return true;
 }
 
 void OnTimer()
 {
-   SyncWindow();
+   if(!SyncWindow())
+      return;
 
    if(TimeCurrent() - g_lastUniverse >= 10)
    {
