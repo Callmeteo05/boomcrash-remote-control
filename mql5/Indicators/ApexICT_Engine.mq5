@@ -118,7 +118,26 @@ input group "=== Journal ==="
 input bool             InpJournalEnabled    = true;            // Append every signal to a CSV journal
 input string           InpJournalFile       = "ApexICT_Journal.csv"; // File name (MQL5/Files)
 
+input group "=== Header block (top-left chart text) ==="
+input bool             InpShowHeader        = true;            // Show the header block
+input string           InpHdr1              = "Apex ICT Engine";                      // Header line 1
+input string           InpHdr2              = "Follow Green & Red Arrows";            // Header line 2
+input string           InpHdr3              = "Stop Loss: structure-based, per symbol"; // Header line 3
+input string           InpHdr4              = "Take Profit: TP1 / TP2 / TP3 at liquidity"; // Header line 4
+input color            InpHdr1Color         = clrBlack;        // Header line 1 colour
+input color            InpHdr2Color         = clrBlue;         // Header line 2 colour
+input color            InpHdr3Color         = clrRed;          // Header line 3 colour
+input color            InpHdr4Color         = clrBlack;        // Header line 4 colour
+input int              InpHdrFontSize       = 10;              // Header font size
+
+input group "=== Outcome tracking ==="
+input bool             InpTrackOutcomes     = true;            // Follow each signal to TP or SL
+input bool             InpShowOutcomeMarks  = true;            // Print TP / SL marks where they were hit
+input bool             InpShowStats         = true;            // Live win rate / expectancy panel
+
 input group "=== Visuals ==="
+input bool             InpShowZones         = false;           // Shade the risk and reward zones
+input bool             InpShowEntryTag      = true;            // "BUY 0.05 at 1.23456" tag on the entry line
 input bool             InpShowStructure     = true;            // Draw BOS / CHoCH / MSS labels
 input bool             InpShowFVG           = true;            // Draw fair value gaps
 input bool             InpShowRange         = true;            // Draw dealing range + equilibrium
@@ -191,6 +210,23 @@ struct Setup
    bool     watchAlerted;
   };
 
+//--- an emitted signal, followed forward to its outcome
+struct TradeRec
+  {
+   int      idx;
+   int      dir;
+   int      entryBar;
+   datetime entryTime;
+   double   entry, sl, tp1, tp2, tp3;
+   double   risk;
+   int      grade;
+   string   gradeText;
+   bool     open;
+   bool     hitTP1, hitTP2, hitTP3;
+   int      result;          // 0 running, +1 target reached, -1 stopped
+   double   rMultiple;
+  };
+
 //+------------------------------------------------------------------+
 //| Globals                                                          |
 //+------------------------------------------------------------------+
@@ -199,6 +235,16 @@ struct Setup
 SwingPoint   g_major[];
 SwingPoint   g_internal[];
 FairValueGap g_fvg[];
+TradeRec     g_trades[];
+
+//--- realised statistics, filled in by the outcome tracker
+int          g_resolved      = 0;
+int          g_wins          = 0;
+int          g_losses        = 0;
+double       g_sumR          = 0.0;
+double       g_grossWinR     = 0.0;
+double       g_grossLossR    = 0.0;
+int          g_tp1Hits       = 0;
 
 SweepEvent   g_sweepBull;      // sell-side liquidity taken -> looking for longs
 SweepEvent   g_sweepBear;      // buy-side liquidity taken  -> looking for shorts
@@ -239,6 +285,28 @@ double SpreadPrice()
   {
    double sp = (double)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
    return sp * _Point;
+  }
+
+//--- snap a level to the instrument's tick grid. Synthetic indices and
+//--- metals do not always have tick size == point, and a level off the
+//--- grid is a level the server will not accept.
+double NormalizePrice(const double p)
+  {
+   double ts = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double v  = p;
+   if(ts > 0.0) v = MathRound(p / ts) * ts;
+   return NormalizeDouble(v, g_digits);
+  }
+
+//--- the broker's minimum distance between price and any SL or TP.
+//--- A structurally perfect stop inside this distance is simply rejected,
+//--- so every level is pushed out to at least this far.
+double MinStopDistance()
+  {
+   long lvl = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double d = (double)lvl * _Point;
+   double frz = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL) * _Point;
+   return MathMax(d, frz);
   }
 
 //+------------------------------------------------------------------+
@@ -310,6 +378,10 @@ void ResetState()
    ArrayResize(g_major, 0);
    ArrayResize(g_internal, 0);
    ArrayResize(g_fvg, 0);
+   ArrayResize(g_trades, 0);
+
+   g_resolved = 0; g_wins = 0; g_losses = 0;
+   g_sumR = 0.0;   g_grossWinR = 0.0; g_grossLossR = 0.0; g_tp1Hits = 0;
 
    ClearSweep(g_sweepBull);
    ClearSweep(g_sweepBear);
@@ -763,15 +835,36 @@ void DrawBox(const string name, const datetime t1, const double p1,
 void DrawSignalLevels(const int idx, const int dir, const datetime t1, const datetime t2,
                       const double entry, const double sl,
                       const double tp1, const double tp2, const double tp3,
-                      const string gradeTxt)
+                      const string gradeTxt, const double arrowPrice, const double lots)
   {
-   if(!InpShowLevels) return;
-
    color dirColor = (dir > 0) ? InpBuyColor : InpSellColor;
 
-   DrawSegment(ObjName("ENT", idx), t1, entry, t2, entry, dirColor, STYLE_SOLID, 1);
-   DrawSegment(ObjName("SL",  idx), t1, sl,    t2, sl,    InpSLColor, STYLE_DOT, 2);
+   //--- the BUY / SELL word at the arrow, as in a classic arrow system
+   DrawText(ObjName("SIG", idx), t1, arrowPrice,
+            StringFormat("%s %s", (dir > 0 ? "BUY" : "SELL"), gradeTxt), dirColor, 10);
 
+   if(!InpShowLevels) return;
+
+   //--- shaded risk / reward zones
+   if(InpShowZones)
+     {
+      DrawBox(ObjName("ZR", idx), t1, entry, t2, sl,  InpSLColor);
+      DrawBox(ObjName("ZT", idx), t1, entry, t2, tp2, dirColor);
+     }
+
+   //--- entry
+   DrawSegment(ObjName("ENT", idx), t1, entry, t2, entry, dirColor, STYLE_SOLID, 1);
+   if(InpShowEntryTag)
+      DrawText(ObjName("TAG", idx), t1, entry,
+               StringFormat("%s %s at %s", (dir > 0 ? "BUY" : "SELL"),
+                            DoubleToString(lots, 2), DoubleToString(entry, g_digits)),
+               dirColor, 8);
+
+   //--- stop, drawn as the red dotted band
+   DrawSegment(ObjName("SL",  idx), t1, sl, t2, sl, InpSLColor, STYLE_DOT, 2);
+   DrawText   (ObjName("SLt", idx), t2, sl, "SL", InpSLColor);
+
+   //--- targets
    DrawSegment(ObjName("TP1", idx), t1, tp1, t2, tp1, InpTPColor, STYLE_DOT, 1);
    DrawText   (ObjName("TP1t",idx), t2, tp1, "TP1", InpTPColor);
 
@@ -785,10 +878,118 @@ void DrawSignalLevels(const int idx, const int dir, const datetime t1, const dat
       DrawSegment(ObjName("TP3", idx), t1, tp3, t2, tp3, InpTPColor, STYLE_DOT, 1);
       DrawText   (ObjName("TP3t",idx), t2, tp3, "TP3", InpTPColor);
      }
+  }
 
-   DrawText(ObjName("SLt", idx), t2, sl, "SL", InpSLColor);
-   DrawText(ObjName("LBL", idx), t1, entry,
-            StringFormat("%s %s", (dir > 0 ? "BUY" : "SELL"), gradeTxt), dirColor, 9);
+//+------------------------------------------------------------------+
+//| Outcome tracker.                                                 |
+//| Every emitted signal is followed forward bar by bar until it      |
+//| reaches a target or its stop. The TP / SL marks this prints are   |
+//| results, not predictions - they appear only after the bar that    |
+//| produced them has closed, and they never move.                    |
+//|                                                                   |
+//| Accounting policy: the trade is scored as held to TP2 or the stop.|
+//| If one bar spans both, it is recorded as the loss. That is the    |
+//| pessimistic reading and it keeps the statistics honest.           |
+//+------------------------------------------------------------------+
+void UpdateTrades(const int i, const datetime &time[],
+                  const double &high[], const double &low[])
+  {
+   if(!InpTrackOutcomes) return;
+
+   for(int k = ArraySize(g_trades) - 1; k >= 0; k--)
+     {
+      if(!g_trades[k].open)        continue;
+      if(i <= g_trades[k].entryBar) continue;
+
+      int    d    = g_trades[k].dir;
+      double risk = g_trades[k].risk;
+      if(risk <= 0.0) { g_trades[k].open = false; continue; }
+
+      bool slHit  = (d > 0) ? (low[i]  <= g_trades[k].sl) : (high[i] >= g_trades[k].sl);
+      bool tp1Hit = (d > 0) ? (high[i] >= g_trades[k].tp1) : (low[i] <= g_trades[k].tp1);
+      bool tp2Hit = (d > 0) ? (high[i] >= g_trades[k].tp2) : (low[i] <= g_trades[k].tp2);
+      bool tp3Hit = (d > 0) ? (high[i] >= g_trades[k].tp3) : (low[i] <= g_trades[k].tp3);
+
+      //--- stop first: the pessimistic reading of an ambiguous bar
+      if(slHit)
+        {
+         g_trades[k].open      = false;
+         g_trades[k].result    = -1;
+         g_trades[k].rMultiple = -1.0;
+
+         g_resolved++; g_losses++;
+         g_sumR       -= 1.0;
+         g_grossLossR += 1.0;
+
+         if(InpShowOutcomeMarks)
+            DrawText(ObjName("XSL", g_trades[k].idx), time[i], g_trades[k].sl,
+                     "SL", InpSLColor, 8);
+         continue;
+        }
+
+      if(tp1Hit && !g_trades[k].hitTP1)
+        {
+         g_trades[k].hitTP1 = true;
+         g_tp1Hits++;
+         if(InpShowOutcomeMarks)
+            DrawText(ObjName("XT1", g_trades[k].idx), time[i], g_trades[k].tp1,
+                     "TP", InpTPColor, 8);
+        }
+
+      if(tp3Hit && !g_trades[k].hitTP3)
+        {
+         g_trades[k].hitTP3 = true;
+         if(InpShowOutcomeMarks)
+            DrawText(ObjName("XT3", g_trades[k].idx), time[i], g_trades[k].tp3,
+                     "TP", InpTPColor, 8);
+        }
+
+      if(tp2Hit && !g_trades[k].hitTP2)
+        {
+         g_trades[k].hitTP2    = true;
+         g_trades[k].open      = false;
+         g_trades[k].result    = 1;
+         g_trades[k].rMultiple = MathAbs(g_trades[k].tp2 - g_trades[k].entry) / risk;
+
+         g_resolved++; g_wins++;
+         g_sumR      += g_trades[k].rMultiple;
+         g_grossWinR += g_trades[k].rMultiple;
+
+         if(InpShowOutcomeMarks)
+            DrawText(ObjName("XT2", g_trades[k].idx), time[i], g_trades[k].tp2,
+                     "TP", InpTPColor, 8);
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Header block, top-left, mirroring a classic arrow system layout  |
+//+------------------------------------------------------------------+
+void DrawHeaderLine(const int line, const string txt, const color clr)
+  {
+   string name = StringFormat("%sHDR%d", PREFIX, line);
+   if(ObjectFind(0, name) < 0)
+     {
+      ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+      ObjectSetInteger(0, name, OBJPROP_XDISTANCE, 12);
+      ObjectSetInteger(0, name, OBJPROP_YDISTANCE, 18 + line * (InpHdrFontSize + 6));
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+      ObjectSetString (0, name, OBJPROP_FONT, "Arial Bold");
+      ObjectSetInteger(0, name, OBJPROP_FONTSIZE, InpHdrFontSize);
+     }
+   ObjectSetString (0, name, OBJPROP_TEXT, txt);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
+  }
+
+void UpdateHeader()
+  {
+   if(!InpShowHeader) return;
+   DrawHeaderLine(0, InpHdr1, InpHdr1Color);
+   DrawHeaderLine(1, InpHdr2, InpHdr2Color);
+   DrawHeaderLine(2, InpHdr3, InpHdr3Color);
+   DrawHeaderLine(3, InpHdr4, InpHdr4Color);
   }
 
 //+------------------------------------------------------------------+
@@ -900,6 +1101,15 @@ void TryArmSetup(const int i, const int dir, const double &close[])
    double buffer = InpSLbufferATR * atr + InpSpreadMult * SpreadPrice();
    double sl     = (dir > 0) ? (sw.extreme - buffer) : (sw.extreme + buffer);
 
+   //--- respect the broker's minimum stop distance for this symbol.
+   //--- Without this the level is structurally correct and untradeable.
+   double minDist = MinStopDistance();
+   if(minDist > 0.0 && MathAbs(entry - sl) < minDist)
+      sl = (dir > 0) ? (entry - minDist) : (entry + minDist);
+
+   entry = NormalizePrice(entry);
+   sl    = NormalizePrice(sl);
+
    double risk = MathAbs(entry - sl);
    if(risk <= 0.0) return;
 
@@ -915,6 +1125,26 @@ void TryArmSetup(const int i, const int dir, const double &close[])
    double tp2 = (dol > 0.0) ? dol
                             : ((dir > 0) ? entry + 2.0 * risk : entry - 2.0 * risk);
    double tp3 = (dir > 0) ? entry + InpTP3_R * risk : entry - InpTP3_R * risk;
+
+   //--- targets must clear the same minimum distance, and sit on the tick grid
+   if(minDist > 0.0)
+     {
+      if(dir > 0)
+        {
+         tp1 = MathMax(tp1, entry + minDist);
+         tp2 = MathMax(tp2, tp1 + minDist);
+         tp3 = MathMax(tp3, tp2 + minDist);
+        }
+      else
+        {
+         tp1 = MathMin(tp1, entry - minDist);
+         tp2 = MathMin(tp2, tp1 - minDist);
+         tp3 = MathMin(tp3, tp2 - minDist);
+        }
+     }
+   tp1 = NormalizePrice(tp1);
+   tp2 = NormalizePrice(tp2);
+   tp3 = NormalizePrice(tp3);
 
    //--- premium / discount hard filter
    if(InpRequireDiscount)
@@ -977,16 +1207,43 @@ void TryTriggerSetup(const int i, const int rates_total, const datetime &time[],
    int idx = g_signalCount;
 
    double atr = BufATR[i];
-   if(g_setup.dir > 0) BufBuy[i]  = low[i]  - 0.6 * atr;
-   else                BufSell[i] = high[i] + 0.6 * atr;
+   double arrowPrice = (g_setup.dir > 0) ? (low[i] - 0.6 * atr) : (high[i] + 0.6 * atr);
+   if(g_setup.dir > 0) BufBuy[i]  = arrowPrice;
+   else                BufSell[i] = arrowPrice;
+
+   double lots = SuggestLots(g_setup.entry, g_setup.sl);
+   double risk = MathAbs(g_setup.entry - g_setup.sl);
 
    int lastIdx = MathMin(rates_total - 1, i + InpLevelBars);
    DrawSignalLevels(idx, g_setup.dir, time[i], time[lastIdx],
                     g_setup.entry, g_setup.sl, g_setup.tp1, g_setup.tp2, g_setup.tp3,
-                    g_setup.gradeText);
+                    g_setup.gradeText, arrowPrice, lots);
 
-   double lots = SuggestLots(g_setup.entry, g_setup.sl);
-   double risk = MathAbs(g_setup.entry - g_setup.sl);
+   //--- register the signal so the outcome tracker can follow it forward
+   if(InpTrackOutcomes)
+     {
+      int n = ArraySize(g_trades);
+      ArrayResize(g_trades, n + 1);
+      g_trades[n].idx       = idx;
+      g_trades[n].dir       = g_setup.dir;
+      g_trades[n].entryBar  = i;
+      g_trades[n].entryTime = time[i];
+      g_trades[n].entry     = g_setup.entry;
+      g_trades[n].sl        = g_setup.sl;
+      g_trades[n].tp1       = g_setup.tp1;
+      g_trades[n].tp2       = g_setup.tp2;
+      g_trades[n].tp3       = g_setup.tp3;
+      g_trades[n].risk      = risk;
+      g_trades[n].grade     = g_setup.grade;
+      g_trades[n].gradeText = g_setup.gradeText;
+      g_trades[n].open      = true;
+      g_trades[n].hitTP1    = false;
+      g_trades[n].hitTP2    = false;
+      g_trades[n].hitTP3    = false;
+      g_trades[n].result    = 0;
+      g_trades[n].rMultiple = 0.0;
+     }
+
    double rr2  = (risk > 0.0) ? MathAbs(g_setup.tp2 - g_setup.entry) / risk : 0.0;
 
    g_lastSignalTxt = StringFormat("%s %s @ %s  SL %s  TP2 %s  (%.1fR)",
@@ -1066,8 +1323,10 @@ void UpdatePanel()
      {
       ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
       ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
-      ObjectSetInteger(0, name, OBJPROP_XDISTANCE, 10);
-      ObjectSetInteger(0, name, OBJPROP_YDISTANCE, 20);
+      ObjectSetInteger(0, name, OBJPROP_XDISTANCE, 12);
+      //--- sit below the header block rather than on top of it
+      ObjectSetInteger(0, name, OBJPROP_YDISTANCE,
+                       InpShowHeader ? (26 + 4 * (InpHdrFontSize + 6)) : 20);
       ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
       ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
       ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 9);
@@ -1078,9 +1337,20 @@ void UpdatePanel()
                 : (g_synthDir < 0) ? " | Crash: spikes down"
                 : (g_isStepIndex   ? " | Step Index: no directional edge" : "");
 
+   string stats = "";
+   if(InpShowStats && g_resolved > 0)
+     {
+      double winRate = 100.0 * g_wins / g_resolved;
+      double expect  = g_sumR / g_resolved;
+      double pf      = (g_grossLossR > 0.0) ? g_grossWinR / g_grossLossR : 0.0;
+      stats = StringFormat(" | resolved %d  win %.1f%%  exp %.2fR  PF %.2f  TP1 hit %d",
+                           g_resolved, winRate, expect, pf, g_tp1Hits);
+     }
+
    ObjectSetString(0, name, OBJPROP_TEXT,
-                   StringFormat("Apex ICT | structure %s | signals %d | %s%s",
-                                trend, g_signalCount, g_lastSignalTxt, synth));
+                   StringFormat("Apex ICT | %s %s | structure %s | signals %d%s | %s%s",
+                                _Symbol, EnumToString((ENUM_TIMEFRAMES)_Period),
+                                trend, g_signalCount, stats, g_lastSignalTxt, synth));
    ObjectSetInteger(0, name, OBJPROP_COLOR,
                     (g_trendMajor > 0) ? InpBuyColor : (g_trendMajor < 0 ? InpSellColor : clrGray));
   }
@@ -1254,6 +1524,10 @@ int OnCalculate(const int rates_total,
       if(intBreak > 0) TryArmSetup(i,  1, close);
       if(intBreak < 0) TryArmSetup(i, -1, close);
 
+      //--- follow already-emitted signals to their outcome before a new one fires,
+      //--- so a signal never resolves itself on its own entry bar
+      UpdateTrades(i, time, high, low);
+
       //--- entry fill
       MaybeWatchAlert(i, rates_total, time, close);
       TryTriggerSetup(i, rates_total, time, high, low);
@@ -1297,6 +1571,7 @@ int OnCalculate(const int rates_total,
         }
      }
 
+   UpdateHeader();
    UpdatePanel();
    return rates_total;
   }
