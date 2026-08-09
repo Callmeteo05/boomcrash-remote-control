@@ -137,15 +137,40 @@ score component: a day trade taken in the wrong half of the range is the short, 
 you buy where the move is already spent, and your target is the part of the leg somebody else
 already took.
 
-The range used is the **bias timeframe's dealing range**, not the chart's, because that is the
-range the move actually belongs to (`InpPdUseBiasRange`; falls back to the chart range when the
-bias range is unusable). Position is measured 0 at the range low, 1 at the high:
+The range used is the **chart timeframe's dealing range** — the leg you are actually trading.
+After a bullish break that range runs from the swing low that preceded it up to the break high,
+and the order block sits near its bottom: genuine discount.
+
+Do not measure this on the bias timeframe (`InpPdUseBiasRange`, off by default). The bias filter
+already requires price to be trending on H1/H4, which puts it near the *top* of the H1/H4 range
+for a buy — demanding the entry also sit in the bottom half of that same range is very nearly a
+contradiction, and it rejects almost everything. The bias timeframes decide direction; they
+should not also define where in the move you are allowed to enter.
+
+Position is measured 0 at the range low, 1 at the high:
 
 - buy needs `position ≤ InpPdMaxPct` (0.50 = at or below equilibrium)
 - sell needs `position ≥ 1 − InpPdMaxPct`
 
 Set `InpPdMaxPct = 0.40` to demand deeper discount and fewer, longer-legged setups.
 `InpRequirePD = false` downgrades it back to a scoring component only.
+
+## When a pair shows no setup, it says why
+
+A `WATCH` row puts the reason in the `SMC` column (turn it on with `InpShowSmc`):
+
+| Text | Meaning |
+| --- | --- |
+| `no shift` | no BOS/CHoCH on the chart timeframe within `InpMaxAge` bars |
+| `bias H4` / `bias H1` | that bias timeframe disagrees with the break |
+| `no leg` | neither the SMC leg nor the EMA/RSI leg confirmed |
+| `no POI` / `POI wide` | no order block or FVG, or the zone is wider than `InpMaxZoneAtr` |
+| `in premium` / `in discount` | the entry is on the wrong side of equilibrium |
+| `stop wide` | the stop would exceed `InpMaxRiskAtr` |
+| `score 62` | everything passed but the confluence total missed `InpMinScore` |
+
+An empty board is then a diagnosis rather than a mystery — if every row reads `bias H4`, the
+bias filter is too strict for the conditions; if they read `score 62`, lower `InpMinScore`.
 
 ## Setup lifetime
 

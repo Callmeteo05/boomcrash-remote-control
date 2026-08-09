@@ -89,7 +89,7 @@ input ENUM_TIMEFRAMES InpTimeframe      = PERIOD_CURRENT; // Entry timeframe
 input bool            InpBiasAuto       = true;          // Bias follows the chart (1 and 2 steps up)
 input ENUM_TIMEFRAMES InpBiasTF1        = PERIOD_D1;      // Higher bias TF (when auto is off)
 input ENUM_TIMEFRAMES InpBiasTF2        = PERIOD_H4;      // Nearer bias TF (when auto is off)
-input ENUM_MF_BIAS    InpBiasMode       = MF_BIAS_BOTH;   // How strict the bias must be
+input ENUM_MF_BIAS    InpBiasMode       = MF_BIAS_H4LED;  // How strict the bias must be
 
 input group "=== Market structure (SMC) ==="
 input int             InpSwingStrength  = 2;     // Fractal strength (bars each side)
@@ -102,7 +102,7 @@ input bool            InpRequireBothLegs= false; // Demand SMC *and* EMA/RSI, no
 input int             InpPoiLookback    = 10;    // Bars back to find the OB / FVG
 input ENUM_MF_POI     InpPoiEntry       = MF_POI_CE; // Where in the zone to enter
 input bool            InpRequirePD      = true;  // HARD: no buys in premium, no sells in discount
-input bool            InpPdUseBiasRange = true;  // Measure premium/discount on the bias timeframe range
+input bool            InpPdUseBiasRange = false; // Measure premium/discount on the bias timeframe range
 input double          InpPdMaxPct       = 0.50;  // Buy must sit in the lowest x of the range (0.40 = deeper)
 
 input group "=== Trend filter (EMA + RSI) ==="
@@ -265,6 +265,7 @@ struct MFSymbol
    int      scoutScore;
    int      scoutB1;
    int      scoutB2;
+   string   scoutWhy;        // why this pair has no setup right now
    string   note;
    MFSignal sig;
 };
@@ -330,6 +331,20 @@ int   g_panelW = 900;
 //+------------------------------------------------------------------+
 //| Globals                                                          |
 //+------------------------------------------------------------------+
+//--- why the last evaluation failed, kept so a pair with no setup can say so
+int               g_rejStage = 0;
+string            g_rejWhy   = "";
+
+bool Reject(const int stage, const string why)
+{
+   if(stage > g_rejStage)
+   {
+      g_rejStage = stage;
+      g_rejWhy   = why;
+   }
+   return false;
+}
+
 const string      g_prefix  = "MFV8_";
 const int         g_titleH  = 24;
 const int         g_headerH = 20;
@@ -586,6 +601,7 @@ void BuildUniverse()
       r.scoutScore   = 0;
       r.scoutB1      = 0;
       r.scoutB2      = 0;
+      r.scoutWhy     = "";
       r.note         = "LOADING";
       r.sig.valid  = false;
       r.sig.status = ST_WAIT;
@@ -621,6 +637,7 @@ void BuildUniverse()
             r.scoutScore   = old[j].scoutScore;
             r.scoutB1      = old[j].scoutB1;
             r.scoutB2      = old[j].scoutB2;
+            r.scoutWhy     = old[j].scoutWhy;
             r.note       = old[j].note;
             r.sig        = old[j].sig;
             break;
@@ -957,14 +974,14 @@ bool EvaluateAt(const MFSymbol &s, MFCtx &c, const int i, MFSignal &out)
 
    int n = c.n;
    if(i < 1 || i + 2 >= n)
-      return false;
+      return Reject(1, "no bars");
 
    //--- 1. a structure shift has to happen on this bar
    int dir = c.evDir[i];
    if(dir == 0)
-      return false;
+      return Reject(1, "no shift");
    if(c.atr[i] <= 0.0)
-      return false;
+      return Reject(1, "no ATR");
 
    bool choch = (c.evChoch[i] != 0);
 
@@ -978,25 +995,25 @@ bool EvaluateAt(const MFSymbol &s, MFCtx &c, const int i, MFSignal &out)
 
    if(InpBiasMode == MF_BIAS_BOTH)
    {
-      if(g_use1 && !agree1) return false;
-      if(g_use2 && !agree2) return false;
+      if(g_use1 && !agree1) return Reject(2, "bias " + g_b1Text);
+      if(g_use2 && !agree2) return Reject(2, "bias " + g_b2Text);
    }
    else if(InpBiasMode == MF_BIAS_H4LED)
    {
-      if(g_use2 && !agree2) return false;          // secondary (H4) must agree
-      if(g_use1 && b1 == -dir) return false;       // primary (D1) must not oppose
+      if(g_use2 && !agree2) return Reject(2, "bias " + g_b2Text);
+      if(g_use1 && b1 == -dir) return Reject(2, "bias " + g_b1Text);
    }
    else
    {
       bool any = (g_use1 && agree1) || (g_use2 && agree2);
-      if((g_use1 || g_use2) && !any) return false;
+      if((g_use1 || g_use2) && !any) return Reject(2, "bias");
    }
 
    //--- 3. displacement: the break has to be driven, not drifted into
    double body = MathAbs(c.r[i].close - c.r[i].open);
    bool displaced = (body >= c.atr[i] * InpDispAtrMult);
    if(InpRequireDisp && !displaced)
-      return false;
+      return Reject(3, "no push");
 
    //--- 3b. EMA trend filter. A continuation has to sit on the right side of both
    //--- EMAs; a reversal only has to have reclaimed the fast one, because on a
@@ -1009,7 +1026,7 @@ bool EvaluateAt(const MFSymbol &s, MFCtx &c, const int i, MFSignal &out)
       emaOk = (dir > 0 ? (emaUp  && c.r[i].close > c.emaS[i])
                        : (!emaUp && c.r[i].close < c.emaS[i]));
    if(InpUseEmaFilter && InpRequireBothLegs && !emaOk)
-      return false;
+      return Reject(3, "EMA");
 
    //--- 3c. RSI filter. Refuses to buy something already exhausted upwards, and
    //--- demands that a reversal actually come from the stretched side.
@@ -1021,7 +1038,7 @@ bool EvaluateAt(const MFSymbol &s, MFCtx &c, const int i, MFSignal &out)
       rsiOk = (dir > 0 ? (rs >= 45.0 && rs <= InpRsiMaxBuy)
                        : (rs <= 55.0 && rs >= InpRsiMinSell));
    if(InpUseRsiFilter && InpRequireBothLegs && !rsiOk)
-      return false;
+      return Reject(3, "RSI");
 
    //--- 4. liquidity sweep shortly before the shift
    bool   hasSweep    = false;
@@ -1035,7 +1052,7 @@ bool EvaluateAt(const MFSymbol &s, MFCtx &c, const int i, MFSignal &out)
          break;
       }
    if(InpRequireSweep && !hasSweep)
-      return false;
+      return Reject(3, "no sweep");
 
    //--- Two independent ways to confirm a break, either of which is enough on
    //--- top of an agreeing bias:
@@ -1053,19 +1070,19 @@ bool EvaluateAt(const MFSymbol &s, MFCtx &c, const int i, MFSignal &out)
    if(InpRequireBothLegs)
    {
       if(!smcOk || !trendOk)
-         return false;
+         return Reject(4, "one leg only");
    }
    else if(!smcOk && !trendOk)
-      return false;
+      return Reject(4, "no leg");
 
    //--- 5. point of interest to enter from
    MFPoi poi = FindPoi(c.r, n, i, dir);
    if(!poi.valid || poi.hi <= poi.lo)
-      return false;
+      return Reject(5, "no POI");
 
    //--- a zone wider than this is not a level, it is a guess
    if((poi.hi - poi.lo) > c.atr[i] * InpMaxZoneAtr)
-      return false;
+      return Reject(5, "POI wide");
 
    double entry = (InpPoiEntry == MF_POI_CE)
                   ? (poi.hi + poi.lo) * 0.5
@@ -1095,7 +1112,7 @@ bool EvaluateAt(const MFSymbol &s, MFCtx &c, const int i, MFSignal &out)
       pdOk = (dir > 0 ? pos <= InpPdMaxPct : pos >= 1.0 - InpPdMaxPct);
    }
    if(InpRequirePD && !pdOk)
-      return false;
+      return Reject(6, (dir > 0 ? "in premium" : "in discount"));
 
    //--- 7. stop behind the zone and behind the swept low/high
    double buffer = c.atr[i] * InpSlBufferAtr;
@@ -1131,11 +1148,11 @@ bool EvaluateAt(const MFSymbol &s, MFCtx &c, const int i, MFSignal &out)
       adjusted = true;
    }
    if(risk <= 0.0)
-      return false;
+      return Reject(7, "no risk");
 
    //--- a stop this wide means the structure is not clean enough to trade
    if(risk > c.atr[i] * InpMaxRiskAtr)
-      return false;
+      return Reject(7, "stop wide");
 
    //--- 8. targets: resting liquidity first, R multiples only as fallback
    double minTp1 = entry + dir * risk * InpMinTp1R;
@@ -1533,13 +1550,24 @@ void AnalyseSymbol(MFSymbol &s)
    //--- newest qualifying setup
    if(!held)
    {
+      //--- track how far the best candidate got, so a pair with no setup can say
+      //--- which gate stopped it rather than just showing a blank row
+      g_rejStage = 0;
+      g_rejWhy   = "";
+      int  events = 0;
+      int  bestScore = -1;
+      bool published = false;
+
       MFSignal sg;
       for(int i = 1; i <= InpMaxAge; i++)
       {
          if(c.evDir[i] == 0)
             continue;
+         events++;
          if(!EvaluateAt(s, c, i, sg))
             continue;
+         if(sg.score > bestScore)
+            bestScore = sg.score;
          if(sg.score < InpMinScore)
             continue;
 
@@ -1550,8 +1578,18 @@ void AnalyseSymbol(MFSymbol &s)
             continue;                  // discovered already over - never tradable
 
          s.sig = sg;
+         published = true;
          break;
       }
+
+      if(published)
+         s.scoutWhy = "";
+      else if(events == 0)
+         s.scoutWhy = "no shift";
+      else if(bestScore >= 0)
+         s.scoutWhy = StringFormat("score %d", bestScore);
+      else
+         s.scoutWhy = (g_rejWhy == "" ? "no setup" : g_rejWhy);
    }
 
    //--- measured hit rate of this exact rule on this symbol
@@ -2015,7 +2053,7 @@ void DrawPanel()
                         (sv ? BiasText(s.sig) : (scout ? BiasPair(s.scoutB1, s.scoutB2) : "-")));
       cell[C_SIGNAL] = (s.note != "" ? s.note :
                         (sv ? SignalText(s.sig) : DirText(s.scoutDir)));
-      cell[C_SMC]    = (sv ? s.sig.tags : "-");
+      cell[C_SMC]    = (sv ? s.sig.tags : (scout && s.scoutWhy != "" ? s.scoutWhy : "-"));
       cell[C_SCORE]  = (sv ? IntegerToString(s.sig.score)
                            : (scout ? IntegerToString(s.scoutScore) : "-"));
       cell[C_WR]     = (s.analysed ? WinRateText(s) : "-");
