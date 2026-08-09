@@ -1,0 +1,4 @@
+# rendered audio: large and regenerable via `python3 song.py`
+out/*.wav
+out/stems/
+__pycache__/
