@@ -118,12 +118,14 @@ input group "=== Quality gates ==="
 input double          InpMaxRiskAtr     = 4.0;   // Reject setups whose stop is wider than ATR x
 input double          InpMaxZoneAtr     = 2.5;   // Reject POI zones wider than ATR x
 input bool            InpHideFinished   = true;  // Drop a finished setup instead of leaving it on the board
-input ENUM_MF_RECYCLE InpRecycleAt      = MF_RECYCLE_TP1; // When a pair may produce its next setup
+input ENUM_MF_RECYCLE InpRecycleAt      = MF_RECYCLE_TP3; // When a pair may produce its next setup
+input int             InpMaxHoldBars    = 500;   // Safety cap on how long a FILLED trade is tracked
 
 input group "=== Signal selection ==="
-input int             InpMaxAge         = 25;    // Keep a setup on the board for N bars
+input int             InpMaxAge         = 25;    // Bars an UNFILLED limit waits before it is dropped
 input int             InpMinScore       = 70;    // Minimum confluence score (0-100)
 input bool            InpOnlySignals    = false; // Show only symbols with a live setup
+input bool            InpShowOnlyAnalysed= true; // A pair appears only once it has been analysed
 input ENUM_MF_SORT    InpSortMode       = MF_SORT_FRESH; // Row order
 input ENUM_MF_AGE     InpAgeMode        = MF_AGE_BARS;   // How AGE is displayed
 
@@ -1409,7 +1411,19 @@ void AnalyseSymbol(MFSymbol &s)
 
    int warmup = (int)MathMax(MathMax(InpAtrPeriod * 6, InpEmaSlow * 4), 200);
    int stats  = (wantStats ? InpStatsBars + InpStatsMaxHold : 0);
-   int want   = (int)MathMax(InpMaxAge + InpLiquidityLook + warmup, stats + warmup);
+   //--- Only stretch the history window when a trade is actually still running.
+   //--- Sizing every scan for the worst case would double the bars read on every
+   //--- symbol to cover a situation that is usually not happening.
+   int holdNeed = 0;
+   if(prev.valid)
+   {
+      int ps = iBarShift(s.name, g_tf, prev.time, false);
+      if(ps > 0)
+         holdNeed = (int)MathMin(ps + 8, InpMaxHoldBars + 8);
+   }
+
+   int want   = (int)MathMax(MathMax(InpMaxAge + InpLiquidityLook + warmup, stats + warmup),
+                             holdNeed + warmup);
 
    ArraySetAsSeries(c.r, true);
    int got = CopyRates(s.name, g_tf, 0, want, c.r);
@@ -1479,19 +1493,28 @@ void AnalyseSymbol(MFSymbol &s)
    if(prev.valid)
    {
       int pshift = iBarShift(s.name, g_tf, prev.time, false);
-      if(pshift >= 0 && pshift <= InpMaxAge)
+      if(pshift >= 0 && pshift < c.n - 2)
       {
          prev.barIndex = pshift;
          int st = ReplayStatus(c.r, c.n, prev);
          prev.status = st;
 
          bool finished = (st == ST_INVALID || st == ST_SL || st >= done);
-         if(!finished)
+
+         //--- A filled trade runs until TP3 or the stop, however long that takes -
+         //--- no clock kills it. An UNFILLED limit is different: if price never
+         //--- comes back to the zone the setup is just clutter, so it is dropped
+         //--- after InpMaxAge bars. InpMaxHoldBars is only a safety stop so a
+         //--- forgotten trade cannot be tracked forever.
+         bool expired = (st == ST_WAIT ? (pshift > InpMaxAge)
+                                       : (pshift > InpMaxHoldBars));
+
+         if(!finished && !expired)
          {
             s.sig = prev;             // still running - the pair stays occupied
             held  = true;
          }
-         else if(!InpHideFinished)
+         else if(finished && !InpHideFinished)
          {
             s.sig = prev;             // keep it visible until something replaces it
          }
@@ -1698,6 +1721,14 @@ void BuildOrder()
    for(int i = 0; i < ArraySize(g_syms); i++)
    {
       if(InpOnlySignals && !g_syms[i].sig.valid)
+         continue;
+
+      //--- a row on the board means real analysis sits behind it. Symbols still
+      //--- downloading are held back rather than shown as placeholders; ones that
+      //--- failed for a reason (DISABLED, SHORT HIST) still show, so nothing
+      //--- disappears silently.
+      if(InpShowOnlyAnalysed && !g_syms[i].analysed &&
+         StringFind(g_syms[i].note, "LOADING") == 0)
          continue;
       int k = ArraySize(g_order);
       ArrayResize(g_order, k + 1);

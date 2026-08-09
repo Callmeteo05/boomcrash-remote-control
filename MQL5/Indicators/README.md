@@ -147,6 +147,22 @@ bias range is unusable). Position is measured 0 at the range low, 1 at the high:
 Set `InpPdMaxPct = 0.40` to demand deeper discount and fewer, longer-legged setups.
 `InpRequirePD = false` downgrades it back to a scoring component only.
 
+## Setup lifetime
+
+A pair holds one setup at a time. What ends it depends on whether it ever filled:
+
+| State | Ends when |
+| --- | --- |
+| **Filled** (`ACTIVE`) | TP3 or SL — **no clock kills it**. It can run across sessions and overnight. `InpMaxHoldBars` (500) is a safety stop, not a design limit |
+| **Unfilled** (`WAITING`) | price never came back to the zone within `InpMaxAge` bars (25), or the stop was taken out before the fill (`INVALID`) |
+
+That split matters: an unfilled limit that price walked away from is clutter, but a running
+trade is a running trade and gets tracked to its conclusion. `InpRecycleAt` (default TP3) sets
+which target frees the pair for its next setup.
+
+The history window stretches only while a trade is actually still running, so the common case
+does not pay for the worst case.
+
 ## Quality gates
 
 Three hard rejections exist purely to keep low-quality setups off the board:
@@ -269,6 +285,11 @@ page counter on the right. `SIGNAL` shows `▲ BUY+` / `▼ SELL+` for a BOS con
 `▲ BUY` / `▼ SELL` for a CHoCH reversal. `AGE` reads `current`, `1 bars ago`, … The row of the
 symbol currently on the chart is highlighted. `OPEN` switches the chart to that row's symbol.
 
+**A pair reaches the board only once it has actually been analysed** (`InpShowOnlyAnalysed`).
+Symbols still downloading history are held back rather than shown as placeholders — combined
+with the warm-up burst the board fills in seconds. Symbols that failed for a reason (`DISABLED`,
+`SHORT HIST`) still appear, so nothing vanishes silently.
+
 **Every Market Watch symbol is collected**, not a capped subset — `InpMaxSymbols` defaults to
 `0`, meaning no limit. Rows sort live setups first, then the `WATCH` rows by strength, so page 1
 is always the actionable page, and you can page down through the rest at leisure.
@@ -350,13 +371,15 @@ Two opt-in extras:
 | `InpRequireBothLegs` | false | true = only A+ setups |
 | `InpBiasAuto` | true | Bias follows the chart (1 and 2 steps up) |
 | `InpBiasMode` | Both | Both bias timeframes must agree |
-| `InpRecycleAt` | TP1 | When a pair may produce its next setup |
+| `InpRecycleAt` | TP3 | Which target frees the pair for its next setup |
+| `InpMaxHoldBars` | 500 | Safety cap on tracking a filled trade |
+| `InpShowOnlyAnalysed` | true | Hide pairs until they are analysed |
 | `InpAlertMinScore` | 75 | Alert threshold |
 | `InpRequireSweep` | false | Set true to demand a liquidity sweep on every setup |
 | `InpRequireDisp` | true | Reject breaks without displacement |
 | `InpRequirePD` | false | Set true to refuse entries on the wrong side of equilibrium |
 | `InpPoiEntry` | CE | Zone midpoint, or proximal edge |
-| `InpMaxAge` | 25 | How long a setup stays on the board waiting for its fill |
+| `InpMaxAge` | 25 | Bars an **unfilled** limit waits before being dropped |
 | `InpStatsBars` | 600 | Back-test window; `0` disables the WR column |
 | `InpShowSmcMarkup` | false | POI zone, sweep line and BOS/CHoCH tag on the chart |
 | `InpShowTradeDetail` | false | Third legend line with the full SMC read |
