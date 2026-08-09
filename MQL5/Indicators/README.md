@@ -85,37 +85,67 @@ fallback= 1.5R / 2.5R / 4R whenever no liquidity is found in range
 The legend on the chart says which was used — `targets liquidity` or `targets R fallback` —
 so you always know whether a target is a real level or a placeholder.
 
-## Confluence score (gate: `InpMinScore`, default 70)
+## Confluence: two legs, either one qualifies
 
-| Points | Test |
+A break can be confirmed two independent ways. **Either one, on top of an agreeing bias, is
+enough to publish a setup. Both at once is the strong case** — and it is graded and scored
+higher rather than merely allowed.
+
+| Leg | What it means | Passes when |
+| --- | --- | --- |
+| **SMC** | smart money left evidence | liquidity was swept **and** the break was driven (displacement) |
+| **Trend** | momentum backs the direction | EMA agrees **and** RSI is not fighting it |
+
+| Grade | Meaning |
 | --- | --- |
-| 15 | D1 bias agrees |
-| 15 | H4 bias agrees |
-| 10 | EMA trend agrees |
-| 10 | RSI not fighting the setup |
-| 15 | liquidity sweep before the shift |
-| 10 / 5 | CHoCH / BOS |
-| 10 | displacement |
-| 15 / 10 | POI is an OB **and** FVG / only one of them |
-| 10 | entry on the right side of equilibrium |
+| **A+** | both legs — SMC and EMA/RSI aligned at the same time |
+| **A** | SMC leg: sweep + displacement |
+| **B** | trend leg: EMA + RSI |
 
-Turning on the `SMC` column (`InpShowSmc`) shows which of these actually fired, e.g.
-`D1 H4 SW CH OB FVG DISC`, so a score is never just a number you have to trust.
+The grade is the first token in the `SMC` column, e.g. `A+ H4 H1 EMA RSI SW CH OB FVG DISC`.
 
-`InpBiasMode` controls strictness: **Both** (D1 and H4 must agree — fewest, strongest setups),
-**H4 led** (default: H4 agrees, D1 must not oppose), or **Any**.
+`InpRequireBothLegs = true` demands A+ only. `InpRequireSweep` / `InpRequireDisp` can still be
+forced on individually if you want them mandatory rather than part of a leg.
 
-## Trend filter (EMA + RSI)
-
-Structure tells you *where*; the trend filter refuses the trades where structure looks right
-but momentum does not. Both are hard gates by default and also feed the score.
+### Trend filter detail (EMA + RSI)
 
 | | Continuation (BOS) | Reversal (CHoCH) |
 | --- | --- | --- |
-| **EMA** | price on the correct side of **both** EMAs, and EMA21/EMA50 stacked that way | price has reclaimed the **fast** EMA only — on a genuine turn the slow EMA still points the old way |
-| **RSI** | buys need RSI 45–75, sells need 25–55 — it will not buy something already exhausted upward | buy needs RSI ≤ 45, sell ≥ 55 — the turn has to come from the stretched side |
+| **EMA** | price on the correct side of **both** EMAs, EMA21/EMA50 stacked that way | price has reclaimed the **fast** EMA only — on a genuine turn the slow EMA still points the old way |
+| **RSI** | buys need RSI 45–75, sells 25–55 — it will not buy something already exhausted upward | buy needs RSI ≤ 45, sell ≥ 55 — the turn has to come from the stretched side |
 
-`InpUseEmaFilter` / `InpUseRsiFilter` switch each off; thresholds are all inputs.
+### Score (gate: `InpMinScore`, default 70)
+
+| Points | Test |
+| --- | --- |
+| 15 | higher bias agrees |
+| 15 | nearer bias agrees |
+| 15 | SMC leg |
+| 15 | trend leg |
+| 10 | **both legs at once** |
+| 10 / 5 | CHoCH / BOS |
+| 15 / 10 | POI is an OB **and** FVG / only one of them |
+| 10 | discount buy / premium sell |
+
+Capped at 100. The alert gate (`InpAlertMinScore`, 75) sits above the publish gate, so weaker
+setups reach the board without waking you.
+
+## Premium and discount — a hard rule
+
+Buys are only ever taken in **discount**, sells only in **premium**. This is a rejection, not a
+score component: a day trade taken in the wrong half of the range is the short, useless kind —
+you buy where the move is already spent, and your target is the part of the leg somebody else
+already took.
+
+The range used is the **bias timeframe's dealing range**, not the chart's, because that is the
+range the move actually belongs to (`InpPdUseBiasRange`; falls back to the chart range when the
+bias range is unusable). Position is measured 0 at the range low, 1 at the high:
+
+- buy needs `position ≤ InpPdMaxPct` (0.50 = at or below equilibrium)
+- sell needs `position ≥ 1 − InpPdMaxPct`
+
+Set `InpPdMaxPct = 0.40` to demand deeper discount and fewer, longer-legged setups.
+`InpRequirePD = false` downgrades it back to a scoring component only.
 
 ## Quality gates
 
@@ -138,7 +168,7 @@ appear as a live entry.
 | Element | Refresh |
 | --- | --- |
 | Market Watch contents | re-read every 10 s — added or removed symbols follow |
-| Scan | round-robin, `InpSymbolsPerTick` symbols per second, each re-analysed when it prints a new bar |
+| Scan | round-robin. `InpWarmupPerTick` per second until every symbol has been analysed once, then `InpSymbolsPerTick` for maintenance — a symbol is only re-analysed when it prints a new bar, so the steady-state cost is small no matter how many pairs are loaded |
 | `AGE` | recomputed at draw time from the signal bar's own timestamp against that symbol's current bar, so it is never a number frozen at scan time. `InpAgeMode = Clock` shows `1h 05m ago` instead of bars |
 | `STATUS` | every second for every signalled symbol, and **every tick** for the charted symbol |
 | Chart drawing | every tick |
@@ -239,8 +269,11 @@ page counter on the right. `SIGNAL` shows `▲ BUY+` / `▼ SELL+` for a BOS con
 `▲ BUY` / `▼ SELL` for a CHoCH reversal. `AGE` reads `current`, `1 bars ago`, … The row of the
 symbol currently on the chart is highlighted. `OPEN` switches the chart to that row's symbol.
 
-Rows sort live setups first, then the `WATCH` rows by strength, so page 1 is always the
-actionable page even with 250 symbols loaded.
+**Every Market Watch symbol is collected**, not a capped subset — `InpMaxSymbols` defaults to
+`0`, meaning no limit. Rows sort live setups first, then the `WATCH` rows by strength, so page 1
+is always the actionable page, and you can page down through the rest at leisure.
+
+Scrolling: `▲`/`▼` move one row, `▲▲`/`▼▼` jump a full page. The counter shows `1-9 / 148`.
 
 **Every pair always shows a direction.** A pair with no tradable setup right now still shows
 `▲ BUY` or `▼ SELL` with a score — that is the current directional read from the two bias
@@ -310,7 +343,11 @@ Two opt-in extras:
 | `InpUseEmaFilter` / `InpUseRsiFilter` | true | Hard trend gates on top of the SMC logic |
 | `InpMaxRiskAtr` / `InpMaxZoneAtr` | 4.0 / 2.5 | Quality rejections |
 | `InpAgeMode` | Bars | `Clock` shows elapsed time instead of bar count |
-| `InpSymbolsPerTick` | 10 | Scan throughput |
+| `InpSymbolsPerTick` | 10 | Maintenance scan rate once every symbol has been analysed |
+| `InpWarmupPerTick` | 40 | Burst rate during the first fill |
+| `InpMaxSymbols` | 0 | 0 = every Market Watch symbol, no cap |
+| `InpPdMaxPct` | 0.50 | Lower it for deeper discount / higher premium |
+| `InpRequireBothLegs` | false | true = only A+ setups |
 | `InpBiasAuto` | true | Bias follows the chart (1 and 2 steps up) |
 | `InpBiasMode` | Both | Both bias timeframes must agree |
 | `InpRecycleAt` | TP1 | When a pair may produce its next setup |

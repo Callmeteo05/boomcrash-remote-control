@@ -78,8 +78,9 @@ input string          InpSymbols        = "";    // Manual list (used when Marke
 input string          InpFilterInclude  = "";    // Only symbols containing this text
 input string          InpFilterExclude  = "";    // Skip symbols containing this text
 input bool            InpSkipUntradable = true;  // Skip symbols with trading disabled
-input int             InpMaxSymbols     = 250;   // Hard cap on scanned symbols
-input int             InpSymbolsPerTick = 10;    // Symbols analysed per second
+input int             InpMaxSymbols     = 0;     // Cap on scanned symbols (0 = every Market Watch symbol)
+input int             InpSymbolsPerTick = 10;    // Symbols analysed per second once warm
+input int             InpWarmupPerTick  = 40;    // Symbols analysed per second during first fill
 
 input group "=== Timeframes ==="
 input ENUM_TIMEFRAMES InpTimeframe      = PERIOD_CURRENT; // Entry timeframe
@@ -92,12 +93,15 @@ input group "=== Market structure (SMC) ==="
 input int             InpSwingStrength  = 2;     // Fractal strength (bars each side)
 input int             InpSweepWindow    = 6;     // Sweep must be within N bars of the shift
 input int             InpSweepLookback  = 20;    // Liquidity pool lookback for the sweep
-input bool            InpRequireSweep   = false; // Reject setups with no liquidity sweep
+input bool            InpRequireSweep   = false; // Force a liquidity sweep on every setup
 input double          InpDispAtrMult    = 1.0;   // Displacement body >= ATR x
-input bool            InpRequireDisp    = true;  // Reject setups without displacement
+input bool            InpRequireDisp    = false; // Force displacement on every setup
+input bool            InpRequireBothLegs= false; // Demand SMC *and* EMA/RSI, not either
 input int             InpPoiLookback    = 10;    // Bars back to find the OB / FVG
 input ENUM_MF_POI     InpPoiEntry       = MF_POI_CE; // Where in the zone to enter
-input bool            InpRequirePD      = false; // Reject entries on the wrong side of equilibrium
+input bool            InpRequirePD      = true;  // HARD: no buys in premium, no sells in discount
+input bool            InpPdUseBiasRange = true;  // Measure premium/discount on the bias timeframe range
+input double          InpPdMaxPct       = 0.50;  // Buy must sit in the lowest x of the range (0.40 = deeper)
 
 input group "=== Trend filter (EMA + RSI) ==="
 input bool            InpUseEmaFilter   = true;  // EMA trend must agree with the setup
@@ -231,6 +235,7 @@ struct MFSignal
    bool     displaced;
    bool     liquidityTp;    // targets came from real liquidity, not R fallback
    int      score;
+   string   grade;          // A+ both legs, A smc leg, B trend leg
    bool     adjusted;       // levels widened for the broker stop level
    int      status;
    string   tags;
@@ -578,6 +583,7 @@ void BuildUniverse()
       r.sig.valid  = false;
       r.sig.status = ST_WAIT;
       r.sig.tags   = "";
+      r.sig.grade  = "";
 
       r.ok = SymbolSelect(names[i], true);
       if(r.ok && InpSkipUntradable &&
@@ -994,7 +1000,7 @@ bool EvaluateAt(const MFSymbol &s, MFCtx &c, const int i, MFSignal &out)
    else
       emaOk = (dir > 0 ? (emaUp  && c.r[i].close > c.emaS[i])
                        : (!emaUp && c.r[i].close < c.emaS[i]));
-   if(InpUseEmaFilter && !emaOk)
+   if(InpUseEmaFilter && InpRequireBothLegs && !emaOk)
       return false;
 
    //--- 3c. RSI filter. Refuses to buy something already exhausted upwards, and
@@ -1006,7 +1012,7 @@ bool EvaluateAt(const MFSymbol &s, MFCtx &c, const int i, MFSignal &out)
    else
       rsiOk = (dir > 0 ? (rs >= 45.0 && rs <= InpRsiMaxBuy)
                        : (rs <= 55.0 && rs >= InpRsiMinSell));
-   if(InpUseRsiFilter && !rsiOk)
+   if(InpUseRsiFilter && InpRequireBothLegs && !rsiOk)
       return false;
 
    //--- 4. liquidity sweep shortly before the shift
@@ -1023,6 +1029,27 @@ bool EvaluateAt(const MFSymbol &s, MFCtx &c, const int i, MFSignal &out)
    if(InpRequireSweep && !hasSweep)
       return false;
 
+   //--- Two independent ways to confirm a break, either of which is enough on
+   //--- top of an agreeing bias:
+   //---   SMC leg   - liquidity was taken and the break was driven
+   //---   trend leg - EMA and RSI both back the direction
+   //--- One leg plus bias is a strong setup. Both legs at once is the strong
+   //--- one, and it is graded and scored higher rather than merely allowed.
+   //--- Gating here, before the POI and liquidity searches, also means a bar
+   //--- that cannot qualify costs almost nothing to reject.
+   bool smcOk   = (hasSweep && displaced);
+   bool trendOk = (InpUseEmaFilter || InpUseRsiFilter) &&
+                  (!InpUseEmaFilter || emaOk) &&
+                  (!InpUseRsiFilter || rsiOk);
+
+   if(InpRequireBothLegs)
+   {
+      if(!smcOk || !trendOk)
+         return false;
+   }
+   else if(!smcOk && !trendOk)
+      return false;
+
    //--- 5. point of interest to enter from
    MFPoi poi = FindPoi(c.r, n, i, dir);
    if(!poi.valid || poi.hi <= poi.lo)
@@ -1036,9 +1063,29 @@ bool EvaluateAt(const MFSymbol &s, MFCtx &c, const int i, MFSignal &out)
                   ? (poi.hi + poi.lo) * 0.5
                   : (dir > 0 ? poi.hi : poi.lo);
 
-   //--- 6. premium / discount against the current dealing range
-   double eq    = (c.rHigh[i] + c.rLow[i]) * 0.5;
-   bool   pdOk  = (c.rHigh[i] > c.rLow[i]) && (dir > 0 ? entry <= eq : entry >= eq);
+   //--- 6. Premium / discount. A day trade taken at the wrong half of the range
+   //--- is the short, useless kind: you buy where the move is already spent and
+   //--- your target is the part of the leg someone else took. So this is a hard
+   //--- rule - buys only in discount, sells only in premium - measured on the
+   //--- bias timeframe's dealing range, which is the range the move belongs to.
+   double rangeHi = c.rHigh[i];
+   double rangeLo = c.rLow[i];
+   if(InpPdUseBiasRange && g_use2 && c.n2 > 0)
+   {
+      int j2 = c.idx2[i];
+      if(c.rHigh2[j2] > c.rLow2[j2])
+      {
+         rangeHi = c.rHigh2[j2];
+         rangeLo = c.rLow2[j2];
+      }
+   }
+
+   bool pdOk = false;
+   if(rangeHi > rangeLo)
+   {
+      double pos = (entry - rangeLo) / (rangeHi - rangeLo);   // 0 = range low, 1 = range high
+      pdOk = (dir > 0 ? pos <= InpPdMaxPct : pos >= 1.0 - InpPdMaxPct);
+   }
    if(InpRequirePD && !pdOk)
       return false;
 
@@ -1140,21 +1187,22 @@ bool EvaluateAt(const MFSymbol &s, MFCtx &c, const int i, MFSignal &out)
       adjusted = true;
    }
 
-   //--- 9. confluence score
+   //--- 9. confluence score and grade
    int score = 0;
-   if(agree1)   score += 15;      // D1 bias
-   if(agree2)   score += 15;      // H4 bias
-   if(emaOk)    score += 10;      // EMA trend
-   if(rsiOk)    score += 10;      // RSI not fighting the setup
-   if(hasSweep) score += 15;      // liquidity taken
-   score += (choch ? 10 : 5);     // CHoCH over BOS
-   if(displaced) score += 10;
+   if(agree1)           score += 15;     // higher bias
+   if(agree2)           score += 15;     // nearer bias
+   if(smcOk)            score += 15;     // SMC leg
+   if(trendOk)          score += 15;     // EMA/RSI leg
+   if(smcOk && trendOk) score += 10;     // both at once - the strong case
+   score += (choch ? 10 : 5);            // CHoCH over BOS
    score += ((poi.isOB && poi.isFVG) ? 15 : 10);
-   if(pdOk)     score += 10;
+   if(pdOk)             score += 10;     // discount buy / premium sell
    if(score > 100) score = 100;
 
+   string grade = (smcOk && trendOk) ? "A+" : (smcOk ? "A" : "B");
+
    //--- 10. compact confluence tags for the dashboard
-   string tags = "";
+   string tags = grade + " ";
    if(agree1) tags += g_b1Text + " ";
    if(agree2) tags += g_b2Text + " ";
    if(emaOk) tags += "EMA ";
@@ -1188,6 +1236,7 @@ bool EvaluateAt(const MFSymbol &s, MFCtx &c, const int i, MFSignal &out)
    out.displaced   = displaced;
    out.liquidityTp = liqTp;
    out.score       = score;
+   out.grade       = grade;
    out.adjusted    = adjusted;
    out.status      = ST_WAIT;
    out.tags        = tags;
@@ -1593,7 +1642,17 @@ void RunScanBudget()
    if(total == 0)
       return;
 
-   int budget = (int)MathMax(1, InpSymbolsPerTick);
+   //--- until every symbol has been analysed once, run at the burst rate so the
+   //--- board fills quickly; after that only new bars need work, so drop back
+   bool warm = true;
+   for(int i = 0; i < total; i++)
+      if(g_syms[i].ok && !g_syms[i].analysed)
+      {
+         warm = false;
+         break;
+      }
+
+   int budget = (int)MathMax(1, warm ? InpSymbolsPerTick : InpWarmupPerTick);
    int looked = 0;
 
    while(budget > 0 && looked < total)
@@ -1834,11 +1893,18 @@ void DrawPanel()
    int to    = g_scroll + shown;
 
    int btnY = InpPanelY + H - g_titleH + 3;
-   SetButton(g_prefix + "btn_up",   InpPanelX + g_panelW - 132, btnY, 18, 16,
+   string dblUp = ShortToString(0x25B2) + ShortToString(0x25B2);
+   string dblDn = ShortToString(0x25BC) + ShortToString(0x25BC);
+
+   SetButton(g_prefix + "btn_pgup", InpPanelX + g_panelW - 200, btnY, 26, 16,
+             dblUp, InpClrRowB, InpClrTitle);
+   SetButton(g_prefix + "btn_up",   InpPanelX + g_panelW - 170, btnY, 18, 16,
              ShortToString(0x25B2), InpClrRowB, InpClrTitle);
-   SetButton(g_prefix + "btn_down", InpPanelX + g_panelW - 112, btnY, 18, 16,
+   SetButton(g_prefix + "btn_down", InpPanelX + g_panelW - 148, btnY, 18, 16,
              ShortToString(0x25BC), InpClrRowB, InpClrTitle);
-   SetLabel(g_prefix + "page", InpPanelX + g_panelW - 88, InpPanelY + H - g_titleH + 7,
+   SetButton(g_prefix + "btn_pgdn", InpPanelX + g_panelW - 126, btnY, 26, 16,
+             dblDn, InpClrRowB, InpClrTitle);
+   SetLabel(g_prefix + "page", InpPanelX + g_panelW - 94, InpPanelY + H - g_titleH + 7,
             StringFormat("%d-%d / %d", from, to, total), InpClrHeader, InpFontSize);
 
    int headY = InpPanelY + H - g_titleH - g_headerH + 6;
@@ -2315,6 +2381,20 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
    if(sparam == g_prefix + "btn_down")
    {
       g_scroll = (int)MathMin(maxScroll, g_scroll + 1);
+      DrawPanel();
+      ChartRedraw();
+      return;
+   }
+   if(sparam == g_prefix + "btn_pgup")
+   {
+      g_scroll = (int)MathMax(0, g_scroll - InpRowsVisible);
+      DrawPanel();
+      ChartRedraw();
+      return;
+   }
+   if(sparam == g_prefix + "btn_pgdn")
+   {
+      g_scroll = (int)MathMin(maxScroll, g_scroll + InpRowsVisible);
       DrawPanel();
       ChartRedraw();
       return;
