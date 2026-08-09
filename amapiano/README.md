@@ -131,9 +131,15 @@ them. If you add a vocal, that is the layer to duck.
 - Log drum and kick own the low end; the sub and pads duck under every kick.
 - Piano, sax, choir and kalimba go through stereo delay into a synthetic plate;
   the log drum stays nearly dry so it keeps working as a bassline.
-- Master: high shelf at 1.3 kHz, bell cut at 700 Hz (low-mid boxiness), bell
-  cut at 115 Hz (where kick and log drum pile up), low shelf for weight, glue
-  saturation, soft-clip limit.
+- Master: high shelf at 1.3 kHz, bell cuts at 700 Hz and 350 Hz (low-mid
+  boxiness and the piano/sax stack), a bell cut at 115 Hz where kick and log
+  drum pile up, low shelf for weight, glue saturation, soft-clip limit.
+- Measured: −0.72 dBFS peak, −13.3 dBFS RMS, L/R correlation 0.89. Energy
+  distribution 8% / 31% / 19% / 15% / 13% / 8% / 4% / 2% / 1% across the
+  octave bands from 20 Hz up — weight in the 60–120 Hz log-drum register
+  without swallowing the piano and percussion.
+- Section dynamics run about 11 dB from the sparse intro (−22 dB) to the full
+  grooves (−11 dB), with the breaks sitting at −17 dB.
 
 ## Files
 
@@ -144,6 +150,20 @@ them. If you add a vocal, that is the layer to duck.
 - `out/midi/isibani_<part>.mid` — piano, sax, log, choir, pad, strings, kalimba, sub
 
 WAV and stems are gitignored (large, regenerable); MP3 and MIDI are committed.
+
+## Verification
+
+I cannot hear the output, so the mix was checked by measurement rather than by
+ear. Worth knowing if you build on this. The checks that caught real problems:
+
+- **Groove placement** — asserts no log-drum hit shares a 16th step with a
+  kick, across all three rotating patterns.
+- **Spectral balance** — octave-band energy. Caught the log drum clipping at
+  exactly 1.00 and taking 56% of the total energy below 120 Hz.
+- **MIDI validation** — parsed back with `mido`: 5,981 notes, no hanging notes.
+- **Scale check** — flags notes outside the key. It reports G natural in the
+  piano, pad, log drum and sub, which is correct: that is the ♭VII, the
+  Mixolydian note the whole style rests on.
 
 ## A note on the render
 
