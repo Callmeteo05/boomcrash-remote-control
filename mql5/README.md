@@ -108,11 +108,12 @@ read 0) or has trading disabled for your account.
 **Symbol suffixes are handled.** Brokers append their own tags — `EURUSD.m`,
 `AUDCHF.m`, `US100.s`. Detection uses substring matching, so a suffix never breaks it.
 
-**Boom / Crash / Step are Deriv-proprietary instruments.** If your broker does not list
-them, the synthetic layer simply stays off and the structure engine runs normally on
-forex, metals, indices and crypto. If a broker lists equivalent spike instruments under
-different names, set `Synthetic handling` to `Force Boom` or `Force Crash` rather than
-relying on auto-detect.
+**Each broker has its own synthetic family.** Boom/Crash/Step are Deriv's; PainX, GainX,
+FlipX, SwitchX, BreakX, TrendX, FX Vol and SFX Vol are Weltrade's SyntX. Both naming
+schemes are recognised. On a broker whose synthetics use neither naming, the layer stays
+off and the structure engine runs normally on forex, metals, indices and crypto — or set
+`Synthetic handling` to `Force spikes-up` / `Force spikes-down` / `Measured` to enable it
+manually.
 
 ## Outcome tracking — the TP marks
 
@@ -146,13 +147,15 @@ updating live as trades resolve.
 | `Min RR` | Rejects a setup when the nearest opposing pool is closer than this in R |
 | `Require discount` | Hard-blocks longs in premium and shorts in discount |
 | `Synthetic handling` | Auto / Off / Force up / Force down / **Measured** (ignore the name, read the bars) |
-| `Spike ATR` | Bar range that counts as a Boom/Crash spike |
+| `Spike cycle style` | **Spike catch** (default) / Drip / Both — which side of the cycle you trade |
+| `Spike ATR` | Bar range that counts as a jump |
 
 ## Grading
 
 Points accumulate from: HTF trend alignment, premium/discount side, displacement
 strength, gap cleanliness, room to the draw, age of the swept level, and — on
-synthetics — whether the trade runs with or against the instrument's spike direction.
+synthetics — whether the trade runs with or against the side of the spike cycle you
+chose to trade.
 
 **A+ ≥ 85 · A ≥ 70 · B ≥ 55.** Below 55 is discarded.
 
