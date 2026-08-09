@@ -114,18 +114,23 @@ forced on individually if you want them mandatory rather than part of a leg.
 | **EMA** | price on the correct side of **both** EMAs, EMA21/EMA50 stacked that way | price has reclaimed the **fast** EMA only — on a genuine turn the slow EMA still points the old way |
 | **RSI** | buys need RSI 45–75, sells 25–55 — it will not buy something already exhausted upward | buy needs RSI ≤ 45, sell ≥ 55 — the turn has to come from the stretched side |
 
-### Score (gate: `InpMinScore`, default 70)
+### Score (gate: `InpMinScore`, default 65)
 
 | Points | Test |
 | --- | --- |
-| 15 | higher bias agrees |
-| 15 | nearer bias agrees |
+| 12 | higher bias agrees |
+| 18 | nearer bias agrees — it sits closer to the trade |
 | 15 | SMC leg |
-| 15 | trend leg |
+| 18 | trend leg |
 | 10 | **both legs at once** |
-| 10 / 5 | CHoCH / BOS |
-| 15 / 10 | POI is an OB **and** FVG / only one of them |
-| 10 | discount buy / premium sell |
+| 12 / 8 | CHoCH / BOS |
+| 15 / 12 | POI is an OB **and** FVG / only one of them |
+| 12 | discount buy / premium sell |
+
+Bias used to be worth 30 of the 70 needed, which made *both* bias timeframes effectively
+mandatory: a clean single-bias setup — nearer bias trending, chart-timeframe break, EMA/RSI
+aligned, order block in discount — scored 55 and was discarded. The setup's own evidence now
+carries more of the total.
 
 Capped at 100. The alert gate (`InpAlertMinScore`, 75) sits above the publish gate, so weaker
 setups reach the board without waking you.
@@ -172,6 +177,17 @@ A `WATCH` row puts the reason in the `SMC` column (turn it on with `InpShowSmc`)
 An empty board is then a diagnosis rather than a mystery — if every row reads `bias H4`, the
 bias filter is too strict for the conditions; if they read `score 62`, lower `InpMinScore`.
 
+## Diagnostics
+
+`InpLogRejects` prints one line to the **Experts** tab every `InpLogSeconds`:
+
+```
+MarketFlow V8 | M15 H4+H1 bias | 132 symbols: 7 setups, 121 watching, 4 loading | reasons: score 58, bias H1, no leg
+```
+
+Turn it on whenever the board looks emptier or busier than expected. Combined with the reason
+text in the `SMC` column it tells you exactly which gate to move.
+
 ## Setup lifetime
 
 A pair holds one setup at a time. What ends it depends on whether it ever filled:
@@ -193,7 +209,12 @@ does not pay for the worst case.
 Three hard rejections exist purely to keep low-quality setups off the board:
 
 - **`InpMaxRiskAtr` (4.0)** — a stop wider than this means the structure is not clean enough
-  to trade, whatever the confluence says.
+  to trade, whatever the confluence says. This is measured on the **structural** stop, before
+  the broker's minimum stop distance is applied. Order matters: on symbols with a wide
+  `SYMBOL_TRADE_STOPS_LEVEL` — normal for Boom/Crash and the volatility indices — applying the
+  broker distance first pushes every stop past this gate and rejects every setup on those
+  symbols. A venue constraint is not a reason to throw away clean structure; the `*` on the SL
+  tells you the level was widened so the real R:R is never hidden.
 - **`InpMaxZoneAtr` (2.5)** — a POI wider than this is not a level, it is a guess; a huge order
   block would give a meaningless entry price.
 - **`InpHideFinished` (on)** — a setup that has already hit SL or TP3 stops being a signal. The

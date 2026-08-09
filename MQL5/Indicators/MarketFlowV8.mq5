@@ -125,7 +125,7 @@ input int             InpMaxHoldBars    = 500;   // Safety cap on how long a FIL
 
 input group "=== Signal selection ==="
 input int             InpMaxAge         = 25;    // Bars an UNFILLED limit waits before it is dropped
-input int             InpMinScore       = 70;    // Minimum confluence score (0-100)
+input int             InpMinScore       = 65;    // Minimum confluence score (0-100)
 input bool            InpOnlySignals    = false; // Show only symbols with a live setup
 input bool            InpShowOnlyAnalysed= true; // A pair appears only once it has been analysed
 input ENUM_MF_SORT    InpSortMode       = MF_SORT_FRESH; // Row order
@@ -190,6 +190,10 @@ input bool            InpAlertSound     = true;  // Play a sound with the entry 
 input int             InpAlertMinScore  = 75;    // Only alert setups scoring at least this
 input int             InpAlertMaxScore  = 100;   // ...and at most this
 input bool            InpAlertOnForming = false; // Extra heads-up when the setup first appears
+
+input group "=== Diagnostics ==="
+input bool            InpLogRejects     = false; // Log why setups are being rejected (Experts tab)
+input int             InpLogSeconds     = 30;    // How often to print the tally
 
 //+------------------------------------------------------------------+
 //| Status codes                                                     |
@@ -366,6 +370,7 @@ string            g_tfText  = "";
 string            g_b1Text  = "D1";
 string            g_b2Text  = "H4";
 datetime          g_lastUniverse = 0;
+datetime          g_lastLog      = 0;
 
 //+------------------------------------------------------------------+
 //| Small helpers                                                    |
@@ -1140,6 +1145,17 @@ bool EvaluateAt(const MFSymbol &s, MFCtx &c, const int i, MFSignal &out)
       sl   = entry - dir * risk;
    }
 
+   if(risk <= 0.0)
+      return Reject(7, "no risk");
+
+   //--- judge the STRUCTURAL stop before the broker gets a say
+   if(risk > c.atr[i] * InpMaxRiskAtr)
+      return Reject(7, "stop wide");
+
+   //--- now widen to whatever the broker demands. This can push the stop past
+   //--- InpMaxRiskAtr and that is fine: it is a venue constraint, not a reason
+   //--- to throw away a clean setup. The row flags it with * so the real R:R is
+   //--- never hidden from you.
    bool adjusted = false;
    if(s.stopDist > 0.0 && risk < s.stopDist)
    {
@@ -1147,12 +1163,6 @@ bool EvaluateAt(const MFSymbol &s, MFCtx &c, const int i, MFSignal &out)
       sl       = entry - dir * risk;
       adjusted = true;
    }
-   if(risk <= 0.0)
-      return Reject(7, "no risk");
-
-   //--- a stop this wide means the structure is not clean enough to trade
-   if(risk > c.atr[i] * InpMaxRiskAtr)
-      return Reject(7, "stop wide");
 
    //--- 8. targets: resting liquidity first, R multiples only as fallback
    double minTp1 = entry + dir * risk * InpMinTp1R;
@@ -1214,14 +1224,14 @@ bool EvaluateAt(const MFSymbol &s, MFCtx &c, const int i, MFSignal &out)
 
    //--- 9. confluence score and grade
    int score = 0;
-   if(agree1)           score += 15;     // higher bias
-   if(agree2)           score += 15;     // nearer bias
+   if(agree1)           score += 12;     // higher bias
+   if(agree2)           score += 18;     // nearer bias - closer to the trade
    if(smcOk)            score += 15;     // SMC leg
-   if(trendOk)          score += 15;     // EMA/RSI leg
+   if(trendOk)          score += 18;     // EMA/RSI leg
    if(smcOk && trendOk) score += 10;     // both at once - the strong case
-   score += (choch ? 10 : 5);            // CHoCH over BOS
-   score += ((poi.isOB && poi.isFVG) ? 15 : 10);
-   if(pdOk)             score += 10;     // discount buy / premium sell
+   score += (choch ? 12 : 8);            // CHoCH over BOS
+   score += ((poi.isOB && poi.isFVG) ? 15 : 12);
+   if(pdOk)             score += 12;     // discount buy / premium sell
    if(score > 100) score = 100;
 
    string grade = (smcOk && trendOk) ? "A+" : (smcOk ? "A" : "B");
@@ -1335,18 +1345,13 @@ int ReplayStatus(const MqlRates &r[], const int n, const MFSignal &sg)
       if(!entered)
       {
          if(sg.dir > 0)
-         {
-            if(r[k].low <= sg.sl)     return ST_INVALID;
-            if(r[k].low <= sg.entry)  entered = true;
-         }
+            entered = (r[k].low  <= sg.entry);
          else
-         {
-            if(r[k].high >= sg.sl)    return ST_INVALID;
-            if(r[k].high >= sg.entry) entered = true;
-         }
+            entered = (r[k].high >= sg.entry);
          if(!entered)
             continue;
          st = ST_ACTIVE;
+         // fall through: the same bar may also have hit the stop or a target
       }
 
       if(sg.dir > 0)
@@ -1382,17 +1387,12 @@ int BacktestOutcome(const MqlRates &r[], const int n, const MFSignal &sg)
       if(!entered)
       {
          if(sg.dir > 0)
-         {
-            if(r[k].low <= sg.sl)     return 0;
-            if(r[k].low <= sg.entry)  entered = true;
-         }
+            entered = (r[k].low  <= sg.entry);
          else
-         {
-            if(r[k].high >= sg.sl)    return 0;
-            if(r[k].high >= sg.entry) entered = true;
-         }
+            entered = (r[k].high >= sg.entry);
          if(!entered)
             continue;
+         // fall through: the filling bar may also have hit the stop or TP1
       }
 
       if(sg.dir > 0)
@@ -1664,6 +1664,39 @@ void FireEntryAlert(MFSymbol &s)
    if(InpAlertPopup) Alert(msg);
    if(InpAlertPush)  SendNotification(msg);
    if(InpAlertSound) PlaySound("alert2.wav");
+}
+
+//--- one line to the Experts tab saying what the scan is actually doing
+void LogRejects()
+{
+   if(!InpLogRejects)
+      return;
+   if(TimeCurrent() - g_lastLog < InpLogSeconds)
+      return;
+   g_lastLog = TimeCurrent();
+
+   int total = ArraySize(g_syms);
+   int live = 0, watch = 0, loading = 0;
+   string why = "";
+   for(int i = 0; i < total; i++)
+   {
+      if(g_syms[i].sig.valid)
+      {
+         live++;
+         continue;
+      }
+      if(!g_syms[i].analysed)
+      {
+         loading++;
+         continue;
+      }
+      watch++;
+      if(g_syms[i].scoutWhy != "" && StringFind(why, g_syms[i].scoutWhy) < 0)
+         why += g_syms[i].scoutWhy + ", ";
+   }
+   PrintFormat("MarketFlow V8 | %s %s | %d symbols: %d setups, %d watching, %d loading | reasons: %s",
+               g_tfText, (g_use1 || g_use2 ? g_b1Text + "+" + g_b2Text + " bias" : "no bias"),
+               total, live, watch, loading, (why == "" ? "-" : why));
 }
 
 //--- cheap intrabar refresh of the outcome only
@@ -2462,6 +2495,7 @@ void OnTimer()
    }
 
    RunScanBudget();
+   LogRejects();
    BuildOrder();
    DrawPanel();
    DrawChartTrade();
