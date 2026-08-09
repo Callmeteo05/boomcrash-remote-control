@@ -1,0 +1,680 @@
+//@version=6
+// ============================================================================
+// MarketFlow V8 - top-down SMC scanner
+// TradingView (Pine v6) port of MarketFlowV8.mq5
+//
+// Same engine as the MT5 build: higher-timeframe bias -> chart-timeframe
+// structure shift -> SMC leg or EMA/RSI leg -> POI entry with premium/discount
+// enforced -> liquidity targets -> alert when the limit actually fills.
+//
+// PLATFORM LIMIT, STATED UP FRONT
+// Pine allows at most 40 request.*() calls per script. This scanner spends two
+// per symbol (engine on the chart timeframe, bias on the bias timeframe), so it
+// covers 16 symbols - not 100+. That ceiling is TradingView's and applies to
+// every Pine script ever written, whatever its description claims. The MT5
+// build has no such limit and scans the entire Market Watch.
+// ============================================================================
+indicator("MarketFlow V8 - SMC Scanner", shorttitle="MarketFlow V8", overlay=true,
+     max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+
+// ---------------------------------------------------------------- inputs ---
+gU = "Universe (leave blank to skip a slot)"
+s01 = input.symbol("", "01", group=gU, inline="a1")
+s02 = input.symbol("", "02", group=gU, inline="a1")
+s03 = input.symbol("", "03", group=gU, inline="a2")
+s04 = input.symbol("", "04", group=gU, inline="a2")
+s05 = input.symbol("", "05", group=gU, inline="a3")
+s06 = input.symbol("", "06", group=gU, inline="a3")
+s07 = input.symbol("", "07", group=gU, inline="a4")
+s08 = input.symbol("", "08", group=gU, inline="a4")
+s09 = input.symbol("", "09", group=gU, inline="a5")
+s10 = input.symbol("", "10", group=gU, inline="a5")
+s11 = input.symbol("", "11", group=gU, inline="a6")
+s12 = input.symbol("", "12", group=gU, inline="a6")
+s13 = input.symbol("", "13", group=gU, inline="a7")
+s14 = input.symbol("", "14", group=gU, inline="a7")
+s15 = input.symbol("", "15", group=gU, inline="a8")
+s16 = input.symbol("", "16", group=gU, inline="a8")
+
+gT = "Timeframes"
+biasTf  = input.timeframe("240", "Bias timeframe", group=gT,
+     tooltip="Structure here decides direction. The 'far' bias is the same series read with longer pivots, standing in for the next step up without spending another request call.")
+farMult = input.int(3, "Far-bias pivot multiplier", minval=2, maxval=8, group=gT)
+
+gS = "Structure"
+pivLen   = input.int(2,  "Pivot strength", minval=1, maxval=10, group=gS)
+maxAge   = input.int(25, "Bars an unfilled limit waits", minval=3, group=gS)
+sweepLb  = input.int(20, "Liquidity lookback", minval=5, group=gS)
+sweepWin = input.int(6,  "Sweep must be within N bars", minval=1, maxval=20, group=gS)
+dispMult = input.float(1.0, "Displacement body >= ATR x", minval=0.1, step=0.1, group=gS)
+poiLb    = input.int(10, "POI lookback", minval=3, maxval=30, group=gS)
+poiCE    = input.bool(true, "Enter at zone midpoint (else proximal edge)", group=gS)
+
+gF = "Trend filter"
+useEma     = input.bool(true, "Use EMA leg", group=gF)
+emaFastL   = input.int(21, "Fast EMA", minval=1, group=gF)
+emaSlowL   = input.int(50, "Slow EMA", minval=2, group=gF)
+useRsi     = input.bool(true, "Use RSI leg", group=gF)
+rsiLen     = input.int(14, "RSI length", minval=2, group=gF)
+rsiMaxBuy  = input.float(75, "Never buy a continuation above RSI", group=gF)
+rsiMinSell = input.float(25, "Never sell a continuation below RSI", group=gF)
+rsiRevBuy  = input.float(45, "Reversal buy needs RSI <=", group=gF)
+rsiRevSell = input.float(55, "Reversal sell needs RSI >=", group=gF)
+
+gR = "Risk and targets"
+atrLen   = input.int(14, "ATR length", minval=1, group=gR)
+minRiskA = input.float(0.5,  "Minimum stop in ATR", minval=0.1, step=0.1, group=gR)
+slBufA   = input.float(0.15, "Stop buffer in ATR",  minval=0.0, step=0.05, group=gR)
+maxRiskA = input.float(4.0,  "Reject stop wider than ATR x", minval=1.0, step=0.5, group=gR)
+maxZoneA = input.float(2.5,  "Reject POI wider than ATR x",  minval=0.5, step=0.5, group=gR)
+minTp1R  = input.float(1.0,  "TP1 at least this many R away", minval=0.5, step=0.1, group=gR)
+liqLb    = input.int(100, "Bars searched for target liquidity", minval=20, maxval=200, group=gR)
+tp1R     = input.float(1.5, "TP1 fallback (R)", step=0.1, group=gR)
+tp2R     = input.float(2.5, "TP2 fallback (R)", step=0.1, group=gR)
+tp3R     = input.float(4.0, "TP3 fallback (R)", step=0.1, group=gR)
+
+gQ = "Quality"
+biasMode  = input.string("Near led", "Bias strictness", options=["Both", "Near led", "Any"], group=gQ)
+bothLegs  = input.bool(false, "Require SMC and EMA/RSI (A+ only)", group=gQ)
+requirePD = input.bool(true,  "Hard rule: buy in discount, sell in premium", group=gQ)
+pdMaxPct  = input.float(0.50, "Buy must sit in lowest x of the range", minval=0.1, maxval=0.9, step=0.05, group=gQ)
+minScore  = input.int(70, "Minimum score to publish", minval=0, maxval=100, group=gQ)
+
+gA = "Alerts"
+alertMin = input.int(75,  "Alert only at or above this score", minval=0, maxval=100, group=gA)
+alertMax = input.int(100, "...and at or below this", minval=0, maxval=100, group=gA)
+
+gD = "Display"
+showPanel = input.bool(true, "Show dashboard", group=gD)
+showTrade = input.bool(true, "Draw the chart symbol's setup", group=gD)
+panelPos  = input.string("Bottom right", "Dashboard position",
+     options=["Bottom right", "Bottom left", "Top right", "Top left", "Middle right"], group=gD)
+txtSize = input.string("Small", "Text size", options=["Tiny", "Small", "Normal"], group=gD)
+cBuy  = input.color(color.rgb(0, 214, 140),    "Buy",  group=gD, inline="c1")
+cSell = input.color(color.rgb(236, 72, 112),   "Sell", group=gD, inline="c1")
+cBg   = input.color(color.rgb(8, 10, 24),      "Panel", group=gD, inline="c2")
+cHdr  = input.color(color.rgb(140, 125, 205),  "Header", group=gD, inline="c2")
+cTxt  = input.color(color.rgb(210, 210, 228),  "Text", group=gD, inline="c3")
+cDim  = input.color(color.rgb(108, 108, 134),  "Dim",  group=gD, inline="c3")
+
+// ------------------------------------------------------------- constants ---
+ST_INVALID = -2
+ST_SL      = -1
+ST_WAIT    =  0
+ST_ACTIVE  =  1
+ST_TP1     =  2
+ST_TP2     =  3
+ST_TP3     =  4
+
+F_SMC   = 1
+F_TREND = 2
+F_CHOCH = 4
+F_PD    = 8
+F_OB    = 16
+F_FVG   = 32
+F_SWEEP = 64
+
+f_bit(int flags, int bit) => (flags % (bit * 2)) >= bit
+
+// ============================================================================
+// Market structure.
+// ta.pivothigh(L, L) only returns a value once L newer bars exist, so a pivot
+// confirms exactly the way the MT5 fractal walk confirms one - nothing here
+// reads the future. Bias is withheld until price has broken structure once and
+// events until the second break, so the state carries no trace of wherever the
+// series happened to begin.
+// ============================================================================
+f_struct(int L) =>
+    var int   state  = 0
+    var float lastH  = na
+    var float lastL  = na
+    var bool  haveH  = false
+    var bool  haveL  = false
+    var float rh     = na
+    var float rl     = na
+    var int   breaks = 0
+
+    ph = ta.pivothigh(high, L, L)
+    pl = ta.pivotlow(low, L, L)
+    if not na(ph)
+        lastH := ph
+        haveH := true
+    if not na(pl)
+        lastL := pl
+        haveL := true
+
+    int  ev = 0
+    bool ch = false
+
+    if haveH and not na(lastH) and close > lastH
+        ch     := state == -1
+        state  := 1
+        ev     := 1
+        breaks := breaks + 1
+        if haveL and not na(lastL)
+            rl := lastL
+        rh    := high
+        haveH := false
+    else if haveL and not na(lastL) and close < lastL
+        ch     := state == 1
+        state  := -1
+        ev     := -1
+        breaks := breaks + 1
+        if haveH and not na(lastH)
+            rh := lastH
+        rl    := low
+        haveL := false
+    else
+        if state > 0
+            rh := math.max(nz(rh, high), high)
+        if state < 0
+            rl := math.min(nz(rl, low), low)
+
+    int outBias = breaks >= 1 ? state : 0
+    int outEv   = breaks >= 2 ? ev : 0
+    [outBias, outEv, ch, rh, rl]
+
+// Two bias levels from a single request call: the near bias at the configured
+// pivot strength, the far bias on the same series with longer pivots.
+f_bias() =>
+    [bNear, e1, c1, h1, l1] = f_struct(pivLen)
+    [bFar,  e2, c2, h2, l2] = f_struct(pivLen * farMult)
+    [bNear, bFar]
+
+// ============================================================================
+// The engine, run in one symbol's context on the chart timeframe. Returns the
+// candidate setup; the bias gate is applied by the caller because the bias
+// arrives from a separate request call.
+// ============================================================================
+f_engine() =>
+    [bs, ev, ch, rangeHi, rangeLo] = f_struct(pivLen)
+
+    atr  = ta.atr(atrLen)
+    emaF = ta.ema(close, emaFastL)
+    emaS = ta.ema(close, emaSlowL)
+    rsi  = ta.rsi(close, rsiLen)
+
+    // hoisted: stateful ta.* calls must run once per bar, never inside a loop
+    phSer  = ta.pivothigh(high, pivLen, pivLen)
+    plSer  = ta.pivotlow(low, pivLen, pivLen)
+    poolLo = ta.lowest(low, sweepLb)
+    poolHi = ta.highest(high, sweepLb)
+
+    var int   pDir    = 0
+    var float pEntry  = na
+    var float pSl     = na
+    var float pTp1    = na
+    var float pTp2    = na
+    var float pTp3    = na
+    var int   pFlags  = 0
+    var int   pStatus = ST_WAIT
+    var int   pBar    = 0
+    var bool  pLive   = false
+
+    // ---- what the published setup actually did, replayed every bar
+    if pLive
+        if pStatus == ST_WAIT
+            if (pDir > 0 and low <= pSl) or (pDir < 0 and high >= pSl)
+                pStatus := ST_INVALID
+                pLive   := false
+            else if (pDir > 0 and low <= pEntry) or (pDir < 0 and high >= pEntry)
+                pStatus := ST_ACTIVE
+        if pLive and pStatus >= ST_ACTIVE
+            // stop counted first when one bar touches both - never the flattering read
+            if (pDir > 0 and low <= pSl) or (pDir < 0 and high >= pSl)
+                pStatus := ST_SL
+                pLive   := false
+            else if (pDir > 0 and high >= pTp3) or (pDir < 0 and low <= pTp3)
+                pStatus := ST_TP3
+                pLive   := false
+            else if (pDir > 0 and high >= pTp2) or (pDir < 0 and low <= pTp2)
+                pStatus := math.max(pStatus, ST_TP2)
+            else if (pDir > 0 and high >= pTp1) or (pDir < 0 and low <= pTp1)
+                pStatus := math.max(pStatus, ST_TP1)
+        if pLive and pStatus == ST_WAIT and (bar_index - pBar) > maxAge
+            pLive := false
+
+    // ---- a pair only looks for a new setup once the old one is done
+    if not pLive and ev != 0 and not na(atr) and atr > 0
+        dir  = ev
+        body = math.abs(close - open)
+        disp = body >= atr * dispMult
+
+        emaUp = emaF > emaS
+        bool emaOk = false
+        if ch
+            emaOk := dir > 0 ? close > emaF : close < emaF
+        else
+            emaOk := dir > 0 ? (emaUp and close > emaS) : (not emaUp and close < emaS)
+
+        bool rsiOk = false
+        if ch
+            rsiOk := dir > 0 ? rsi <= rsiRevBuy : rsi >= rsiRevSell
+        else
+            rsiOk := dir > 0 ? (rsi >= 45 and rsi <= rsiMaxBuy) : (rsi <= 55 and rsi >= rsiMinSell)
+
+        bool  swept   = false
+        float sweepPx = na
+        for k = 0 to sweepWin - 1
+            if not swept
+                if dir > 0 and low[k] < poolLo[k + 1] and close[k] > poolLo[k + 1]
+                    swept   := true
+                    sweepPx := low[k]
+                else if dir < 0 and high[k] > poolHi[k + 1] and close[k] < poolHi[k + 1]
+                    swept   := true
+                    sweepPx := high[k]
+
+        smcOk   = swept and disp
+        trendOk = (useEma or useRsi) and (not useEma or emaOk) and (not useRsi or rsiOk)
+        legsOk  = bothLegs ? (smcOk and trendOk) : (smcOk or trendOk)
+
+        // POI: order block and/or fair value gap left by the impulse
+        float obHi = na
+        float obLo = na
+        for k = 0 to poiLb - 1
+            if na(obHi)
+                if (dir > 0 and close[k] < open[k]) or (dir < 0 and close[k] > open[k])
+                    obHi := high[k]
+                    obLo := low[k]
+
+        float fvHi = na
+        float fvLo = na
+        for k = 1 to poiLb - 1
+            if na(fvHi)
+                if dir > 0 and low[k - 1] > high[k + 1]
+                    fvLo := high[k + 1]
+                    fvHi := low[k - 1]
+                else if dir < 0 and high[k - 1] < low[k + 1]
+                    fvLo := high[k - 1]
+                    fvHi := low[k + 1]
+
+        hasOB  = not na(obHi) and obHi > obLo
+        hasFVG = not na(fvHi) and fvHi > fvLo
+
+        float zHi = na
+        float zLo = na
+        if hasOB and hasFVG
+            ovHi = math.min(obHi, fvHi)
+            ovLo = math.max(obLo, fvLo)
+            if ovHi > ovLo
+                zHi := ovHi
+                zLo := ovLo
+            else
+                zHi := obHi
+                zLo := obLo
+        else if hasFVG
+            zHi := fvHi
+            zLo := fvLo
+        else if hasOB
+            zHi := obHi
+            zLo := obLo
+
+        poiOk = not na(zHi) and zHi > zLo and (zHi - zLo) <= atr * maxZoneA
+
+        if legsOk and poiOk
+            entry = poiCE ? (zHi + zLo) / 2 : (dir > 0 ? zHi : zLo)
+
+            // premium / discount on the dealing range of the leg being traded
+            bool pdOk = false
+            if not na(rangeHi) and not na(rangeLo) and rangeHi > rangeLo
+                pos = (entry - rangeLo) / (rangeHi - rangeLo)
+                pdOk := dir > 0 ? pos <= pdMaxPct : pos >= 1.0 - pdMaxPct
+
+            if not requirePD or pdOk
+                float sl = dir > 0 ? zLo : zHi
+                if swept and not na(sweepPx)
+                    sl := dir > 0 ? math.min(sl, sweepPx) : math.max(sl, sweepPx)
+                sl := dir > 0 ? sl - atr * slBufA : sl + atr * slBufA
+
+                float risk = math.abs(entry - sl)
+                if risk < atr * minRiskA
+                    risk := atr * minRiskA
+                    sl   := entry - dir * risk
+
+                if risk > 0 and risk <= atr * maxRiskA
+                    minT1 = entry + dir * risk * minTp1R
+                    float t1 = na
+                    float t2 = na
+                    for k = pivLen to liqLb
+                        if dir > 0
+                            hv = phSer[k]
+                            if not na(hv) and hv > minT1 and (na(t1) or hv < t1)
+                                t1 := hv
+                        else
+                            lv = plSer[k]
+                            if not na(lv) and lv < minT1 and (na(t1) or lv > t1)
+                                t1 := lv
+                    if not na(t1)
+                        for k = pivLen to liqLb
+                            if dir > 0
+                                hv = phSer[k]
+                                if not na(hv) and hv > t1 + risk * 0.25 and (na(t2) or hv < t2)
+                                    t2 := hv
+                            else
+                                lv = plSer[k]
+                                if not na(lv) and lv < t1 - risk * 0.25 and (na(t2) or lv > t2)
+                                    t2 := lv
+
+                    float tp1 = na(t1) ? entry + dir * risk * tp1R : t1
+                    float tp2 = na(t2) ? entry + dir * risk * tp2R : t2
+                    float tp3 = entry + dir * risk * tp3R
+                    tp2 := dir > 0 ? math.max(tp2, tp1 + risk * 0.25) : math.min(tp2, tp1 - risk * 0.25)
+                    tp3 := dir > 0 ? math.max(tp3, tp2 + risk * 0.25) : math.min(tp3, tp2 - risk * 0.25)
+
+                    int fl = 0
+                    if smcOk
+                        fl := fl + F_SMC
+                    if trendOk
+                        fl := fl + F_TREND
+                    if ch
+                        fl := fl + F_CHOCH
+                    if pdOk
+                        fl := fl + F_PD
+                    if hasOB
+                        fl := fl + F_OB
+                    if hasFVG
+                        fl := fl + F_FVG
+                    if swept
+                        fl := fl + F_SWEEP
+
+                    pDir    := dir
+                    pEntry  := entry
+                    pSl     := sl
+                    pTp1    := tp1
+                    pTp2    := tp2
+                    pTp3    := tp3
+                    pFlags  := fl
+                    pStatus := ST_WAIT
+                    pBar    := bar_index
+                    pLive   := true
+
+    int age = pLive ? bar_index - pBar : 0
+    [pDir, pEntry, pSl, pTp1, pTp2, pTp3, pFlags, age, pStatus, pLive ? 1 : 0]
+
+// ------------------------------------------------------- scoring / gating ---
+f_score(int dir, int flags, int bNear, int bFar) =>
+    smc = f_bit(flags, F_SMC)
+    trd = f_bit(flags, F_TREND)
+    cho = f_bit(flags, F_CHOCH)
+    pdd = f_bit(flags, F_PD)
+    ob  = f_bit(flags, F_OB)
+    fvg = f_bit(flags, F_FVG)
+    int sc = 0
+    if bFar == dir
+        sc := sc + 15
+    if bNear == dir
+        sc := sc + 15
+    if smc
+        sc := sc + 15
+    if trd
+        sc := sc + 15
+    if smc and trd
+        sc := sc + 10
+    sc := sc + (cho ? 10 : 5)
+    sc := sc + (ob and fvg ? 15 : 10)
+    if pdd
+        sc := sc + 10
+    math.min(sc, 100)
+
+f_grade(int flags) =>
+    smc = f_bit(flags, F_SMC)
+    trd = f_bit(flags, F_TREND)
+    smc and trd ? "A+" : smc ? "A" : "B"
+
+f_biasOk(int dir, int bNear, int bFar) =>
+    bool ok = false
+    if biasMode == "Both"
+        ok := bNear == dir and bFar == dir
+    else if biasMode == "Near led"
+        ok := bNear == dir and bFar != -dir
+    else
+        ok := bNear == dir or bFar == dir
+    ok
+
+f_name(string s) =>
+    parts = str.split(s, ":")
+    array.size(parts) > 1 ? array.get(parts, 1) : s
+
+// ============================================================================
+// Per-symbol requests: 16 engine + 16 bias + 1 for the chart symbol's own bias
+// = 33, inside Pine's 40-call ceiling.
+// ============================================================================
+t01 = s01 == "" ? syminfo.tickerid : s01
+t02 = s02 == "" ? syminfo.tickerid : s02
+t03 = s03 == "" ? syminfo.tickerid : s03
+t04 = s04 == "" ? syminfo.tickerid : s04
+t05 = s05 == "" ? syminfo.tickerid : s05
+t06 = s06 == "" ? syminfo.tickerid : s06
+t07 = s07 == "" ? syminfo.tickerid : s07
+t08 = s08 == "" ? syminfo.tickerid : s08
+t09 = s09 == "" ? syminfo.tickerid : s09
+t10 = s10 == "" ? syminfo.tickerid : s10
+t11 = s11 == "" ? syminfo.tickerid : s11
+t12 = s12 == "" ? syminfo.tickerid : s12
+t13 = s13 == "" ? syminfo.tickerid : s13
+t14 = s14 == "" ? syminfo.tickerid : s14
+t15 = s15 == "" ? syminfo.tickerid : s15
+t16 = s16 == "" ? syminfo.tickerid : s16
+
+[d01, e01, x01, p01, q01, w01, g01, y01, u01, v01] = request.security(t01, timeframe.period, f_engine())
+[d02, e02, x02, p02, q02, w02, g02, y02, u02, v02] = request.security(t02, timeframe.period, f_engine())
+[d03, e03, x03, p03, q03, w03, g03, y03, u03, v03] = request.security(t03, timeframe.period, f_engine())
+[d04, e04, x04, p04, q04, w04, g04, y04, u04, v04] = request.security(t04, timeframe.period, f_engine())
+[d05, e05, x05, p05, q05, w05, g05, y05, u05, v05] = request.security(t05, timeframe.period, f_engine())
+[d06, e06, x06, p06, q06, w06, g06, y06, u06, v06] = request.security(t06, timeframe.period, f_engine())
+[d07, e07, x07, p07, q07, w07, g07, y07, u07, v07] = request.security(t07, timeframe.period, f_engine())
+[d08, e08, x08, p08, q08, w08, g08, y08, u08, v08] = request.security(t08, timeframe.period, f_engine())
+[d09, e09, x09, p09, q09, w09, g09, y09, u09, v09] = request.security(t09, timeframe.period, f_engine())
+[d10, e10, x10, p10, q10, w10, g10, y10, u10, v10] = request.security(t10, timeframe.period, f_engine())
+[d11, e11, x11, p11, q11, w11, g11, y11, u11, v11] = request.security(t11, timeframe.period, f_engine())
+[d12, e12, x12, p12, q12, w12, g12, y12, u12, v12] = request.security(t12, timeframe.period, f_engine())
+[d13, e13, x13, p13, q13, w13, g13, y13, u13, v13] = request.security(t13, timeframe.period, f_engine())
+[d14, e14, x14, p14, q14, w14, g14, y14, u14, v14] = request.security(t14, timeframe.period, f_engine())
+[d15, e15, x15, p15, q15, w15, g15, y15, u15, v15] = request.security(t15, timeframe.period, f_engine())
+[d16, e16, x16, p16, q16, w16, g16, y16, u16, v16] = request.security(t16, timeframe.period, f_engine())
+
+[n01, r01] = request.security(t01, biasTf, f_bias())
+[n02, r02] = request.security(t02, biasTf, f_bias())
+[n03, r03] = request.security(t03, biasTf, f_bias())
+[n04, r04] = request.security(t04, biasTf, f_bias())
+[n05, r05] = request.security(t05, biasTf, f_bias())
+[n06, r06] = request.security(t06, biasTf, f_bias())
+[n07, r07] = request.security(t07, biasTf, f_bias())
+[n08, r08] = request.security(t08, biasTf, f_bias())
+[n09, r09] = request.security(t09, biasTf, f_bias())
+[n10, r10] = request.security(t10, biasTf, f_bias())
+[n11, r11] = request.security(t11, biasTf, f_bias())
+[n12, r12] = request.security(t12, biasTf, f_bias())
+[n13, r13] = request.security(t13, biasTf, f_bias())
+[n14, r14] = request.security(t14, biasTf, f_bias())
+[n15, r15] = request.security(t15, biasTf, f_bias())
+[n16, r16] = request.security(t16, biasTf, f_bias())
+
+// ---------------------------------------------------------------- collect --
+var array<string> aName  = array.new<string>()
+var array<int>    aDir   = array.new<int>()
+var array<float>  aEntry = array.new<float>()
+var array<float>  aSl    = array.new<float>()
+var array<float>  aTp1   = array.new<float>()
+var array<float>  aTp2   = array.new<float>()
+var array<float>  aTp3   = array.new<float>()
+var array<int>    aScore = array.new<int>()
+var array<int>    aAge   = array.new<int>()
+var array<int>    aStat  = array.new<int>()
+var array<string> aGrade = array.new<string>()
+var array<bool>   aLive  = array.new<bool>()
+
+f_push(string sym, int dir, float e, float sl, float t1, float t2, float t3,
+       int flags, int age, int st, int live, int bn, int bf) =>
+    if sym != ""
+        sc  = dir == 0 ? 0 : f_score(dir, flags, bn, bf)
+        pub = live == 1 and dir != 0 and f_biasOk(dir, bn, bf) and sc >= minScore
+        // a slot with no tradable setup still shows its directional lean, but
+        // the price columns stay empty - a lean is never dressed as an entry
+        lean = pub ? dir : (bn != 0 ? bn : bf)
+        array.push(aName,  f_name(sym))
+        array.push(aDir,   lean)
+        array.push(aEntry, pub ? e  : na)
+        array.push(aSl,    pub ? sl : na)
+        array.push(aTp1,   pub ? t1 : na)
+        array.push(aTp2,   pub ? t2 : na)
+        array.push(aTp3,   pub ? t3 : na)
+        array.push(aScore, pub ? sc : 0)
+        array.push(aAge,   pub ? age : 0)
+        array.push(aStat,  pub ? st : ST_WAIT)
+        array.push(aGrade, pub ? f_grade(flags) : "")
+        array.push(aLive,  pub)
+
+if barstate.islast
+    array.clear(aName)
+    array.clear(aDir)
+    array.clear(aEntry)
+    array.clear(aSl)
+    array.clear(aTp1)
+    array.clear(aTp2)
+    array.clear(aTp3)
+    array.clear(aScore)
+    array.clear(aAge)
+    array.clear(aStat)
+    array.clear(aGrade)
+    array.clear(aLive)
+    f_push(s01, d01, e01, x01, p01, q01, w01, g01, y01, u01, v01, n01, r01)
+    f_push(s02, d02, e02, x02, p02, q02, w02, g02, y02, u02, v02, n02, r02)
+    f_push(s03, d03, e03, x03, p03, q03, w03, g03, y03, u03, v03, n03, r03)
+    f_push(s04, d04, e04, x04, p04, q04, w04, g04, y04, u04, v04, n04, r04)
+    f_push(s05, d05, e05, x05, p05, q05, w05, g05, y05, u05, v05, n05, r05)
+    f_push(s06, d06, e06, x06, p06, q06, w06, g06, y06, u06, v06, n06, r06)
+    f_push(s07, d07, e07, x07, p07, q07, w07, g07, y07, u07, v07, n07, r07)
+    f_push(s08, d08, e08, x08, p08, q08, w08, g08, y08, u08, v08, n08, r08)
+    f_push(s09, d09, e09, x09, p09, q09, w09, g09, y09, u09, v09, n09, r09)
+    f_push(s10, d10, e10, x10, p10, q10, w10, g10, y10, u10, v10, n10, r10)
+    f_push(s11, d11, e11, x11, p11, q11, w11, g11, y11, u11, v11, n11, r11)
+    f_push(s12, d12, e12, x12, p12, q12, w12, g12, y12, u12, v12, n12, r12)
+    f_push(s13, d13, e13, x13, p13, q13, w13, g13, y13, u13, v13, n13, r13)
+    f_push(s14, d14, e14, x14, p14, q14, w14, g14, y14, u14, v14, n14, r14)
+    f_push(s15, d15, e15, x15, p15, q15, w15, g15, y15, u15, v15, n15, r15)
+    f_push(s16, d16, e16, x16, p16, q16, w16, g16, y16, u16, v16, n16, r16)
+
+// -------------------------------------------------------------- dashboard --
+f_pos() =>
+    switch panelPos
+        "Bottom right" => position.bottom_right
+        "Bottom left"  => position.bottom_left
+        "Top right"    => position.top_right
+        "Top left"     => position.top_left
+        => position.middle_right
+
+f_size() =>
+    switch txtSize
+        "Tiny"   => size.tiny
+        "Normal" => size.normal
+        => size.small
+
+f_statusTxt(int st) =>
+    switch st
+        ST_INVALID => "INVALID"
+        ST_SL      => "SL HIT"
+        ST_WAIT    => "WAITING"
+        ST_ACTIVE  => "ACTIVE"
+        ST_TP1     => "TP1 HIT"
+        ST_TP2     => "TP2 HIT"
+        ST_TP3     => "TP3 HIT"
+        => "-"
+
+f_ageTxt(int a, bool live) =>
+    not live ? "-" : a <= 1 ? "current" : str.tostring(a - 1) + " bars ago"
+
+var table panel = table.new(f_pos(), 12, 18, border_width=1)
+
+if showPanel and barstate.islast
+    table.clear(panel, 0, 0, 11, 17)
+    ts = f_size()
+    table.cell(panel,  0, 0, "SYMBOL", text_color=cHdr, bgcolor=cBg, text_size=ts)
+    table.cell(panel,  1, 0, "TF",     text_color=cHdr, bgcolor=cBg, text_size=ts)
+    table.cell(panel,  2, 0, "SIGNAL", text_color=cHdr, bgcolor=cBg, text_size=ts)
+    table.cell(panel,  3, 0, "GRADE",  text_color=cHdr, bgcolor=cBg, text_size=ts)
+    table.cell(panel,  4, 0, "SCORE",  text_color=cHdr, bgcolor=cBg, text_size=ts)
+    table.cell(panel,  5, 0, "AGE",    text_color=cHdr, bgcolor=cBg, text_size=ts)
+    table.cell(panel,  6, 0, "ENTRY",  text_color=cHdr, bgcolor=cBg, text_size=ts)
+    table.cell(panel,  7, 0, "SL",     text_color=cHdr, bgcolor=cBg, text_size=ts)
+    table.cell(panel,  8, 0, "TP1",    text_color=cHdr, bgcolor=cBg, text_size=ts)
+    table.cell(panel,  9, 0, "TP2",    text_color=cHdr, bgcolor=cBg, text_size=ts)
+    table.cell(panel, 10, 0, "TP3",    text_color=cHdr, bgcolor=cBg, text_size=ts)
+    table.cell(panel, 11, 0, "STATUS", text_color=cHdr, bgcolor=cBg, text_size=ts)
+
+    n = array.size(aName)
+    if n > 0
+        last = n > 17 ? 16 : n - 1
+        for r = 0 to last
+            dir  = array.get(aDir, r)
+            live = array.get(aLive, r)
+            col  = dir == 0 ? cDim : dir > 0 ? cBuy : cSell
+            sig  = dir == 0 ? "-" : dir > 0 ? "▲ BUY" : "▼ SELL"
+            table.cell(panel,  0, r + 1, array.get(aName, r), text_color=live ? cTxt : cDim, bgcolor=cBg, text_size=ts)
+            table.cell(panel,  1, r + 1, timeframe.period, text_color=cDim, bgcolor=cBg, text_size=ts)
+            table.cell(panel,  2, r + 1, sig, text_color=col, bgcolor=cBg, text_size=ts)
+            table.cell(panel,  3, r + 1, live ? array.get(aGrade, r) : "-", text_color=col, bgcolor=cBg, text_size=ts)
+            table.cell(panel,  4, r + 1, live ? str.tostring(array.get(aScore, r)) : "-", text_color=col, bgcolor=cBg, text_size=ts)
+            table.cell(panel,  5, r + 1, f_ageTxt(array.get(aAge, r), live), text_color=cTxt, bgcolor=cBg, text_size=ts)
+            table.cell(panel,  6, r + 1, live ? str.tostring(array.get(aEntry, r), format.mintick) : "-", text_color=col, bgcolor=cBg, text_size=ts)
+            table.cell(panel,  7, r + 1, live ? str.tostring(array.get(aSl,   r), format.mintick) : "-", text_color=cSell, bgcolor=cBg, text_size=ts)
+            table.cell(panel,  8, r + 1, live ? str.tostring(array.get(aTp1,  r), format.mintick) : "-", text_color=col, bgcolor=cBg, text_size=ts)
+            table.cell(panel,  9, r + 1, live ? str.tostring(array.get(aTp2,  r), format.mintick) : "-", text_color=col, bgcolor=cBg, text_size=ts)
+            table.cell(panel, 10, r + 1, live ? str.tostring(array.get(aTp3,  r), format.mintick) : "-", text_color=col, bgcolor=cBg, text_size=ts)
+            table.cell(panel, 11, r + 1, live ? f_statusTxt(array.get(aStat, r)) : "WATCH", text_color=live ? cTxt : cDim, bgcolor=cBg, text_size=ts)
+
+// ---------------------------------------------------- chart symbol drawing --
+[cd, ce, cx, cp, cq, cw, cg, cy, cu, cv] = f_engine()
+[cbn, cbf] = request.security(syminfo.tickerid, biasTf, f_bias())
+
+cScore = cd == 0 ? 0 : f_score(cd, cg, cbn, cbf)
+cShow  = showTrade and cv == 1 and cd != 0 and f_biasOk(cd, cbn, cbf) and cScore >= minScore
+
+var box   bZone = na
+var line  lEnt  = na
+var line  lSl   = na
+var line  lTp1  = na
+var line  lTp2  = na
+var line  lTp3  = na
+var label lLeg  = na
+
+if barstate.islast
+    box.delete(bZone)
+    line.delete(lEnt)
+    line.delete(lSl)
+    line.delete(lTp1)
+    line.delete(lTp2)
+    line.delete(lTp3)
+    label.delete(lLeg)
+    if cShow
+        col = cd > 0 ? cBuy : cSell
+        x1  = bar_index - cy
+        x2  = bar_index + 12
+        bZone := box.new(x1, math.max(cw, cx), x2, math.min(cw, cx),
+             border_color=col, bgcolor=color.new(col, 92))
+        lEnt  := line.new(x1, ce, x2, ce, color=color.rgb(160, 45, 60), width=1)
+        lSl   := line.new(x1, cx, x2, cx, color=cSell, width=1)
+        lTp1  := line.new(x1, cp, x2, cp, color=col, style=line.style_dotted)
+        lTp2  := line.new(x1, cq, x2, cq, color=col, style=line.style_dotted)
+        lTp3  := line.new(x1, cw, x2, cw, color=col, style=line.style_dotted)
+        txt = (cd > 0 ? "▲ BUY" : "▼ SELL") + "  " + f_grade(cg) + "  score " + str.tostring(cScore) +
+             "\nENTRY " + str.tostring(ce, format.mintick) + "   SL " + str.tostring(cx, format.mintick) +
+             "\nTP1 " + str.tostring(cp, format.mintick) + "   TP2 " + str.tostring(cq, format.mintick) +
+             "   TP3 " + str.tostring(cw, format.mintick) +
+             "\n" + f_statusTxt(cu)
+        lLeg := label.new(x2, ce, txt, style=label.style_label_left,
+             color=cBg, textcolor=col, size=size.small)
+
+// ------------------------------------------------------------------ alerts -
+// Fires when the limit actually becomes fillable, not when the setup is drawn.
+// At that moment the entry is available and the setup is still valid.
+cFilled = cShow and cu == ST_ACTIVE and cu[1] == ST_WAIT and cScore >= alertMin and cScore <= alertMax
+
+if cFilled
+    alert("MarketFlow V8 >> ENTER NOW " + syminfo.ticker + " " + timeframe.period + " " +
+         (cd > 0 ? "BUY" : "SELL") + " " + f_grade(cg) + " score " + str.tostring(cScore) +
+         " | entry " + str.tostring(ce, format.mintick) +
+         "  SL " + str.tostring(cx, format.mintick) +
+         "  TP1 " + str.tostring(cp, format.mintick), alert.freq_once_per_bar)
+
+alertcondition(cFilled, "MarketFlow V8 entry", "MarketFlow V8: entry reached on {{ticker}}")
