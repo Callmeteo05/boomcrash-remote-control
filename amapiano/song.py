@@ -549,8 +549,8 @@ def render():
 
 # ---------------------------------------------------------------------- mix
 
-GAINS = dict(kick=0.80, log=0.85, sub=0.70, piano=1.00, pad=0.48,
-             strings=0.80, choir=0.85, sax=0.95, kalimba=0.80, shaker=0.95,
+GAINS = dict(kick=0.88, log=0.95, sub=0.80, piano=0.85, pad=0.48,
+             strings=0.70, choir=0.85, sax=0.85, kalimba=0.80, shaker=0.95,
              hat=1.00, rim=0.90, conga=1.00, bell=1.00, tamb=0.85)
 
 
@@ -634,7 +634,8 @@ def mixdown(buses, kick_hits, stem_dir):
         m[:, ch] = dsp.highpass(m[:, ch], 26)
         m[:, ch] = dsp.shelf(m[:, ch], 1300, 5.5, 'high')
         m[:, ch] = dsp.peaking(m[:, ch], 700, -2.5, q=1.2)
-        m[:, ch] = dsp.peaking(m[:, ch], 115, -3.0, q=1.4)
+        m[:, ch] = dsp.peaking(m[:, ch], 350, -2.5, q=1.0)
+        m[:, ch] = dsp.peaking(m[:, ch], 115, -2.0, q=1.4)
         m[:, ch] = dsp.shelf(m[:, ch], 55, 2.5, 'low')
     m = dsp.saturate(m * 0.85, drive=1.5, mix=0.35)
     m = dsp.soft_clip(m, 0.95)
