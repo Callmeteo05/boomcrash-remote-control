@@ -340,6 +340,15 @@ Two opt-in extras:
 
 ## Performance
 
+- **The first fill is download-bound, not compute-bound.** MetaTrader has to fetch history for
+  the entry timeframe and both bias timeframes for every symbol. Round-robin on its own would
+  discover that need one symbol at a time, so each download would only start when its turn came
+  up. Instead, every symbol that has not been analysed yet is asked for a single bar on all
+  three timeframes each cycle — costs nothing, and makes the terminal fetch them concurrently.
+  That is what actually shortens the wait.
+- Data per symbol is kept lean: ~325 entry bars and `InpBiasBars` (260) per bias timeframe.
+  Warm-up is `3 × slow EMA`, which leaves about 0.3% of the seed in EMA50 — far outside where
+  any signal is read — and lets a symbol qualify sooner after its history lands.
 - Symbols are analysed **round-robin, `InpSymbolsPerTick` per second** (default 6), and only
   when that symbol prints a new bar; otherwise the cached result is shown.
 - Three `CopyRates` per symbol per new bar (entry TF + D1 + H4). ATR and all structure walks
@@ -365,7 +374,8 @@ Two opt-in extras:
 | `InpMaxRiskAtr` / `InpMaxZoneAtr` | 4.0 / 2.5 | Quality rejections |
 | `InpAgeMode` | Bars | `Clock` shows elapsed time instead of bar count |
 | `InpSymbolsPerTick` | 10 | Maintenance scan rate once every symbol has been analysed |
-| `InpWarmupPerTick` | 40 | Burst rate during the first fill |
+| `InpWarmupPerTick` | 60 | Burst rate during the first fill |
+| `InpBiasBars` | 260 | Bars fetched per bias timeframe |
 | `InpMaxSymbols` | 0 | 0 = every Market Watch symbol, no cap |
 | `InpPdMaxPct` | 0.50 | Lower it for deeper discount / higher premium |
 | `InpRequireBothLegs` | false | true = only A+ setups |

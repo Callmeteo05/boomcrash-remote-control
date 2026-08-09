@@ -80,7 +80,8 @@ input string          InpFilterExclude  = "";    // Skip symbols containing this
 input bool            InpSkipUntradable = true;  // Skip symbols with trading disabled
 input int             InpMaxSymbols     = 0;     // Cap on scanned symbols (0 = every Market Watch symbol)
 input int             InpSymbolsPerTick = 10;    // Symbols analysed per second once warm
-input int             InpWarmupPerTick  = 40;    // Symbols analysed per second during first fill
+input int             InpWarmupPerTick  = 60;    // Symbols analysed per second during first fill
+input int             InpBiasBars       = 260;   // Bars fetched per bias timeframe
 
 input group "=== Timeframes ==="
 input ENUM_TIMEFRAMES InpTimeframe      = PERIOD_CURRENT; // Entry timeframe
@@ -1409,7 +1410,7 @@ void AnalyseSymbol(MFSymbol &s)
    //--- is looking at is what makes a scanner slow
    bool wantStats = (InpStatsBars > 0 && (InpShowWinRate || InpShowTradeDetail));
 
-   int warmup = (int)MathMax(MathMax(InpAtrPeriod * 6, InpEmaSlow * 4), 200);
+   int warmup = (int)MathMax(MathMax(InpAtrPeriod * 5, InpEmaSlow * 3), 150);
    int stats  = (wantStats ? InpStatsBars + InpStatsMaxHold : 0);
    //--- Only stretch the history window when a trade is actually still running.
    //--- Sizing every scan for the worst case would double the bars read on every
@@ -1447,8 +1448,8 @@ void AnalyseSymbol(MFSymbol &s)
    if(g_use1)
    {
       ArraySetAsSeries(c.r1, true);
-      int g1 = CopyRates(s.name, g_bias1, 0, 400, c.r1);
-      if(g1 >= 80)
+      int g1 = CopyRates(s.name, g_bias1, 0, InpBiasBars, c.r1);
+      if(g1 >= 60)
       {
          c.n1 = g1;
          int ed1[], ec1[];
@@ -1465,8 +1466,8 @@ void AnalyseSymbol(MFSymbol &s)
    if(g_use2)
    {
       ArraySetAsSeries(c.r2, true);
-      int g2 = CopyRates(s.name, g_bias2, 0, 600, c.r2);
-      if(g2 >= 80)
+      int g2 = CopyRates(s.name, g_bias2, 0, InpBiasBars, c.r2);
+      if(g2 >= 60)
       {
          c.n2 = g2;
          int ed2[], ec2[];
@@ -1674,6 +1675,24 @@ void RunScanBudget()
          warm = false;
          break;
       }
+
+   //--- The first fill is not limited by arithmetic, it is limited by MetaTrader
+   //--- downloading history. Round-robin alone discovers that need one symbol at
+   //--- a time, so each download starts only when its turn comes up. Asking for a
+   //--- single bar on every pending symbol costs nothing and makes the terminal
+   //--- fetch them all concurrently, which is what actually shortens the wait.
+   if(!warm)
+   {
+      MqlRates probe[];
+      for(int i = 0; i < total; i++)
+      {
+         if(!g_syms[i].ok || g_syms[i].analysed)
+            continue;
+         CopyRates(g_syms[i].name, g_tf, 0, 1, probe);
+         if(g_use1) CopyRates(g_syms[i].name, g_bias1, 0, 1, probe);
+         if(g_use2) CopyRates(g_syms[i].name, g_bias2, 0, 1, probe);
+      }
+   }
 
    int budget = (int)MathMax(1, warm ? InpSymbolsPerTick : InpWarmupPerTick);
    int looked = 0;
