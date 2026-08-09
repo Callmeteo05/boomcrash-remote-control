@@ -331,6 +331,44 @@ void DetectSynthetic()
   }
 
 //+------------------------------------------------------------------+
+//| Print what the engine reads from this broker's symbol spec.       |
+//| Everything the risk engine does is derived from these numbers, so |
+//| this line is the first thing to check on an unfamiliar broker.    |
+//+------------------------------------------------------------------+
+void ReportSymbolSpec()
+  {
+   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double tickVal  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE_LOSS);
+   if(tickVal <= 0.0) tickVal = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+
+   long stopsLvl = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   long freezeLvl= SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+   long tradeMode= SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE);
+
+   PrintFormat("ApexICT spec | %s | digits %d | point %s | tick size %s | "
+               "tick value(loss) %s | stops level %d | freeze %d | spread %d",
+               _Symbol, _Digits,
+               DoubleToString(_Point, 8),
+               DoubleToString(tickSize, 8),
+               DoubleToString(tickVal, 5),
+               (int)stopsLvl, (int)freezeLvl,
+               (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD));
+
+   if(tickSize <= 0.0 || tickVal <= 0.0)
+      Print("ApexICT WARNING: this symbol reports no tick size or tick value. "
+            "Levels will still be correct but the lot suggestion will read 0.");
+
+   if(tradeMode == SYMBOL_TRADE_MODE_DISABLED)
+      Print("ApexICT WARNING: trading is disabled for this symbol on this account. "
+            "Signals will still print - they just cannot be executed here.");
+
+   if(stopsLvl > 0)
+      PrintFormat("ApexICT: broker requires stops at least %s away from price; "
+                  "levels closer than that are pushed out automatically.",
+                  DoubleToString(stopsLvl * _Point, _Digits));
+  }
+
+//+------------------------------------------------------------------+
 //| Apply the style preset                                           |
 //+------------------------------------------------------------------+
 void ApplyPreset()
@@ -768,8 +806,15 @@ double SuggestLots(const double entry, const double sl)
    double risk = MathAbs(entry - sl);
    if(risk <= 0.0) return 0.0;
 
-   double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+
+   //--- TICK_VALUE_LOSS is the value of one tick moving against the position,
+   //--- which is exactly what a stop loss costs. Plain TICK_VALUE can differ on
+   //--- crosses and on accounts denominated in a third currency.
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE_LOSS);
+   if(tickValue <= 0.0)
+      tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+
    if(tickSize <= 0.0 || tickValue <= 0.0) return 0.0;
 
    double lossPerLot = (risk / tickSize) * tickValue;
@@ -1389,6 +1434,8 @@ int OnInit()
    if(g_isStepIndex)
       Print("ApexICT: Step Index detected. This series is a fixed-step random walk - "
             "directional setups are scored down and should be treated as low confidence.");
+
+   ReportSymbolSpec();
 
    return INIT_SUCCEEDED;
   }

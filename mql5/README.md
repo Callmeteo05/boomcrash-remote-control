@@ -86,6 +86,34 @@ Nothing in the engine is expressed in pips, and nothing is tuned to one instrume
 The one thing that genuinely differs per instrument is spike behaviour, and that is
 handled explicitly by the synthetic layer rather than being averaged away.
 
+## Broker compatibility
+
+The engine reads nothing from a hardcoded list. Every number it needs comes from the
+symbol's own specification in your terminal, so it runs on **any MT5 broker** —
+Weltrade, Deriv, JustMarkets, IC Markets, whoever — on any instrument they list.
+
+On attach it prints a spec line to the Experts tab:
+
+```
+ApexICT spec | EURUSD.m | digits 5 | point 0.00001 | tick size 0.00001 |
+tick value(loss) 1.00000 | stops level 0 | freeze 0 | spread 12
+```
+
+Check that line first on an unfamiliar broker. It is exactly what the risk engine is
+working from, and it warns you if the symbol reports no tick value (lot suggestion will
+read 0) or has trading disabled for your account.
+
+### Two things to know per broker
+
+**Symbol suffixes are handled.** Brokers append their own tags — `EURUSD.m`,
+`AUDCHF.m`, `US100.s`. Detection uses substring matching, so a suffix never breaks it.
+
+**Boom / Crash / Step are Deriv-proprietary instruments.** If your broker does not list
+them, the synthetic layer simply stays off and the structure engine runs normally on
+forex, metals, indices and crypto. If a broker lists equivalent spike instruments under
+different names, set `Synthetic handling` to `Force Boom` or `Force Crash` rather than
+relying on auto-detect.
+
 ## Outcome tracking — the TP marks
 
 Every emitted signal is followed forward bar by bar until it reaches TP2 or its stop.
