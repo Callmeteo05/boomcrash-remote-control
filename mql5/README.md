@@ -145,7 +145,7 @@ updating live as trades resolve.
 | `Entry mode` | FVG near edge (fills most) / 50% CE (default) / far edge (best price) |
 | `Min RR` | Rejects a setup when the nearest opposing pool is closer than this in R |
 | `Require discount` | Hard-blocks longs in premium and shorts in discount |
-| `Synthetic handling` | Auto-detects Boom / Crash / Step from the symbol name |
+| `Synthetic handling` | Auto / Off / Force up / Force down / **Measured** (ignore the name, read the bars) |
 | `Spike ATR` | Bar range that counts as a Boom/Crash spike |
 
 ## Grading
@@ -163,16 +163,48 @@ Every signal carries a reason string into the alert and the journal, e.g.
 
 ## Synthetic indices
 
-Auto-detected from the symbol name:
+Auto-detected from the symbol name, across both naming conventions. Full sources and
+confidence levels are in [`docs/BROKER_RESEARCH.md`](../docs/BROKER_RESEARCH.md).
 
-- **Crash** — spikes down, grinds up. Shorts score `+Synth bias score`, longs score `-`.
-- **Boom** — spikes up, grinds down. Mirror image.
-- **Step Index** — a fixed-step random walk with equal up/down probability. Directional
-  setups are scored **down by 15** and flagged on the panel, because no directional edge
-  exists in that series. The engine says so rather than inventing signals.
+| Family | Broker | Behaviour | Engine treatment |
+|---|---|---|---|
+| **Crash** | Deriv | grinds up, drops sharply | shorts score `+bias`, longs `-` |
+| **Boom** | Deriv | drifts down, spikes up | longs score `+bias`, shorts `-` |
+| **Step Index** | Deriv | fixed-step random walk | scored **down 15**, flagged |
+| **PainX** 400-1200 | Weltrade SyntX | gradual rise, sharp drops | shorts score `+bias` |
+| **GainX** 400-1200 | Weltrade SyntX | steady decline, sudden spikes up | longs score `+bias` |
+| **FlipX** 1-5 | Weltrade SyntX | 50/50 each tick, random walk | scored **down 15**, flagged |
+| **SwitchX / BreakX / TrendX** | Weltrade SyntX | direction **changes by design** | bias measured from data |
+| **FX Vol / SFX Vol** | Weltrade SyntX | no spike mechanic | structure engine only |
 
-Killzones, sessions and SMT are deliberately absent here — they describe human market
-structure that algorithmic series do not have.
+### The number in the symbol means opposite things
+
+`Crash 1000` = one spike per ~1000 ticks. `PainX 400` = **400% leverage** — a 0.01 price
+jump moves 4 points. Same-looking number, unrelated meaning. **The engine derives
+nothing from the number**, only from the family name. Volatility differences are already
+captured by ATR, which is what the risk engine actually uses.
+
+### The engine checks its own assumption
+
+The PainX/GainX spike directions above are documented at *medium-high* confidence —
+Weltrade's own pages are unreachable from the build environment, so they come from
+secondary sources. Rather than encode that as a silent constant, the engine counts
+observed up-spikes and down-spikes and prints a warning if the data disagrees:
+
+```
+ApexICT WARNING: PainX is assumed to spike down, but the bars show
+41 up-spikes and 6 down-spikes. Set 'Synthetic handling' to Measured...
+```
+
+The counts are always shown on the panel as `[spikes up 6 / down 41]`. If you ever see
+that warning, set `Synthetic handling` to **Measured** and the engine ignores the name
+entirely, taking the bias from the bars.
+
+`SwitchX`, `BreakX` and `TrendX` alternate direction as part of their design, so they
+use the measured bias automatically and report `undecided` until 10 spikes are seen.
+
+Killzones, sessions and SMT are deliberately absent for all synthetics — they describe
+human market structure that algorithmic series do not have.
 
 ---
 

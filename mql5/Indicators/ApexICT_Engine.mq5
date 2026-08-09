@@ -61,10 +61,22 @@ enum ENUM_GRADE_FILTER
 
 enum ENUM_SYNTH_MODE
   {
-   SYNTH_AUTO,        // Auto-detect Boom / Crash / Step from the symbol name
+   SYNTH_AUTO,        // Auto-detect from the symbol name (Deriv + Weltrade SyntX)
    SYNTH_OFF,         // Treat as an ordinary symbol
-   SYNTH_FORCE_BOOM,  // Force Boom behaviour (spikes up)
-   SYNTH_FORCE_CRASH  // Force Crash behaviour (spikes down)
+   SYNTH_FORCE_UP,    // Force spikes-up behaviour (Boom / GainX)
+   SYNTH_FORCE_DOWN,  // Force spikes-down behaviour (Crash / PainX)
+   SYNTH_MEASURED     // Ignore the name, take the bias from observed spikes
+  };
+
+//--- how an instrument's spike behaviour is decided
+enum ENUM_SYNTH_FAMILY
+  {
+   FAM_NONE,          // ordinary instrument
+   FAM_SPIKE_UP,      // Boom, GainX
+   FAM_SPIKE_DOWN,    // Crash, PainX
+   FAM_RANDOM,        // Step Index, FlipX - driftless random walk
+   FAM_ADAPTIVE,      // SwitchX, BreakX, TrendX - direction changes by design
+   FAM_SYMMETRIC      // FX Vol, SFX Vol - no spike mechanic
   };
 
 //+------------------------------------------------------------------+
@@ -258,8 +270,14 @@ int          g_swingLB       = 5;
 int          g_intLB         = 2;
 double       g_dispATR       = 1.5;
 
-int          g_synthDir      = 0;   // +1 Boom (spikes up), -1 Crash (spikes down), 0 none
-bool         g_isStepIndex   = false;
+int               g_synthDir    = 0;         // +1 spikes up, -1 spikes down, 0 none
+ENUM_SYNTH_FAMILY g_family      = FAM_NONE;
+string            g_familyName  = "";
+
+//--- observed spike behaviour, used to verify the name-based assumption
+int          g_spikeUp       = 0;
+int          g_spikeDown     = 0;
+bool         g_dirWarned     = false;
 
 datetime     g_lastAlertBar  = 0;
 datetime     g_lastWatchBar  = 0;
@@ -312,22 +330,75 @@ double MinStopDistance()
 //+------------------------------------------------------------------+
 //| Detect Boom / Crash / Step from the symbol name                  |
 //+------------------------------------------------------------------+
+//| Instrument classification.                                        |
+//|                                                                   |
+//| Deriv and Weltrade use opposite naming conventions for the number |
+//| in the symbol: Crash 1000 means one spike per ~1000 ticks, while  |
+//| PainX 400 means 400% leverage. Nothing is ever inferred from the  |
+//| number for that reason - only from the family name.               |
+//|                                                                   |
+//| See docs/BROKER_RESEARCH.md for sources and confidence levels.    |
+//+------------------------------------------------------------------+
 void DetectSynthetic()
   {
    g_synthDir    = 0;
-   g_isStepIndex = false;
+   g_family      = FAM_NONE;
+   g_familyName  = "";
 
-   if(InpSynthMode == SYNTH_OFF)
-      return;
-   if(InpSynthMode == SYNTH_FORCE_BOOM)  { g_synthDir =  1; return; }
-   if(InpSynthMode == SYNTH_FORCE_CRASH) { g_synthDir = -1; return; }
+   if(InpSynthMode == SYNTH_OFF)      return;
+   if(InpSynthMode == SYNTH_FORCE_UP)
+     { g_synthDir = 1;  g_family = FAM_SPIKE_UP;   g_familyName = "forced spikes-up";   return; }
+   if(InpSynthMode == SYNTH_FORCE_DOWN)
+     { g_synthDir = -1; g_family = FAM_SPIKE_DOWN; g_familyName = "forced spikes-down"; return; }
+   if(InpSynthMode == SYNTH_MEASURED)
+     { g_family = FAM_ADAPTIVE; g_familyName = "measured from data"; return; }
 
+   //--- normalise: upper case and strip spaces, so "Pain X 400" matches "PAINX"
    string s = _Symbol;
    StringToUpper(s);
+   StringReplace(s, " ", "");
 
-   if(StringFind(s, "BOOM")  >= 0) g_synthDir =  1;   // Boom spikes upward
-   if(StringFind(s, "CRASH") >= 0) g_synthDir = -1;   // Crash spikes downward
-   if(StringFind(s, "STEP")  >= 0) g_isStepIndex = true;
+   //--- Deriv
+   if(StringFind(s, "BOOM")  >= 0) { g_family = FAM_SPIKE_UP;   g_familyName = "Boom";  }
+   else if(StringFind(s, "CRASH") >= 0) { g_family = FAM_SPIKE_DOWN; g_familyName = "Crash"; }
+   else if(StringFind(s, "STEP")  >= 0) { g_family = FAM_RANDOM;     g_familyName = "Step Index"; }
+
+   //--- Weltrade SyntX
+   else if(StringFind(s, "GAINX")  >= 0) { g_family = FAM_SPIKE_UP;   g_familyName = "GainX";  }
+   else if(StringFind(s, "PAINX")  >= 0) { g_family = FAM_SPIKE_DOWN; g_familyName = "PainX";  }
+   else if(StringFind(s, "FLIPX")  >= 0) { g_family = FAM_RANDOM;     g_familyName = "FlipX";  }
+   else if(StringFind(s, "SWITCHX")>= 0) { g_family = FAM_ADAPTIVE;   g_familyName = "SwitchX";}
+   else if(StringFind(s, "BREAKX") >= 0) { g_family = FAM_ADAPTIVE;   g_familyName = "BreakX"; }
+   else if(StringFind(s, "TRENDX") >= 0) { g_family = FAM_ADAPTIVE;   g_familyName = "TrendX"; }
+   else if(StringFind(s, "SFXVOL") >= 0) { g_family = FAM_SYMMETRIC;  g_familyName = "SFX Vol";}
+   else if(StringFind(s, "FXVOL")  >= 0) { g_family = FAM_SYMMETRIC;  g_familyName = "FX Vol"; }
+
+   if(g_family == FAM_SPIKE_UP)   g_synthDir =  1;
+   if(g_family == FAM_SPIKE_DOWN) g_synthDir = -1;
+  }
+
+//+------------------------------------------------------------------+
+//| The spike direction actually observed in this symbol's bars.      |
+//| Returns 0 until there is enough evidence to call it.              |
+//+------------------------------------------------------------------+
+int MeasuredSpikeDir()
+  {
+   int total = g_spikeUp + g_spikeDown;
+   if(total < 10) return 0;                       // not enough spikes yet
+   if(g_spikeUp   >= (int)MathCeil(total * 0.6))  return  1;
+   if(g_spikeDown >= (int)MathCeil(total * 0.6))  return -1;
+   return 0;                                      // genuinely two-sided
+  }
+
+//+------------------------------------------------------------------+
+//| The bias the engine should actually trade with.                   |
+//| Adaptive instruments change direction by design, so their bias    |
+//| comes from observation, never from the name.                      |
+//+------------------------------------------------------------------+
+int EffectiveSpikeDir()
+  {
+   if(g_family == FAM_ADAPTIVE) return MeasuredSpikeDir();
+   return g_synthDir;
   }
 
 //+------------------------------------------------------------------+
@@ -420,6 +491,7 @@ void ResetState()
 
    g_resolved = 0; g_wins = 0; g_losses = 0;
    g_sumR = 0.0;   g_grossWinR = 0.0; g_grossLossR = 0.0; g_tp1Hits = 0;
+   g_spikeUp = 0;  g_spikeDown = 0;   g_dirWarned = false;
 
    ClearSweep(g_sweepBull);
    ClearSweep(g_sweepBear);
@@ -711,6 +783,10 @@ void DetectSpike(const int i, const double &open[], const double &high[], const 
 
    g_lastSpikeBar = i;
    g_lastSpikeDir = (high[i] - open[i] >= open[i] - low[i]) ? 1 : -1;
+
+   //--- evidence for the self-check against the name-based assumption
+   if(g_lastSpikeDir > 0) g_spikeUp++;
+   else                   g_spikeDown++;
   }
 
 //+------------------------------------------------------------------+
@@ -763,20 +839,22 @@ int GradeSetup(const int dir, const double entry, const double sl, const double 
    if(sw.age >= InpSweepValidBars) { score += 5; parts += "old level swept; "; }
 
    //--- synthetic spike asymmetry
-   if(g_synthDir != 0)
+   int spikeDir = EffectiveSpikeDir();
+   if(spikeDir != 0)
      {
-      if(dir == g_synthDir) { score += InpSynthBiasScore; parts += "with spike direction; "; }
-      else                  { score -= InpSynthBiasScore; parts += "against spike direction; "; }
+      if(dir == spikeDir) { score += InpSynthBiasScore; parts += "with spike direction; "; }
+      else                { score -= InpSynthBiasScore; parts += "against spike direction; "; }
      }
 
    //--- post-spike continuation: after the spike, the instrument returns to its grind
-   if(g_synthDir != 0 && g_lastSpikeBar >= 0 &&
+   if(spikeDir != 0 && g_lastSpikeBar >= 0 &&
       (fvgIdx < 0 || (g_fvg[fvgIdx].bar - g_lastSpikeBar) <= InpSweepValidBars) &&
       dir == -g_lastSpikeDir)
      { score += 5; parts += "post-spike continuation; "; }
 
-   //--- Step Index is a driftless fixed-step random walk: no directional edge exists
-   if(g_isStepIndex) { score -= 15; parts += "Step Index - no directional edge; "; }
+   //--- a driftless random walk (Step Index, FlipX) offers no directional edge
+   if(g_family == FAM_RANDOM)
+     { score -= 15; parts += g_familyName + " - random walk, no directional edge; "; }
 
    score = (int)MathMax(0, MathMin(100, score));
    reason = parts;
@@ -1204,7 +1282,8 @@ void TryArmSetup(const int i, const int dir, const double &close[])
      }
 
    //--- synthetic direction hard filter
-   if(InpSynthBiasFilter && g_synthDir != 0 && dir != g_synthDir) return;
+   int sdir = EffectiveSpikeDir();
+   if(InpSynthBiasFilter && sdir != 0 && dir != sdir) return;
 
    string reason;
    int score = GradeSetup(dir, entry, sl, dol, disp, f, sw, reason);
@@ -1378,9 +1457,44 @@ void UpdatePanel()
      }
 
    string trend = (g_trendMajor > 0) ? "BULLISH" : (g_trendMajor < 0 ? "BEARISH" : "RANGING");
-   string synth = (g_synthDir > 0) ? " | Boom: spikes up"
-                : (g_synthDir < 0) ? " | Crash: spikes down"
-                : (g_isStepIndex   ? " | Step Index: no directional edge" : "");
+
+   //--- synthetic classification, plus what the bars actually show
+   string synth = "";
+   if(g_family != FAM_NONE)
+     {
+      int measured = MeasuredSpikeDir();
+      string obs = StringFormat(" [spikes up %d / down %d]", g_spikeUp, g_spikeDown);
+
+      if(g_family == FAM_RANDOM)
+         synth = " | " + g_familyName + ": random walk, no directional edge" + obs;
+      else if(g_family == FAM_ADAPTIVE)
+         synth = " | " + g_familyName + ": adaptive, bias "
+               + (measured > 0 ? "UP" : measured < 0 ? "DOWN" : "undecided") + obs;
+      else if(g_family == FAM_SYMMETRIC)
+         synth = " | " + g_familyName + ": no spike mechanic" + obs;
+      else
+        {
+         synth = " | " + g_familyName + ": spikes "
+               + (g_synthDir > 0 ? "up" : "down") + obs;
+
+         //--- the assumed direction is documented as medium confidence, so it is
+         //--- checked against reality rather than trusted
+         if(measured != 0 && measured != g_synthDir)
+           {
+            synth += "  << OBSERVED DIRECTION DISAGREES";
+            if(!g_dirWarned)
+              {
+               g_dirWarned = true;
+               PrintFormat("ApexICT WARNING: %s is assumed to spike %s, but the bars show "
+                           "%d up-spikes and %d down-spikes. Set 'Synthetic handling' to "
+                           "Measured, or force the correct direction. See "
+                           "docs/BROKER_RESEARCH.md.",
+                           g_familyName, (g_synthDir > 0 ? "up" : "down"),
+                           g_spikeUp, g_spikeDown);
+              }
+           }
+        }
+     }
 
    string stats = "";
    if(InpShowStats && g_resolved > 0)
@@ -1431,9 +1545,19 @@ int OnInit()
    DetectSynthetic();
    ResetState();
 
-   if(g_isStepIndex)
-      Print("ApexICT: Step Index detected. This series is a fixed-step random walk - "
-            "directional setups are scored down and should be treated as low confidence.");
+   if(g_family != FAM_NONE)
+      PrintFormat("ApexICT: %s detected.", g_familyName);
+
+   if(g_family == FAM_RANDOM)
+      PrintFormat("ApexICT: %s is a driftless random walk (equal probability each tick). "
+                  "Directional setups are scored down by 15 and should be treated as low "
+                  "confidence - there is no trend edge in this series to find.",
+                  g_familyName);
+
+   if(g_family == FAM_ADAPTIVE)
+      PrintFormat("ApexICT: %s changes spike direction by design, so its bias is taken "
+                  "from observed spikes rather than from the symbol name. The bias reads "
+                  "'undecided' until at least 10 spikes have been seen.", g_familyName);
 
    ReportSymbolSpec();
 
