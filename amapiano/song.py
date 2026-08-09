@@ -499,6 +499,26 @@ def export_midi(midi):
     return mdir
 
 
+def export_mp3(wav_path, mp3_path, bitrate=256):
+    """Optional MP3 export -- skipped silently if lameenc isn't installed."""
+    try:
+        import lameenc
+        import wave
+    except ImportError:
+        return None
+    with wave.open(str(wav_path)) as w:
+        pcm = w.readframes(w.getnframes())
+        sr, ch = w.getframerate(), w.getnchannels()
+    enc = lameenc.Encoder()
+    enc.set_bit_rate(bitrate)
+    enc.set_in_sample_rate(sr)
+    enc.set_channels(ch)
+    enc.set_quality(2)
+    with open(mp3_path, 'wb') as f:
+        f.write(enc.encode(pcm) + enc.flush())
+    return mp3_path
+
+
 def main():
     os.makedirs(os.path.join(OUT, 'stems'), exist_ok=True)
     print(f'Umoya | {BPM:.0f} BPM | F# minor | '
@@ -514,6 +534,9 @@ def main():
     for name, sig in stems.items():
         dsp.write_wav(os.path.join(OUT, 'stems', f'{name}.wav'), sig, peak=0.9)
     export_midi(midi)
+    mp3 = export_mp3(os.path.join(OUT, 'umoya.wav'), os.path.join(OUT, 'umoya.mp3'))
+    if mp3 is None:
+        print('(pip install lameenc for an mp3 export)')
 
     peak = np.max(np.abs(master))
     rms = np.sqrt(np.mean(master ** 2))

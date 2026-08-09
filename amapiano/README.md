@@ -17,7 +17,8 @@ python3 song.py     # renders out/umoya.wav, out/stems/*.wav, out/midi/*.mid
 ```
 
 Only dependency is numpy. Audio is written as 16-bit WAV through the stdlib, so
-there is no encoder to install.
+there is no encoder to install. If `lameenc` is present it also writes an MP3;
+if not, that step is skipped.
 
 ---
 
@@ -112,12 +113,14 @@ not a lead. If you drop a vocal on this record, that is the layer to duck.
 
 ## Files
 
-- `out/umoya.wav` — full mix
+- `out/umoya.mp3` — full mix (committed)
+- `out/umoya.wav` — full mix, 16-bit/44.1k
 - `out/stems/*.wav` — ten stems at matched levels, ready to import
 - `out/midi/umoya_full.mid` — all parts as separate tracks
 - `out/midi/umoya_<part>.mid` — keys, bass, log, choir, pad, kalimba individually
 
-Audio output is gitignored (it is regenerable and large); the MIDI is committed.
+The WAV and stems are gitignored (large and regenerable); the MP3 and MIDI are
+committed.
 
 ## Where to take it
 
