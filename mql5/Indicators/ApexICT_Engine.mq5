@@ -79,6 +79,23 @@ enum ENUM_SYNTH_FAMILY
    FAM_SYMMETRIC      // FX Vol, SFX Vol - no spike mechanic
   };
 
+//--- the mode rule an adaptive instrument follows
+enum ENUM_ADAPTIVE_KIND
+  {
+   ADK_NONE,          // fall back to the measured direction
+   ADK_SWITCH,        // SwitchX - alternates mode after every jump
+   ADK_BREAK,         // BreakX  - flips only when a jump breaches the previous jump
+   ADK_TREND          // TrendX  - follows the momentum of the last two jumps
+  };
+
+//--- which side of a spike instrument to trade
+enum ENUM_SYNTH_STYLE
+  {
+   STYLE_SPIKE,       // Spike catch: trade the jump. Low hit rate, large R
+   STYLE_DRIP,        // Drip: trade the grind between jumps. High hit rate, small R
+   STYLE_BOTH         // No directional preference
+  };
+
 //+------------------------------------------------------------------+
 //| Inputs                                                           |
 //+------------------------------------------------------------------+
@@ -112,9 +129,10 @@ input bool             InpRequireDiscount   = false;           // Longs only in 
 
 input group "=== Synthetic indices (Boom / Crash / Step) ==="
 input ENUM_SYNTH_MODE  InpSynthMode         = SYNTH_AUTO;      // Synthetic handling
+input ENUM_SYNTH_STYLE InpSynthStyle        = STYLE_SPIKE;     // Which side of the spike cycle to trade
 input double           InpSpikeATR          = 4.0;             // Spike bar: range >= x * ATR
-input bool             InpSynthBiasFilter   = false;           // Hard-block signals against the spike direction
-input int              InpSynthBiasScore    = 10;              // Grade points for trading with the spike direction
+input bool             InpSynthBiasFilter   = false;           // Hard-block signals on the unfavoured side
+input int              InpSynthBiasScore    = 10;              // Grade points for the favoured side
 
 input group "=== Alerts ==="
 input bool             InpAlertWatch        = true;            // WATCH alert when a setup arms
@@ -270,9 +288,25 @@ int          g_swingLB       = 5;
 int          g_intLB         = 2;
 double       g_dispATR       = 1.5;
 
-int               g_synthDir    = 0;         // +1 spikes up, -1 spikes down, 0 none
-ENUM_SYNTH_FAMILY g_family      = FAM_NONE;
-string            g_familyName  = "";
+int                g_synthDir   = 0;         // +1 spikes up, -1 spikes down, 0 none
+ENUM_SYNTH_FAMILY  g_family     = FAM_NONE;
+ENUM_ADAPTIVE_KIND g_adaptKind  = ADK_NONE;
+string             g_familyName = "";
+
+//--- one recorded jump
+struct SpikeRec
+  {
+   int      bar;
+   datetime time;
+   int      dir;         // +1 up, -1 down
+   double   extreme;     // the far end of the jump
+  };
+SpikeRec     g_spikes[];
+int          g_breakMode     = 0;   // BreakX current mode
+
+//--- the mode model scores itself: predicted next jump vs what actually came
+int          g_predTotal     = 0;
+int          g_predCorrect   = 0;
 
 //--- observed spike behaviour, used to verify the name-based assumption
 int          g_spikeUp       = 0;
@@ -343,6 +377,7 @@ void DetectSynthetic()
   {
    g_synthDir    = 0;
    g_family      = FAM_NONE;
+   g_adaptKind   = ADK_NONE;
    g_familyName  = "";
 
    if(InpSynthMode == SYNTH_OFF)      return;
@@ -351,7 +386,8 @@ void DetectSynthetic()
    if(InpSynthMode == SYNTH_FORCE_DOWN)
      { g_synthDir = -1; g_family = FAM_SPIKE_DOWN; g_familyName = "forced spikes-down"; return; }
    if(InpSynthMode == SYNTH_MEASURED)
-     { g_family = FAM_ADAPTIVE; g_familyName = "measured from data"; return; }
+     { g_family = FAM_ADAPTIVE; g_adaptKind = ADK_NONE;
+       g_familyName = "measured from data"; return; }
 
    //--- normalise: upper case and strip spaces, so "Pain X 400" matches "PAINX"
    string s = _Symbol;
@@ -367,9 +403,12 @@ void DetectSynthetic()
    else if(StringFind(s, "GAINX")  >= 0) { g_family = FAM_SPIKE_UP;   g_familyName = "GainX";  }
    else if(StringFind(s, "PAINX")  >= 0) { g_family = FAM_SPIKE_DOWN; g_familyName = "PainX";  }
    else if(StringFind(s, "FLIPX")  >= 0) { g_family = FAM_RANDOM;     g_familyName = "FlipX";  }
-   else if(StringFind(s, "SWITCHX")>= 0) { g_family = FAM_ADAPTIVE;   g_familyName = "SwitchX";}
-   else if(StringFind(s, "BREAKX") >= 0) { g_family = FAM_ADAPTIVE;   g_familyName = "BreakX"; }
-   else if(StringFind(s, "TRENDX") >= 0) { g_family = FAM_ADAPTIVE;   g_familyName = "TrendX"; }
+   else if(StringFind(s, "SWITCHX")>= 0)
+     { g_family = FAM_ADAPTIVE; g_adaptKind = ADK_SWITCH; g_familyName = "SwitchX"; }
+   else if(StringFind(s, "BREAKX") >= 0)
+     { g_family = FAM_ADAPTIVE; g_adaptKind = ADK_BREAK;  g_familyName = "BreakX";  }
+   else if(StringFind(s, "TRENDX") >= 0)
+     { g_family = FAM_ADAPTIVE; g_adaptKind = ADK_TREND;  g_familyName = "TrendX";  }
    else if(StringFind(s, "SFXVOL") >= 0) { g_family = FAM_SYMMETRIC;  g_familyName = "SFX Vol";}
    else if(StringFind(s, "FXVOL")  >= 0) { g_family = FAM_SYMMETRIC;  g_familyName = "FX Vol"; }
 
@@ -391,14 +430,100 @@ int MeasuredSpikeDir()
   }
 
 //+------------------------------------------------------------------+
-//| The bias the engine should actually trade with.                   |
-//| Adaptive instruments change direction by design, so their bias    |
-//| comes from observation, never from the name.                      |
+//| Which way the NEXT jump is expected to go.                        |
+//|                                                                   |
+//| For the fixed families this is simply the documented direction.    |
+//| For the three mode-switching instruments it is a state machine     |
+//| built from Weltrade's own descriptions:                            |
+//|                                                                    |
+//|   SwitchX - alternates mode after every jump                       |
+//|   BreakX  - flips only when a jump breaches the previous jump      |
+//|   TrendX  - follows the momentum of the last two jumps             |
+//|                                                                    |
+//| Those descriptions are medium confidence (see BROKER_RESEARCH.md), |
+//| so the model scores itself against what actually happens and       |
+//| reports its hit rate on the panel. Treat a rate near 50% as the    |
+//| model being wrong for that instrument.                             |
 //+------------------------------------------------------------------+
+int PredictedNextSpikeDir()
+  {
+   if(g_family == FAM_SPIKE_UP)   return  1;
+   if(g_family == FAM_SPIKE_DOWN) return -1;
+   if(g_family != FAM_ADAPTIVE)   return  0;
+
+   int n = ArraySize(g_spikes);
+   if(n == 0) return 0;
+
+   switch(g_adaptKind)
+     {
+      case ADK_SWITCH:
+         //--- alternates after each jump, so the next one is the opposite
+         return -g_spikes[n-1].dir;
+
+      case ADK_BREAK:
+         //--- mode persists until a jump breaches the previous jump's level
+         return (g_breakMode != 0) ? g_breakMode : g_spikes[n-1].dir;
+
+      case ADK_TREND:
+        {
+         //--- momentum read from where the last two jumps reached
+         if(n < 2) return 0;
+         if(g_spikes[n-1].extreme > g_spikes[n-2].extreme) return  1;
+         if(g_spikes[n-1].extreme < g_spikes[n-2].extreme) return -1;
+         return 0;
+        }
+
+      default:
+         return MeasuredSpikeDir();
+     }
+  }
+
+//--- the bias the engine actually trades with
 int EffectiveSpikeDir()
   {
-   if(g_family == FAM_ADAPTIVE) return MeasuredSpikeDir();
-   return g_synthDir;
+   return PredictedNextSpikeDir();
+  }
+
+//--- accuracy of the mode model, as a percentage; -1 when untested
+double ModelAccuracy()
+  {
+   if(g_predTotal < 5) return -1.0;
+   return 100.0 * g_predCorrect / g_predTotal;
+  }
+
+//+------------------------------------------------------------------+
+//| Record a jump, after first scoring the prediction that preceded it|
+//+------------------------------------------------------------------+
+void RecordSpike(const int bar, const datetime t, const int dir, const double extreme)
+  {
+   //--- score the standing prediction BEFORE the new jump updates the state
+   int pred = PredictedNextSpikeDir();
+   if(pred != 0)
+     {
+      g_predTotal++;
+      if(pred == dir) g_predCorrect++;
+     }
+
+   int n = ArraySize(g_spikes);
+   ArrayResize(g_spikes, n + 1);
+   g_spikes[n].bar     = bar;
+   g_spikes[n].time    = t;
+   g_spikes[n].dir     = dir;
+   g_spikes[n].extreme = extreme;
+
+   //--- BreakX: the mode flips only when this jump breaches the previous one
+   if(n == 0)
+      g_breakMode = dir;
+   else
+     {
+      bool breached = (dir > 0) ? (extreme > g_spikes[n-1].extreme)
+                                : (extreme < g_spikes[n-1].extreme);
+      if(breached) g_breakMode = dir;
+     }
+
+   //--- keep the history bounded
+   int size = ArraySize(g_spikes);
+   if(size > 300) ArrayRemove(g_spikes, 0, size - 300);
   }
 
 //+------------------------------------------------------------------+
@@ -492,6 +617,8 @@ void ResetState()
    g_resolved = 0; g_wins = 0; g_losses = 0;
    g_sumR = 0.0;   g_grossWinR = 0.0; g_grossLossR = 0.0; g_tp1Hits = 0;
    g_spikeUp = 0;  g_spikeDown = 0;   g_dirWarned = false;
+   ArrayResize(g_spikes, 0);
+   g_breakMode = 0; g_predTotal = 0; g_predCorrect = 0;
 
    ClearSweep(g_sweepBull);
    ClearSweep(g_sweepBear);
@@ -775,7 +902,8 @@ double DisplacementStrength(const int i, const double fromPrice, const double &c
 //| Boom / Crash produce one outsized bar in a known direction; the    |
 //| grind between spikes is the opposite direction.                    |
 //+------------------------------------------------------------------+
-void DetectSpike(const int i, const double &open[], const double &high[], const double &low[])
+void DetectSpike(const int i, const datetime &time[], const double &open[],
+                 const double &high[], const double &low[])
   {
    double atr = BufATR[i];
    if(atr <= 0.0) return;
@@ -787,6 +915,9 @@ void DetectSpike(const int i, const double &open[], const double &high[], const 
    //--- evidence for the self-check against the name-based assumption
    if(g_lastSpikeDir > 0) g_spikeUp++;
    else                   g_spikeDown++;
+
+   RecordSpike(i, time[i], g_lastSpikeDir,
+               (g_lastSpikeDir > 0) ? high[i] : low[i]);
   }
 
 //+------------------------------------------------------------------+
@@ -838,12 +969,19 @@ int GradeSetup(const int dir, const double entry, const double sl, const double 
    //--- how long the swept level had been resting
    if(sw.age >= InpSweepValidBars) { score += 5; parts += "old level swept; "; }
 
-   //--- synthetic spike asymmetry
+   //--- synthetic spike asymmetry.
+   //--- Spike style trades the jump itself; drip style trades the grind between
+   //--- jumps, which runs the other way. They are opposite trades, so the bias
+   //--- has to follow whichever the trader has chosen.
    int spikeDir = EffectiveSpikeDir();
-   if(spikeDir != 0)
+   if(spikeDir != 0 && InpSynthStyle != STYLE_BOTH)
      {
-      if(dir == spikeDir) { score += InpSynthBiasScore; parts += "with spike direction; "; }
-      else                { score -= InpSynthBiasScore; parts += "against spike direction; "; }
+      bool drip    = (InpSynthStyle == STYLE_DRIP);
+      int  favored = drip ? -spikeDir : spikeDir;
+      if(dir == favored)
+        { score += InpSynthBiasScore; parts += (drip ? "with the grind; " : "with spike direction; "); }
+      else
+        { score -= InpSynthBiasScore; parts += (drip ? "against the grind; " : "against spike direction; "); }
      }
 
    //--- post-spike continuation: after the spike, the instrument returns to its grind
@@ -1281,9 +1419,13 @@ void TryArmSetup(const int i, const int dir, const double &close[])
         }
      }
 
-   //--- synthetic direction hard filter
+   //--- synthetic direction hard filter, on whichever side the style favours
    int sdir = EffectiveSpikeDir();
-   if(InpSynthBiasFilter && sdir != 0 && dir != sdir) return;
+   if(InpSynthBiasFilter && sdir != 0 && InpSynthStyle != STYLE_BOTH)
+     {
+      int favored = (InpSynthStyle == STYLE_DRIP) ? -sdir : sdir;
+      if(dir != favored) return;
+     }
 
    string reason;
    int score = GradeSetup(dir, entry, sl, dol, disp, f, sw, reason);
@@ -1468,8 +1610,18 @@ void UpdatePanel()
       if(g_family == FAM_RANDOM)
          synth = " | " + g_familyName + ": random walk, no directional edge" + obs;
       else if(g_family == FAM_ADAPTIVE)
-         synth = " | " + g_familyName + ": adaptive, bias "
-               + (measured > 0 ? "UP" : measured < 0 ? "DOWN" : "undecided") + obs;
+        {
+         int    pred = PredictedNextSpikeDir();
+         double acc  = ModelAccuracy();
+         synth = " | " + g_familyName + ": next jump "
+               + (pred > 0 ? "UP" : pred < 0 ? "DOWN" : "undecided");
+         if(acc >= 0.0)
+           {
+            synth += StringFormat("  model %.0f%% (%d/%d)", acc, g_predCorrect, g_predTotal);
+            if(acc < 55.0) synth += " << NO BETTER THAN A COIN, IGNORE THE BIAS";
+           }
+         synth += obs;
+        }
       else if(g_family == FAM_SYMMETRIC)
          synth = " | " + g_familyName + ": no spike mechanic" + obs;
       else
@@ -1555,9 +1707,15 @@ int OnInit()
                   g_familyName);
 
    if(g_family == FAM_ADAPTIVE)
-      PrintFormat("ApexICT: %s changes spike direction by design, so its bias is taken "
-                  "from observed spikes rather than from the symbol name. The bias reads "
-                  "'undecided' until at least 10 spikes have been seen.", g_familyName);
+      PrintFormat("ApexICT: %s changes mode by design. Its next-jump direction comes from "
+                  "a state machine, and the model reports its own hit rate on the panel. "
+                  "If that rate sits near 50%%, the model is wrong for this instrument - "
+                  "set 'Synthetic handling' to Off and trade the structure alone.",
+                  g_familyName);
+
+   if(g_family == FAM_SYMMETRIC)
+      PrintFormat("ApexICT: %s has no spike mechanic, so no directional bias is applied. "
+                  "The structure engine runs normally.", g_familyName);
 
    ReportSymbolSpec();
 
@@ -1672,7 +1830,7 @@ int OnCalculate(const int rates_total,
       //--- arrays
       DetectFVG(i, time, high, low);
       UpdateFVGMitigation(i, high, low);
-      DetectSpike(i, open, high, low);
+      DetectSpike(i, time, open, high, low);
 
       //--- liquidity
       DetectSweeps(i, time, high, low, close);

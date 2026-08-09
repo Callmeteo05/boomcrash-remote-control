@@ -69,11 +69,33 @@ Because of that, the engine **measures** the spike direction from live bars and 
 when the observed direction contradicts the name-based assumption. If the mapping above
 is backwards, the panel will say so rather than trading the wrong way silently.
 
-### Mode-switching instruments
+### Mode-switching instruments — documented mechanics
 
-SwitchX, BreakX and TrendX **change direction by design**. A fixed name-based bias is
-wrong for these. The engine classifies them as *adaptive* and takes the bias from the
-measured recent spike direction instead.
+These three **change direction by design**, so a fixed name-based bias is wrong for
+them. Weltrade's descriptions give a specific rule for each:
+
+| Instrument | Documented rule | Implemented as |
+|---|---|---|
+| **SwitchX** | "alternates between PainX and GainX after each jump" | next jump = opposite of the last jump |
+| **BreakX** | "switches modes only when a new jump breaches the previous jump's price level" | mode persists; flips to the new direction only on a breach of the prior jump's extreme |
+| **TrendX** | "detects emerging trends by analysing the last two jumps, then switches between PainX and GainX modes to align with momentum" | compare the extremes of the last two jumps; ascending = expect up, descending = expect down |
+
+Confidence: **medium.** The wording above is reproduced consistently across search
+summaries, but the exact mechanics — what counts as a "jump", whether "price level"
+means the jump's origin or its extreme — are **not** specified anywhere reachable. The
+implementation picks the extreme as the reference and treats a jump as a bar whose range
+exceeds `Spike ATR x ATR`.
+
+**Because of that uncertainty the state machine scores itself.** Before each new jump the
+engine records its prediction, then compares it to what actually happened, and reports
+the hit rate on the panel:
+
+```
+SwitchX: next jump DOWN  model 78% (32/41)
+```
+
+A rate near 50% means the model is wrong for that instrument, and the panel says so
+outright. That converts an unverifiable assumption into a measurement the trader can see.
 
 ---
 
@@ -100,6 +122,20 @@ any tool claiming to count down to the next spike is selling a myth.
 Whether the real implementation is exactly memoryless is **unverified**. The engine
 should therefore measure the empirical hazard rather than assume either way. Planned,
 not yet built.
+
+---
+
+### Drip versus spike — two opposite trades
+
+On any spike instrument there are two different trades, and they are opposites:
+
+- **Spike catch** — trade the jump. Low hit rate, small stop, large R, positive skew.
+- **Drip** — trade the grind between jumps. High hit rate, small target, and a tail risk
+  that one jump erases many wins.
+
+An engine that applies one directional bias without knowing which style the trader wants
+will actively fight half their trades. The style is therefore an explicit input, not an
+assumption.
 
 ---
 

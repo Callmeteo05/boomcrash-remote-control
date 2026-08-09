@@ -174,7 +174,9 @@ confidence levels are in [`docs/BROKER_RESEARCH.md`](../docs/BROKER_RESEARCH.md)
 | **PainX** 400-1200 | Weltrade SyntX | gradual rise, sharp drops | shorts score `+bias` |
 | **GainX** 400-1200 | Weltrade SyntX | steady decline, sudden spikes up | longs score `+bias` |
 | **FlipX** 1-5 | Weltrade SyntX | 50/50 each tick, random walk | scored **down 15**, flagged |
-| **SwitchX / BreakX / TrendX** | Weltrade SyntX | direction **changes by design** | bias measured from data |
+| **SwitchX** | Weltrade SyntX | alternates mode after every jump | next jump = opposite of last |
+| **BreakX** | Weltrade SyntX | flips only on a breach of the prior jump | mode state machine |
+| **TrendX** | Weltrade SyntX | follows momentum of the last two jumps | mode state machine |
 | **FX Vol / SFX Vol** | Weltrade SyntX | no spike mechanic | structure engine only |
 
 ### The number in the symbol means opposite things
@@ -200,8 +202,42 @@ The counts are always shown on the panel as `[spikes up 6 / down 41]`. If you ev
 that warning, set `Synthetic handling` to **Measured** and the engine ignores the name
 entirely, taking the bias from the bars.
 
-`SwitchX`, `BreakX` and `TrendX` alternate direction as part of their design, so they
-use the measured bias automatically and report `undecided` until 10 spikes are seen.
+### Mode-switching instruments score their own model
+
+`SwitchX`, `BreakX` and `TrendX` change mode by design, each by a different documented
+rule, so each gets its own state machine rather than a fixed bias:
+
+- **SwitchX** — alternates after every jump, so the next jump is the opposite of the last
+- **BreakX** — mode persists and flips only when a jump breaches the previous jump's extreme
+- **TrendX** — compares the extremes of the last two jumps and follows that momentum
+
+Those rules come from Weltrade's descriptions at *medium* confidence — the fine print
+(what exactly counts as a jump, whether "price level" means origin or extreme) is not
+published anywhere reachable. So the state machine **records its prediction before each
+jump and scores it against what actually happens**:
+
+```
+SwitchX: next jump DOWN  model 78% (32/41)  [spikes up 19 / down 22]
+```
+
+If that rate sits near 50% the panel says so outright —
+`<< NO BETTER THAN A COIN, IGNORE THE BIAS` — and you should set `Synthetic handling` to
+`Off` and trade the structure alone on that instrument. An unverifiable assumption
+becomes a number you can watch.
+
+### Drip or spike — pick your side
+
+On any spike instrument there are two opposite trades, and the engine cannot guess which
+you want:
+
+- **Spike catch** (default) — trade the jump. Low hit rate, small stop, large R.
+- **Drip** — trade the grind between jumps. High hit rate, small target, tail risk that
+  one jump erases many wins.
+- **Both** — no directional preference; structure alone decides.
+
+Set this with `Which side of the spike cycle to trade`. It flips which direction earns
+the grade bonus, so the engine works *with* your style instead of fighting half your
+trades.
 
 Killzones, sessions and SMT are deliberately absent for all synthetics — they describe
 human market structure that algorithmic series do not have.
