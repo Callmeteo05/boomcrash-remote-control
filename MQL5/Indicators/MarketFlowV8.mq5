@@ -26,9 +26,12 @@
 #property description "MarketFlow V8 - D1/H4 bias + SMC (sweep, CHoCH/BOS, order block, FVG,"
 #property description "premium/discount) scanner over the whole Market Watch, with liquidity"
 #property description "based targets, live trade status and a measured hit rate per symbol."
-#property indicator_chart_window
+#property indicator_separate_window
 #property indicator_buffers 0
 #property indicator_plots   0
+#property indicator_height  200
+#property indicator_minimum 0.0
+#property indicator_maximum 1.0
 
 //+------------------------------------------------------------------+
 //| Enums                                                            |
@@ -44,6 +47,13 @@ enum ENUM_MF_POI
 {
    MF_POI_CE      = 0,  // Consequent encroachment (zone midpoint)
    MF_POI_PROXIMAL= 1   // Proximal edge (first touch)
+};
+
+enum ENUM_MF_RECYCLE
+{
+   MF_RECYCLE_TP1 = 0,  // free the pair once the setup reaches TP1 (or SL)
+   MF_RECYCLE_TP2 = 1,  // ...TP2
+   MF_RECYCLE_TP3 = 2   // ...TP3
 };
 
 enum ENUM_MF_AGE
@@ -73,9 +83,10 @@ input int             InpSymbolsPerTick = 10;    // Symbols analysed per second
 
 input group "=== Timeframes ==="
 input ENUM_TIMEFRAMES InpTimeframe      = PERIOD_CURRENT; // Entry timeframe
-input ENUM_TIMEFRAMES InpBiasTF1        = PERIOD_D1;      // Primary bias timeframe
-input ENUM_TIMEFRAMES InpBiasTF2        = PERIOD_H4;      // Secondary bias timeframe
-input ENUM_MF_BIAS    InpBiasMode       = MF_BIAS_H4LED;  // How strict the bias must be
+input bool            InpBiasAuto       = true;          // Bias follows the chart (1 and 2 steps up)
+input ENUM_TIMEFRAMES InpBiasTF1        = PERIOD_D1;      // Higher bias TF (when auto is off)
+input ENUM_TIMEFRAMES InpBiasTF2        = PERIOD_H4;      // Nearer bias TF (when auto is off)
+input ENUM_MF_BIAS    InpBiasMode       = MF_BIAS_BOTH;   // How strict the bias must be
 
 input group "=== Market structure (SMC) ==="
 input int             InpSwingStrength  = 2;     // Fractal strength (bars each side)
@@ -102,7 +113,8 @@ input double          InpRsiRevSell     = 55.0;  // Reversal sell needs RSI at o
 input group "=== Quality gates ==="
 input double          InpMaxRiskAtr     = 4.0;   // Reject setups whose stop is wider than ATR x
 input double          InpMaxZoneAtr     = 2.5;   // Reject POI zones wider than ATR x
-input bool            InpHideFinished   = true;  // A setup that already hit SL or TP3 is not a signal
+input bool            InpHideFinished   = true;  // Drop a finished setup instead of leaving it on the board
+input ENUM_MF_RECYCLE InpRecycleAt      = MF_RECYCLE_TP1; // When a pair may produce its next setup
 
 input group "=== Signal selection ==="
 input int             InpMaxAge         = 25;    // Keep a setup on the board for N bars
@@ -148,23 +160,28 @@ input bool            InpShowTradeDetail= false; // Extra legend line (bias, sco
 input int             InpBoxExtendBars  = 6;     // Extend the trade box N bars past the last bar
 
 input group "=== Colors ==="
-input color           InpClrPanelBg     = C'10,12,26';    // Panel background
-input color           InpClrPanelBorder = C'60,50,120';   // Panel border
-input color           InpClrRowA        = C'16,18,38';    // Row background A
-input color           InpClrRowB        = C'22,24,48';    // Row background B
-input color           InpClrRowActive   = C'42,34,88';    // Row background of the charted symbol
-input color           InpClrTitle       = C'190,180,255'; // Title text
-input color           InpClrHeader      = C'130,120,190'; // Column header text
-input color           InpClrText        = C'205,205,220'; // Row text
-input color           InpClrDim         = C'110,110,130'; // Dimmed text
-input color           InpClrBuy         = C'0,210,140';   // Buy color
-input color           InpClrSell        = C'235,70,110';  // Sell color
+input color           InpClrPanelBg     = C'8,10,24';    // Panel background
+input color           InpClrPanelBorder = C'70,55,130';   // Panel border
+input color           InpClrRowA        = C'14,16,34';    // Row background A
+input color           InpClrRowB        = C'20,22,46';    // Row background B
+input color           InpClrRowActive   = C'46,36,96';    // Row background of the charted symbol
+input color           InpClrTitle       = C'200,190,255'; // Title text
+input color           InpClrHeader      = C'140,125,205'; // Column header text
+input color           InpClrText        = C'210,210,228'; // Row text
+input color           InpClrDim         = C'108,108,134'; // Dimmed text
+input color           InpClrBuy         = C'0,214,140';   // Buy color
+input color           InpClrSell        = C'236,72,112';  // Sell color
 input color           InpClrEntryLine   = C'160,45,60';   // Entry line color
 input color           InpClrWatermark   = C'190,185,200'; // Watermark color (when not tinted)
+input color           InpClrOpen        = C'150,170,255'; // "OPEN" button text
 
 input group "=== Alerts ==="
-input bool            InpAlertPopup     = false; // Popup alert on a new setup
-input bool            InpAlertPush      = false; // Push notification on a new setup
+input bool            InpAlertPopup     = true;  // Popup when price reaches the entry
+input bool            InpAlertPush      = false; // Push notification when price reaches the entry
+input bool            InpAlertSound     = true;  // Play a sound with the entry alert
+input int             InpAlertMinScore  = 75;    // Only alert setups scoring at least this
+input int             InpAlertMaxScore  = 100;   // ...and at most this
+input bool            InpAlertOnForming = false; // Extra heads-up when the setup first appears
 
 //+------------------------------------------------------------------+
 //| Status codes                                                     |
@@ -232,7 +249,12 @@ struct MFSymbol
    datetime curBar;         // newest bar time, refreshed every cycle
    int      statWins;
    int      statLosses;
-   datetime lastAlert;
+   datetime lastAlert;       // heads-up already sent for this setup
+   datetime alertedEntry;    // entry alert already sent for this setup
+   int      scoutDir;        // directional read when there is no tradable setup
+   int      scoutScore;
+   int      scoutB1;
+   int      scoutB2;
    string   note;
    MFSignal sig;
 };
@@ -302,6 +324,9 @@ const string      g_prefix  = "MFV8_";
 const int         g_titleH  = 24;
 const int         g_headerH = 20;
 
+int               g_win     = 0;   // sub-window this indicator occupies
+int               g_objWin   = 0;  // window new objects are created in
+
 MFSymbol          g_syms[];
 int               g_order[];
 int               g_cursor  = 0;
@@ -326,6 +351,35 @@ string TfToText(const ENUM_TIMEFRAMES tf)
    return (p >= 0 ? StringSubstr(s, p + 1) : s);
 }
 
+//--- one step up the timeframe ladder, used when the bias follows the chart
+ENUM_TIMEFRAMES NextTimeframeUp(const ENUM_TIMEFRAMES tf)
+{
+   switch(tf)
+   {
+      case PERIOD_M1:  return PERIOD_M5;
+      case PERIOD_M2:  return PERIOD_M10;
+      case PERIOD_M3:  return PERIOD_M15;
+      case PERIOD_M4:  return PERIOD_M20;
+      case PERIOD_M5:  return PERIOD_M30;
+      case PERIOD_M6:  return PERIOD_M30;
+      case PERIOD_M10: return PERIOD_H1;
+      case PERIOD_M12: return PERIOD_H1;
+      case PERIOD_M15: return PERIOD_H1;
+      case PERIOD_M20: return PERIOD_H2;
+      case PERIOD_M30: return PERIOD_H4;
+      case PERIOD_H1:  return PERIOD_H4;
+      case PERIOD_H2:  return PERIOD_H8;
+      case PERIOD_H3:  return PERIOD_H12;
+      case PERIOD_H4:  return PERIOD_D1;
+      case PERIOD_H6:  return PERIOD_D1;
+      case PERIOD_H8:  return PERIOD_D1;
+      case PERIOD_H12: return PERIOD_D1;
+      case PERIOD_D1:  return PERIOD_W1;
+      case PERIOD_W1:  return PERIOD_MN1;
+      default:         return PERIOD_MN1;
+   }
+}
+
 string ArrowFor(const int dir)
 {
    if(dir > 0) return ShortToString(0x25B2);
@@ -346,11 +400,13 @@ int RowBaseline(const int i)
 //+------------------------------------------------------------------+
 //| Object helpers                                                   |
 //+------------------------------------------------------------------+
+//--- objects are created in g_objWin: the sub-window for the dashboard, window 0
+//--- for everything drawn on the price chart
 bool EnsureObject(const string name, const ENUM_OBJECT type)
 {
    if(ObjectFind(0, name) >= 0)
       return true;
-   if(!ObjectCreate(0, name, type, 0, 0, 0))
+   if(!ObjectCreate(0, name, type, g_objWin, 0, 0))
       return false;
    ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
    ObjectSetInteger(0, name, OBJPROP_SELECTED,   false);
@@ -512,8 +568,13 @@ void BuildUniverse()
       r.curBar     = 0;
       r.statWins   = 0;
       r.statLosses = 0;
-      r.lastAlert  = 0;
-      r.note       = "LOADING";
+      r.lastAlert    = 0;
+      r.alertedEntry = 0;
+      r.scoutDir     = 0;
+      r.scoutScore   = 0;
+      r.scoutB1      = 0;
+      r.scoutB2      = 0;
+      r.note         = "LOADING";
       r.sig.valid  = false;
       r.sig.status = ST_WAIT;
       r.sig.tags   = "";
@@ -540,7 +601,12 @@ void BuildUniverse()
             r.lastBar    = old[j].lastBar;
             r.statWins   = old[j].statWins;
             r.statLosses = old[j].statLosses;
-            r.lastAlert  = old[j].lastAlert;
+            r.lastAlert    = old[j].lastAlert;
+            r.alertedEntry = old[j].alertedEntry;
+            r.scoutDir     = old[j].scoutDir;
+            r.scoutScore   = old[j].scoutScore;
+            r.scoutB1      = old[j].scoutB1;
+            r.scoutB2      = old[j].scoutB2;
             r.note       = old[j].note;
             r.sig        = old[j].sig;
             break;
@@ -1128,6 +1194,53 @@ bool EvaluateAt(const MFSymbol &s, MFCtx &c, const int i, MFSignal &out)
    return true;
 }
 
+int RecycleThreshold()
+{
+   if(InpRecycleAt == MF_RECYCLE_TP2) return ST_TP2;
+   if(InpRecycleAt == MF_RECYCLE_TP3) return ST_TP3;
+   return ST_TP1;
+}
+
+//+------------------------------------------------------------------+
+//| Directional read for a pair that has no tradable setup right now. |
+//| This is a lean, not a trade: it fills SIGNAL and SCORE so every    |
+//| row says something, while ENTRY/SL/TP stay empty because there is  |
+//| no setup to quote. A direction is never presented as an entry.     |
+//+------------------------------------------------------------------+
+void ComputeScout(MFCtx &c, MFSymbol &s)
+{
+   int i = 1;
+   if(c.n <= i + 2)
+      return;
+
+   int b1 = (g_use1 && c.n1 > 0) ? c.bias1[c.idx1[i]] : 0;
+   int b2 = (g_use2 && c.n2 > 0) ? c.bias2[c.idx2[i]] : 0;
+   int lt = c.bias[i];
+   bool emaUp = (c.emaF[i] > c.emaS[i]);
+
+   int dir;
+   if(b1 != 0 && b1 == b2) dir = b1;          // both bias timeframes agree
+   else if(b2 != 0)        dir = b2;          // nearer bias leads
+   else if(lt != 0)        dir = lt;          // entry timeframe structure
+   else                    dir = (emaUp ? +1 : -1);
+
+   int sc = 0;
+   if(b1 == dir)            sc += 25;
+   if(b2 == dir)            sc += 25;
+   if(lt == dir)            sc += 20;
+   if((dir > 0) == emaUp)   sc += 15;
+
+   double rs = c.rsi[i];
+   if(dir > 0 ? (rs >= 45.0 && rs <= InpRsiMaxBuy)
+              : (rs <= 55.0 && rs >= InpRsiMinSell))
+      sc += 15;
+
+   s.scoutDir   = dir;
+   s.scoutScore = sc;
+   s.scoutB1    = b1;
+   s.scoutB2    = b2;
+}
+
 //+------------------------------------------------------------------+
 //| Replay the bars after the setup and report what really happened.  |
 //| The entry is a limit: price must come back to it first. If the    |
@@ -1304,35 +1417,60 @@ void AnalyseSymbol(MFSymbol &s)
       }
    }
 
-   //--- newest qualifying setup
-   MFSignal sg;
-   for(int i = 1; i <= InpMaxAge; i++)
+   ComputeScout(c, s);
+
+   //--- A pair carries one live setup at a time. While that setup is still
+   //--- running it is held exactly as published - which is also what makes the
+   //--- numbers non-repainting, since a rescan can never recompute them. Once it
+   //--- reaches its recycle target or the stop, the pair is free again and the
+   //--- scan looks for the next one. There is no cap on setups per day.
+   bool held = false;
+   int  done = RecycleThreshold();
+
+   if(prev.valid)
    {
-      if(c.evDir[i] == 0)
-         continue;
-      if(!EvaluateAt(s, c, i, sg))
-         continue;
-      if(sg.score < InpMinScore)
-         continue;
+      int pshift = iBarShift(s.name, g_tf, prev.time, false);
+      if(pshift >= 0 && pshift <= InpMaxAge)
+      {
+         prev.barIndex = pshift;
+         int st = ReplayStatus(c.r, c.n, prev);
+         prev.status = st;
 
-      //--- No repaint, hard rule. Indicators here are seeded from the oldest bar
-      //--- of a window that slides forward on every new bar, so a recomputed ATR
-      //--- can differ in its last decimals - enough to nudge a stop by a tick.
-      //--- Once a setup has been published for a given signal bar, its numbers
-      //--- are locked: a rescan of that same bar reuses the original entry, SL
-      //--- and targets, and only the outcome is allowed to move.
-      MFSignal use = sg;
-      if(prev.valid && prev.time == sg.time && prev.dir == sg.dir)
-         use = prev;
+         bool finished = (st == ST_INVALID || st == ST_SL || st >= done);
+         if(!finished)
+         {
+            s.sig = prev;             // still running - the pair stays occupied
+            held  = true;
+         }
+         else if(!InpHideFinished)
+         {
+            s.sig = prev;             // keep it visible until something replaces it
+         }
+      }
+   }
 
-      use.status = ReplayStatus(c.r, c.n, use);
-      if(use.status == ST_INVALID)     // stopped out before it ever filled
-         continue;
-      if(InpHideFinished && (use.status == ST_SL || use.status == ST_TP3))
-         continue;                     // already over - not something to trade now
+   //--- newest qualifying setup
+   if(!held)
+   {
+      MFSignal sg;
+      for(int i = 1; i <= InpMaxAge; i++)
+      {
+         if(c.evDir[i] == 0)
+            continue;
+         if(!EvaluateAt(s, c, i, sg))
+            continue;
+         if(sg.score < InpMinScore)
+            continue;
 
-      s.sig = use;
-      break;
+         sg.status = ReplayStatus(c.r, c.n, sg);
+         if(sg.status == ST_INVALID)   // stopped out before it ever filled
+            continue;
+         if(sg.status >= done || sg.status == ST_SL)
+            continue;                  // discovered already over - never tradable
+
+         s.sig = sg;
+         break;
+      }
    }
 
    //--- measured hit rate of this exact rule on this symbol
@@ -1362,20 +1500,50 @@ void AnalyseSymbol(MFSymbol &s)
    s.note     = "";
    s.lastBar  = c.r[0].time;
 
-   if(s.sig.valid && s.sig.barIndex <= 2 && s.sig.time != s.lastAlert)
+   //--- optional heads-up when a setup first appears. This is NOT the trade
+   //--- alert: at this moment price is still away from the entry.
+   if(InpAlertOnForming && s.sig.valid && s.sig.barIndex <= 2 &&
+      s.sig.time != s.lastAlert &&
+      s.sig.score >= InpAlertMinScore && s.sig.score <= InpAlertMaxScore)
    {
       s.lastAlert = s.sig.time;
-      string msg = StringFormat("MarketFlow V8 | %s %s | %s %s | %s | score %d | entry %s  SL %s  TP1 %s",
+      string msg = StringFormat("MarketFlow V8 | forming: %s %s %s %s | score %d | waiting for %s",
                                 s.name, g_tfText,
                                 (s.sig.dir > 0 ? "BUY" : "SELL"),
                                 (s.sig.choch ? "CHoCH" : "BOS"),
-                                s.sig.tags, s.sig.score,
-                                DoubleToString(s.sig.entry, s.digits),
-                                DoubleToString(s.sig.sl,    s.digits),
-                                DoubleToString(s.sig.tp1,   s.digits));
+                                s.sig.score,
+                                DoubleToString(s.sig.entry, s.digits));
       if(InpAlertPopup) Alert(msg);
       if(InpAlertPush)  SendNotification(msg);
    }
+}
+
+//--- THE trade alert. Fires the moment the entry becomes fillable at the live
+//--- quote - a buy limit needs the ask down at the entry, a sell limit needs the
+//--- bid up at it - not when the setup was first drawn. When this fires the
+//--- setup is confirmed and the entry is available right now.
+void FireEntryAlert(MFSymbol &s)
+{
+   if(s.sig.score < InpAlertMinScore || s.sig.score > InpAlertMaxScore)
+      return;
+   if(s.alertedEntry == s.sig.time)
+      return;
+   s.alertedEntry = s.sig.time;
+
+   string msg = StringFormat("MarketFlow V8 >> ENTER NOW  %s %s  %s %s  score %d | entry %s  SL %s  TP1 %s  TP2 %s | %s",
+                             s.name, g_tfText,
+                             (s.sig.dir > 0 ? "BUY" : "SELL"),
+                             (s.sig.choch ? "REVERSAL" : "CONTINUATION"),
+                             s.sig.score,
+                             DoubleToString(s.sig.entry, s.digits),
+                             DoubleToString(s.sig.sl,    s.digits),
+                             DoubleToString(s.sig.tp1,   s.digits),
+                             DoubleToString(s.sig.tp2,   s.digits),
+                             s.sig.tags);
+   Print(msg);
+   if(InpAlertPopup) Alert(msg);
+   if(InpAlertPush)  SendNotification(msg);
+   if(InpAlertSound) PlaySound("alert2.wav");
 }
 
 //--- cheap intrabar refresh of the outcome only
@@ -1383,12 +1551,37 @@ void RefreshStatus(MFSymbol &s)
 {
    if(!s.ok || !s.sig.valid)
       return;
-   int need = s.sig.barIndex + 2;
+
+   //--- re-derive the signal bar's shift from its timestamp: it moves every time
+   //--- a new bar prints, and a stale shift would replay the wrong bars
+   int shift = iBarShift(s.name, g_tf, s.sig.time, false);
+   if(shift < 0)
+      return;
+   s.sig.barIndex = shift;
+
+   int need = shift + 2;
    MqlRates r[];
    ArraySetAsSeries(r, true);
    if(CopyRates(s.name, g_tf, 0, need, r) < need)
       return;
-   s.sig.status = ReplayStatus(r, need, s.sig);
+
+   int before = s.sig.status;
+   int st     = ReplayStatus(r, need, s.sig);
+
+   //--- live fillability, checked against the actual quote rather than bar lows
+   if(st == ST_WAIT)
+   {
+      double ask = SymbolInfoDouble(s.name, SYMBOL_ASK);
+      double bid = SymbolInfoDouble(s.name, SYMBOL_BID);
+      if(s.sig.dir > 0 ? (ask > 0.0 && ask <= s.sig.entry)
+                       : (bid > 0.0 && bid >= s.sig.entry))
+         st = ST_ACTIVE;
+   }
+
+   s.sig.status = st;
+
+   if(before == ST_WAIT && st >= ST_ACTIVE)
+      FireEntryAlert(s);
 }
 
 //+------------------------------------------------------------------+
@@ -1432,8 +1625,9 @@ void RunScanBudget()
 //+------------------------------------------------------------------+
 int RankOf(const MFSymbol &s)
 {
+   //--- real setups first, then the directional reads by strength
    if(!s.sig.valid)
-      return 1000000;
+      return 500000 + (100 - s.scoutScore);
    if(InpSortMode == MF_SORT_SCORE)
       return 1000 - s.sig.score;
    return s.sig.barIndex * 1000 + (100 - s.sig.score);
@@ -1471,6 +1665,13 @@ void BuildOrder()
 //+------------------------------------------------------------------+
 //| Cell text                                                        |
 //+------------------------------------------------------------------+
+string DirText(const int dir)
+{
+   if(dir == 0)
+      return "-";
+   return (dir > 0 ? ShortToString(0x25B2) + " BUY" : ShortToString(0x25BC) + " SELL");
+}
+
 string SignalText(const MFSignal &s)
 {
    if(!s.valid)
@@ -1479,15 +1680,21 @@ string SignalText(const MFSignal &s)
    return head + (s.choch ? "" : "+");          // CHoCH reversal plain, BOS continuation "+"
 }
 
+string BiasPair(const int b1, const int b2)
+{
+   string t = "";
+   if(g_use1)           t += g_b1Text + ArrowFor(b1);
+   if(g_use1 && g_use2) t += " ";
+   if(g_use2)           t += g_b2Text + ArrowFor(b2);
+   if(t == "")          t = "-";
+   return t;
+}
+
 string BiasText(const MFSignal &s)
 {
    if(!s.valid)
       return "-";
-   string t = "";
-   if(g_use1) t += StringSubstr(g_b1Text, 0, 1) + ArrowFor(s.biasD1) + " ";
-   if(g_use2) t += StringSubstr(g_b2Text, 0, 1) + ArrowFor(s.biasH4);
-   StringTrimRight(t);
-   return t;
+   return BiasPair(s.biasD1, s.biasH4);
 }
 
 color BiasColor(const MFSignal &s)
@@ -1600,6 +1807,7 @@ void LayoutColumns()
 
 void DrawPanel()
 {
+   g_objWin = g_win;                 // dashboard lives in its own sub-window
    int H = PanelHeight();
    SetRect(g_prefix + "bg", InpPanelX, InpPanelY, g_panelW, H, InpClrPanelBg, InpClrPanelBorder);
 
@@ -1670,16 +1878,21 @@ void DrawPanel()
       if(s.name == _Symbol)
          rowClr = InpClrRowActive;
       SetRect(rowBg, InpPanelX + 4, base - 4, g_panelW - 8, InpRowHeight, rowClr, InpClrPanelBg);
-      bool     sv = s.sig.valid;
-      color    sc = (!sv ? InpClrDim : (s.sig.dir > 0 ? InpClrBuy : InpClrSell));
+      bool     sv    = s.sig.valid;
+      bool     scout = (!sv && s.analysed && s.scoutDir != 0);
+      int      rdir  = (sv ? s.sig.dir : (scout ? s.scoutDir : 0));
+      color    sc    = (rdir == 0 ? InpClrDim : (rdir > 0 ? InpClrBuy : InpClrSell));
 
       string cell[NCOLS];
       cell[C_SYMBOL] = s.name;
       cell[C_TF]     = g_tfText;
-      cell[C_BIAS]   = (s.note != "" ? "" : BiasText(s.sig));
-      cell[C_SIGNAL] = (s.note != "" ? s.note : SignalText(s.sig));
+      cell[C_BIAS]   = (s.note != "" ? "" :
+                        (sv ? BiasText(s.sig) : (scout ? BiasPair(s.scoutB1, s.scoutB2) : "-")));
+      cell[C_SIGNAL] = (s.note != "" ? s.note :
+                        (sv ? SignalText(s.sig) : DirText(s.scoutDir)));
       cell[C_SMC]    = (sv ? s.sig.tags : "-");
-      cell[C_SCORE]  = (sv ? IntegerToString(s.sig.score) : "-");
+      cell[C_SCORE]  = (sv ? IntegerToString(s.sig.score)
+                           : (scout ? IntegerToString(s.scoutScore) : "-"));
       cell[C_WR]     = (s.analysed ? WinRateText(s) : "-");
       cell[C_AGE]    = (s.note != "" ? "" : AgeText(s));
       cell[C_ENTRY]  = PriceText(s, s.sig.entry);
@@ -1687,7 +1900,7 @@ void DrawPanel()
       cell[C_TP1]    = PriceText(s, s.sig.tp1);
       cell[C_TP2]    = PriceText(s, s.sig.tp2);
       cell[C_TP3]    = PriceText(s, s.sig.tp3);
-      cell[C_STATUS] = StatusText(s.sig);
+      cell[C_STATUS] = (sv ? StatusText(s.sig) : (scout ? "WATCH" : "-"));
       cell[C_CHART]  = "";
 
       for(int c = 0; c < NCOLS; c++)
@@ -1701,20 +1914,20 @@ void DrawPanel()
 
          color clr = InpClrText;
          if(c == C_SYMBOL)                    clr = (sv ? InpClrTitle : InpClrDim);
-         if(c == C_BIAS)                      clr = BiasColor(s.sig);
+         if(c == C_BIAS)                      clr = (sv ? BiasColor(s.sig) : InpClrDim);
          if(c == C_SIGNAL)                    clr = (s.note != "" ? InpClrDim : sc);
          if(c == C_SMC)                       clr = (sv ? InpClrHeader : InpClrDim);
          if(c == C_SCORE || c == C_AGE)       clr = sc;
          if(c >= C_ENTRY && c <= C_TP3)       clr = (sv ? sc : InpClrDim);
          if(c == C_SL && sv)                  clr = InpClrSell;
          if(c == C_WR)                        clr = InpClrText;
-         if(c == C_STATUS)                    clr = StatusColor(s.sig);
+         if(c == C_STATUS)                    clr = (sv ? StatusColor(s.sig) : InpClrDim);
 
          SetLabel(cn, InpPanelX + g_colX[c], base, cell[c], clr, InpFontSize);
       }
 
       SetButton(btn, InpPanelX + g_colX[C_CHART], base - 3, 50, InpRowHeight - 3,
-                "OPEN", InpClrRowB, InpClrTitle);
+                "OPEN", InpClrPanelBg, InpClrOpen);
    }
 }
 
@@ -1759,6 +1972,7 @@ void SetTradeText(const string name, const datetime t, const double price,
 
 void DrawChartTrade()
 {
+   g_objWin = 0;                     // trade drawing belongs on the price chart
    if(!InpShowChartTrade || g_tf != (ENUM_TIMEFRAMES)_Period)
    {
       ClearChartTrade();
@@ -1925,6 +2139,7 @@ void DrawChartTrade()
 
 void DrawWatermark()
 {
+   g_objWin = 0;
    string wm = g_prefix + "watermark";
    if(!InpShowWatermark)
    {
@@ -1950,8 +2165,19 @@ void DrawWatermark()
 int OnInit()
 {
    g_tf     = (InpTimeframe == PERIOD_CURRENT ? (ENUM_TIMEFRAMES)_Period : InpTimeframe);
-   g_bias1  = InpBiasTF1;
-   g_bias2  = InpBiasTF2;
+   //--- Setups are always found on the CURRENT chart timeframe. The two bias
+   //--- timeframes ride one and two steps above it, so an M15 chart is confirmed
+   //--- by H1 + H4, and an H4 chart is the H4 setup itself confirmed by D1 + W1.
+   if(InpBiasAuto)
+   {
+      g_bias2 = NextTimeframeUp(g_tf);          // nearer bias
+      g_bias1 = NextTimeframeUp(g_bias2);       // higher bias
+   }
+   else
+   {
+      g_bias1 = InpBiasTF1;
+      g_bias2 = InpBiasTF2;
+   }
    g_tfText = TfToText(g_tf);
    g_b1Text = TfToText(g_bias1);
    g_b2Text = TfToText(g_bias2);
@@ -1985,6 +2211,10 @@ int OnInit()
    }
 
    IndicatorSetString(INDICATOR_SHORTNAME, "MarketFlow V8");
+
+   g_win = ChartWindowFind();
+   if(g_win < 0)
+      g_win = 0;
 
    LayoutColumns();
    ArrayResize(g_syms, 0);
@@ -2034,8 +2264,21 @@ int OnCalculate(const int rates_total,
    return rates_total;
 }
 
+void SyncWindow()
+{
+   int w = ChartWindowFind();
+   if(w >= 0 && w != g_win)
+   {
+      //--- our sub-window moved; objects cannot change window, so rebuild them
+      g_win = w;
+      ObjectsDeleteAll(0, g_prefix);
+   }
+}
+
 void OnTimer()
 {
+   SyncWindow();
+
    if(TimeCurrent() - g_lastUniverse >= 10)
    {
       g_lastUniverse = TimeCurrent();

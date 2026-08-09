@@ -1,29 +1,44 @@
 # MarketFlow V8 — top-down SMC scanner for MT5
 
-`MarketFlowV8.mq5` reads the market the way the setup is meant to be built: **Daily and H4
-bias first**, then it only looks for entry-timeframe setups pointing the same way, and only
-takes them when Smart Money Concepts confluence lines up.
+`MarketFlowV8.mq5` scans **every Market Watch symbol on the timeframe your chart is on**, and
+publishes a setup only when higher-timeframe bias, market structure, SMC confluence and the
+EMA/RSI trend filter all point the same way.
+
+The dashboard lives in its **own indicator sub-window**, so it never sits on top of your
+candles. The trade drawing still goes on the price chart where it belongs.
 
 ## The top-down sequence
 
+Setups are always found on the **current chart timeframe**. The two bias timeframes ride one
+and two steps above it, so the hierarchy moves with you:
+
+| Chart | Nearer bias | Higher bias |
+| --- | --- | --- |
+| M15 | H1 | H4 |
+| H1 | H4 | D1 |
+| H4 | D1 | W1 |
+
+So a bullish H4 pushes the M15 and H1 rows bullish, and when you move to the H4 chart you get
+the H4 setup itself, confirmed by D1 and W1. `InpBiasAuto = false` pins them to fixed
+timeframes instead.
+
 ```
-1. D1  bias    market structure (BOS / CHoCH) on the daily
-2. H4  bias    market structure on H4
+1. bias        market structure (BOS / CHoCH) on both bias timeframes
                -> direction is fixed here. Nothing trades against it.
-3. entry TF    a setup in that direction only:
+2. chart TF    a setup in that direction only:
                  . liquidity sweep    - a prior swing raided, stops taken, close back inside
                  . CHoCH / BOS        - structure actually shifts
                  . displacement       - the break is driven (body >= 1.0 x ATR), not drifted
                  . POI                - order block and/or fair value gap left by that leg
                  . premium / discount - buy in discount, sell in premium of the dealing range
-4. entry       a LIMIT at the POI. The setup WAITS for price to return to the zone.
-5. targets     resting liquidity - prior swing highs / lows - not arbitrary multiples
+                 . EMA + RSI          - momentum must not be fighting the setup
+3. entry       a LIMIT at the POI. The setup WAITS for price to return to the zone.
+4. targets     resting liquidity - prior swing highs / lows - not arbitrary multiples
+5. alert       fires when price actually reaches the entry, not when the setup was drawn
 ```
 
-Step 4 is the part that "takes advantage of the market" rather than chasing it: the entry sits
-at the order block / FVG and the dashboard shows `WAITING` until price comes back to it.
-If the stop is taken out before price ever reaches the entry, the row reads `INVALID` — the
-setup died without a trade, and it is excluded from the hit rate rather than booked as a loss.
+`InpBiasMode` defaults to **Both** — both bias timeframes must agree. That is the strictest
+setting and the reason a board can hold more `WATCH` rows than live setups.
 
 ## Market structure
 
@@ -128,7 +143,7 @@ appear as a live entry.
 | `STATUS` | every second for every signalled symbol, and **every tick** for the charted symbol |
 | Chart drawing | every tick |
 
-**No repainting.** Four separate mechanisms, because one is not enough:
+**No repainting.** Five separate mechanisms, because one is not enough:
 
 1. **Closed bars only.** Signals are only ever evaluated on bar 1 and older. The forming bar
    never produces a signal.
@@ -140,13 +155,55 @@ appear as a live entry.
    still carries a trace of that seed — so bias is only published after the first real break,
    and signals only from the second. A seed-dependent signal is a signal that can change under
    you.
-4. **Frozen levels.** ATR/EMA/RSI are seeded from the oldest bar in the window, so a recomputed
+4. **Held setups.** A live setup is held exactly as published until it finishes, so a rescan
+   is never even given the chance to replace it with a recomputed version.
+5. **Frozen levels.** ATR/EMA/RSI are seeded from the oldest bar in the window, so a recomputed
    value can differ in its last decimals — enough to nudge a stop by a tick. Once a setup is
    published for a given signal bar, its entry, SL and targets are **locked**. A rescan of that
    same bar reuses the original numbers; only the outcome is allowed to move.
 
 What *does* change, by design, and is not repainting: a setup leaves the board when it ages
 past `InpMaxAge`, when it is invalidated before filling, or when it finishes at SL/TP3.
+
+## Alerts — fired at the fill, not at the drawing
+
+This is the part that decides whether an alert is useful or noise.
+
+A setup is drawn when structure shifts, but the entry is a limit sitting back at the POI —
+price has not reached it yet. Alerting there gives you a heads-up for a trade you cannot take,
+and by the time price arrives the alert is old news.
+
+So the alert fires on the **fill condition, checked against the live quote**:
+
+- a buy needs the **ask** down at the entry
+- a sell needs the **bid** up at the entry
+
+When it fires, the entry is available at that moment and the setup is still valid. That is the
+"ready to serve" alert: `MarketFlow V8 >> ENTER NOW  Boom 1000 Index M15  BUY CONTINUATION
+score 85 | entry ... SL ... TP1 ... TP2 ... | H4 H1 EMA RSI SW CH OB FVG DISC`.
+
+| Input | Default | |
+| --- | --- | --- |
+| `InpAlertMinScore` | 75 | Only setups scoring at least this alert |
+| `InpAlertMaxScore` | 100 | Upper bound — set 95 to skip perfect-score outliers |
+| `InpAlertPopup` / `InpAlertPush` / `InpAlertSound` | on / off / on | Where the alert goes |
+| `InpAlertOnForming` | false | Optional quiet heads-up when the setup first appears |
+
+One entry alert per setup. Checked every second for every symbol, every tick for the charted
+one.
+
+## One setup at a time per pair, no daily cap
+
+A pair holds one live setup. While it is running the pair produces nothing new — and holding it
+untouched is also what makes the numbers non-repainting, since a rescan cannot recompute a
+setup it is not allowed to replace.
+
+Once that setup reaches its recycle target or the stop, the pair is free and the next setup can
+appear immediately. There is no limit of one per day: a pair can produce several in a session
+whenever conditions genuinely line up.
+
+`InpRecycleAt` sets when the pair is freed — `TP1` (default), `TP2` or `TP3`. The stop always
+frees it, and so does invalidation before fill.
 
 ## Why the numbers are real
 
@@ -168,6 +225,11 @@ with its sample size, and treat a thin sample as no information.
 
 ## Dashboard
 
+The dashboard is drawn in its **own indicator sub-window** (`#property indicator_separate_window`),
+so it never overlaps the candles. If you add or remove other indicators the sub-window index
+shifts; the panel detects that and rebuilds itself. Set its height with
+`#property indicator_height` (200 by default) or drag the divider.
+
 The default view is the reference layout, exactly ten columns:
 
 `SYMBOL · TF · SIGNAL · AGE · ENTRY · SL · TP1 · TP2 · TP3 · CHART`
@@ -177,7 +239,16 @@ page counter on the right. `SIGNAL` shows `▲ BUY+` / `▼ SELL+` for a BOS con
 `▲ BUY` / `▼ SELL` for a CHoCH reversal. `AGE` reads `current`, `1 bars ago`, … The row of the
 symbol currently on the chart is highlighted. `OPEN` switches the chart to that row's symbol.
 
-Rows sort signals-first, so page 1 is the actionable page even with 250 symbols loaded.
+Rows sort live setups first, then the `WATCH` rows by strength, so page 1 is always the
+actionable page even with 250 symbols loaded.
+
+**Every pair always shows a direction.** A pair with no tradable setup right now still shows
+`▲ BUY` or `▼ SELL` with a score — that is the current directional read from the two bias
+timeframes, the chart-timeframe structure, EMA and RSI. Its `STATUS` says `WATCH` and its
+ENTRY/SL/TP stay blank, because there is no setup to quote yet. A lean is never dressed up as
+an entry: if the price columns are empty, there is nothing to place.
+
+When a real setup qualifies, the row fills in completely and becomes alert-eligible.
 
 **One deliberate deviation:** while symbols are still warming up the title appends
 `| scanning 84/132`. It disappears once every symbol has been analysed, so the steady-state
@@ -192,7 +263,7 @@ The analysis columns are switched **off** by default and can be turned on indivi
 | `InpShowSmc` | `SMC` — which confluences fired, e.g. `D1 H4 SW CH OB FVG DISC` |
 | `InpShowScore` | `SCORE` — the confluence total |
 | `InpShowWinRate` | `WR` — measured hit rate and sample size |
-| `InpShowStatus` | `STATUS` — `WAITING / ACTIVE / TP1 HIT / SL HIT / INVALID` |
+| `InpShowStatus` | `STATUS` — `WATCH / WAITING / ACTIVE / TP1 HIT / SL HIT / INVALID` |
 
 ### Chart
 
@@ -240,6 +311,10 @@ Two opt-in extras:
 | `InpMaxRiskAtr` / `InpMaxZoneAtr` | 4.0 / 2.5 | Quality rejections |
 | `InpAgeMode` | Bars | `Clock` shows elapsed time instead of bar count |
 | `InpSymbolsPerTick` | 10 | Scan throughput |
+| `InpBiasAuto` | true | Bias follows the chart (1 and 2 steps up) |
+| `InpBiasMode` | Both | Both bias timeframes must agree |
+| `InpRecycleAt` | TP1 | When a pair may produce its next setup |
+| `InpAlertMinScore` | 75 | Alert threshold |
 | `InpRequireSweep` | false | Set true to demand a liquidity sweep on every setup |
 | `InpRequireDisp` | true | Reject breaks without displacement |
 | `InpRequirePD` | false | Set true to refuse entries on the wrong side of equilibrium |
