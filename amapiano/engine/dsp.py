@@ -1,8 +1,7 @@
-"""Small DSP toolkit for the Umoya render.
+"""Small DSP toolkit for the Isibani render.
 
-Everything is vectorised numpy -- no per-sample python loops -- so a full
-3-minute arrangement renders in a few seconds. Filtering is done in the
-frequency domain (or baked into per-harmonic amplitudes for the additive
+Everything is vectorised numpy -- no per-sample python loops. Filtering is done
+in the frequency domain (or baked into per-harmonic amplitudes for the additive
 voices), which keeps the whole thing dependency-free apart from numpy.
 """
 
@@ -219,6 +218,31 @@ def _next_pow2(x):
     return 1 << (int(x) - 1).bit_length()
 
 
+def next_fast_len(n):
+    """Smallest 5-smooth integer >= n.
+
+    numpy's FFT is only fast for lengths whose prime factors are small. A
+    full-length bus at this tempo lands on 2**2 * 7 * 573007, and that large
+    prime factor sends every filter down a Bluestein fallback path that is
+    orders of magnitude slower -- so pad the transform up to a smooth size.
+    """
+    n = int(n)
+    if n <= 16:
+        return 16
+    best = 1 << (n - 1).bit_length()
+    p5 = 1
+    while p5 < best:
+        p35 = p5
+        while p35 < best:
+            m = p35
+            while m < n:
+                m *= 2
+            best = min(best, m)
+            p35 *= 3
+        p5 *= 5
+    return best
+
+
 def fft_convolve(x, h):
     """Overlap-add convolution of mono `x` with mono `h`."""
     n, m = len(x), len(h)
@@ -309,31 +333,34 @@ def stereo(mono, pan=0.0, width=0.0, seed=0):
 def highpass(x, cutoff, order=2.0):
     """Frequency-domain highpass for whole buses (keeps the low end tidy)."""
     n = len(x)
-    X = np.fft.rfft(x)
-    f = np.fft.rfftfreq(n, 1.0 / SR)
+    L = next_fast_len(n)
+    X = np.fft.rfft(x, L)
+    f = np.fft.rfftfreq(L, 1.0 / SR)
     resp = (f / cutoff) ** order / np.sqrt(1.0 + (f / cutoff) ** (2 * order))
-    return np.fft.irfft(X * resp, n)
+    return np.fft.irfft(X * resp, L)[:n]
 
 
 def shelf(x, freq, gain_db, kind='high', order=1.0):
     """Frequency-domain shelving EQ for master/bus tone shaping."""
     n = len(x)
-    X = np.fft.rfft(x)
-    f = np.fft.rfftfreq(n, 1.0 / SR)
+    L = next_fast_len(n)
+    X = np.fft.rfft(x, L)
+    f = np.fft.rfftfreq(L, 1.0 / SR)
     g = db(gain_db)
     ratio = (np.maximum(f, 1e-6) / freq) ** order
     frac = ratio / (1.0 + ratio) if kind == 'high' else 1.0 / (1.0 + ratio)
-    return np.fft.irfft(X * (1.0 + (g - 1.0) * frac), n)
+    return np.fft.irfft(X * (1.0 + (g - 1.0) * frac), L)[:n]
 
 
 def peaking(x, freq, gain_db, q=1.0):
     """Frequency-domain bell EQ -- used to unclutter the low mids."""
     n = len(x)
-    X = np.fft.rfft(x)
-    f = np.fft.rfftfreq(n, 1.0 / SR)
+    L = next_fast_len(n)
+    X = np.fft.rfft(x, L)
+    f = np.fft.rfftfreq(L, 1.0 / SR)
     bw = max(freq / max(q, 1e-3), 1e-6)
     bell = 1.0 / (1.0 + ((f - freq) / (bw / 2.0)) ** 2)
-    return np.fft.irfft(X * (1.0 + (db(gain_db) - 1.0) * bell), n)
+    return np.fft.irfft(X * (1.0 + (db(gain_db) - 1.0) * bell), L)[:n]
 
 
 def write_wav(path, audio, sr=SR, peak=0.97):

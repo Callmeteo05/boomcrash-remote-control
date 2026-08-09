@@ -1,131 +1,176 @@
-# Umoya — spiritual / soulful amapiano
+# Isibani — spiritual / soulful amapiano
 
-An original instrumental in the soulful-amapiano lane (the spiritual, gospel-tinged
-side of the genre rather than the hard private-school or sgija side). It is written
-from scratch — no samples, no reference audio, no borrowed material. Everything is
-synthesised in Python.
+An original instrumental in the soulful-amapiano lane — the spiritual,
+gospel-tinged side of the genre. Written from scratch: no samples, no reference
+audio, no borrowed material. Everything is synthesised in Python.
 
 | | |
 |---|---|
-| **Key** | F# minor |
-| **Tempo** | 112 BPM, 4/4 |
-| **Length** | 88 bars ≈ 3:15 |
-| **Feel** | 16ths with a 13% shuffle |
+| **Key** | A major (Mixolydian-inflected gospel walk) |
+| **Tempo** | 113 BPM, 4/4 |
+| **Length** | 168 bars ≈ 6:00 |
+| **Feel** | 16ths with a 16% shuffle |
 
 ```
-python3 song.py     # renders out/umoya.wav, out/stems/*.wav, out/midi/*.mid
+python3 song.py     # renders out/isibani.{wav,mp3}, out/stems/, out/midi/
 ```
 
-Only dependency is numpy. Audio is written as 16-bit WAV through the stdlib, so
-there is no encoder to install. If `lameenc` is present it also writes an MP3;
-if not, that step is skipped.
+Only dependency is numpy. Audio is written as 16-bit WAV through the stdlib; if
+`lameenc` is present it also writes an MP3.
 
 ---
 
+## What this version fixed
+
+The first draft of this track was, correctly, called out as deep house with a
+log drum bolted on. Researching how these records are actually built turned up
+six concrete faults, and each one is a real structural difference between the
+genres rather than a matter of taste:
+
+| Fault | Deep house behaviour (v1) | Amapiano behaviour (now) |
+|---|---|---|
+| **Log drum placement** | Hits on step 0, on top of the kick | Never lands on a kick — bounces through the gaps |
+| **Who carries the bass** | Separate sustained bassline | The log drum *is* the bassline; sub only reinforces |
+| **Harmony** | Minor i–VI–iv–ii–V | I–IV–♭VII gospel walk (Mixolydian) |
+| **Hats** | Closed hats on the offbeats | Open hats on the offbeats, over 16th shakers |
+| **Percussion** | Shaker and rim only | Congas, quinto, bell, tambourine, rim — live feel |
+| **Length / shape** | 3:15, intro→build→drop→breakdown | 6:00, elements entering one at a time |
+
+The single biggest one is the log drum. In deep house the kick drives the
+record; in amapiano the log drum drives it and the kick just holds the pulse
+underneath. Getting that hierarchy backwards is what made v1 sound like house.
+
 ## The harmony
 
-The bed is a gospel-leaning turnaround — **i – VI – iv – (ii – V)**:
+The gospel walk — **I – IV – ♭VII – I** — is the harmonic signature of the
+style:
 
 ```
-| F#m9 | Dmaj9 | Bm11 | C#m7  E9 |
+| Amaj9 | Dmaj9 | Gmaj9 | Amaj9  E9 |
 ```
 
-The 9ths and 11ths are the whole point. A plain F#m–D–Bm–C#m loop reads as a sad
-minor-key progression; adding the 9th to the tonic and the 11th to the iv opens
-the voicings up and gives the prayerful, suspended quality the style lives on.
-Nothing ever fully resolves to a bare triad.
+That **G major in the key of A** is the whole trick. It is the flat seventh,
+borrowed from Mixolydian, and it is what makes a progression read as South
+African gospel instead of as house or neo-soul. A minor-key loop — which is
+what v1 used — cannot produce that feeling no matter how it is voiced.
+Extending everything to maj9 is the "amapiano jazz" colour this lane works in.
 
-The bridge lifts to the major side and comes home through an altered dominant:
+The bridge drops to the relative minor for the emotional lift, then walks home
+through the V:
 
 ```
-| Dmaj9 | C#m7 | Bm11 | C#7#5  E9 |
+| F#m9 | Dmaj9 | Bm9 | E9  Amaj9 |
 ```
-
-That `C#7#5` is the one moment of real tension in the record — a borrowed
-dominant pulling back to F#m. It is deliberately short (half a bar).
 
 ## The groove
 
-**Log drum** is the signature and the hardest part to get right. Three things
-matter:
+**The log drum is doing three jobs at once** — sub-bass, rhythm and melody —
+and each one shaped the synthesis:
 
-1. *It is pitched and it moves.* A log drum hammering one note is the giveaway of
-   a fake amapiano beat. Each chord in `CHORDS` carries an explicit three-note
-   set — root, lower alt, upper alt — chosen per chord so the drum never lands on
-   a note that fights the voicing. (Using a blanket "b7 below the root" offset
-   instead would sound a C natural against the Dmaj9's C# — the kind of thing
-   that makes a track feel subtly wrong without being obviously out of tune.)
-2. *The pitch envelope.* A fast bend from ~3.2× down to the target over ~28 ms is
-   what makes it read as a struck log rather than a bass note, plus saturation
-   for the woody edge.
-3. *It never sits on the grid.* The two alternating patterns place hits on the
-   `&` and `a` of beats, leaving beat 1 exposed and beat 3 mostly open.
+1. *It is the bassline.* That is why it gets a long tail and why the sub is
+   reduced to sparse reinforcement under the biggest sections. Two competing
+   low-end parts is a house arrangement.
+2. *It never lands on a kick.* The kick holds 0/4/8/12; the log drum plays
+   2/6/9/11/14 and variants. Three alternating patterns rotate so the groove
+   never locks into a one-bar loop.
+3. *It moves melodically.* Each chord carries an explicit three-note set —
+   root plus two consonant alternates — so the drum walks A–D–G with the
+   harmony instead of hammering one note.
 
-**Everything else** stays out of its way: four-to-the-floor kick, rim/clap on 2
-and 4, continuous shaker 16ths with the accents on the offbeats, and offbeat
-closed hats. Shakers do the work that trap hats would do in another genre.
+**Around it**: soft four-on-the-floor kick, continuous 16th shakers accented on
+the offbeats, **open** hats on those same offbeats, congas in three tunings
+(tumba/conga/quinto) playing a clave-ish figure, rimshot on 2 and 4, plus bell
+and tambourine for the metallic texture layer. That percussion stack is what
+gives the genre its live, hand-played feel.
 
 ## The arrangement
 
-| Bars | Section | What happens |
-|---|---|---|
-| 0–8 | intro | Pad, choir, sparse keys, shaker only |
-| 8–16 | build | Kick, bass and rim enter — still no log drum |
-| 16–32 | groove A | Log drum drops, full groove |
-| 32–40 | break | Drums out, kalimba motif enters over the choir |
-| 40–56 | groove B | Full, with the kalimba carried over |
-| 56–64 | bridge | Bridge progression, drums out, choir leads |
-| 64–80 | groove C | Biggest section, bridge harmony under the full groove |
-| 80–88 | outro | Groove holds four bars, then falls away to pad and choir |
+Records in this lane run five to seven minutes and introduce elements one at a
+time. There is no EDM-style drop — the track accumulates.
 
-Withholding the log drum until bar 16 is the single most important arrangement
-decision. The genre's payoff is the drop into that pattern, and it only works if
-the listener has spent time without it.
+| Bar | Time | Section | What happens |
+|---|---|---|---|
+| 0 | 0:00 | intro_perc | Percussion and pads only |
+| 16 | 0:34 | intro_keys | Piano and choir enter |
+| 32 | 1:08 | log_enters | **Kick and log drum arrive** |
+| 48 | 1:42 | groove_1 | Sax melody, sub reinforcement |
+| 64 | 2:16 | break_1 | Drums out, kalimba over the choir |
+| 72 | 2:33 | groove_2 | Full groove, 24 bars |
+| 96 | 3:24 | bridge | Relative-minor progression, drums out |
+| 112 | 3:58 | groove_3 | Biggest section, bridge harmony under full groove |
+| 136 | 4:49 | break_2 | Stripped to piano and choir |
+| 144 | 5:06 | outro | Groove returns, then peels apart bar by bar |
 
-## Sound design
+Holding the log drum back until **1:08** is the most important decision here.
+The genre's payoff is that entrance, and it only works if the listener has
+spent real time without it.
+
+## Instruments
+
+Everything is synthesised, but each voice is modelled on the real instrument
+these records use:
 
 | Voice | Method |
 |---|---|
-| Log drum | Pitch-bent sine + 2nd harmonic, saturated, noise transient |
-| Kick | Sine with 95 Hz → 52 Hz drop, short noise click |
-| Bass | Additive sub, saturated so it survives phone speakers |
-| Keys | 2-operator FM Rhodes, slight roll across the voicing so it plays like hands |
-| Pad | Three detuned saw stacks, lowpassed at 2 kHz, slow bloom |
-| Choir | Formant-shaped harmonics on an /a/ vowel, with vibrato and breath noise |
-| Kalimba | FM at a 3.01 ratio, F# minor pentatonic |
-| Shaker / hats | Spectrally shaped noise bursts |
+| Log drum | Pitch-bent sine + 2nd/3rd harmonics, saturated, long tail |
+| Kick | Sine, 128 Hz → 48 Hz drop; soft but bold |
+| Acoustic piano | Inharmonic partials (stiff-string model), per-partial decay, hammer noise |
+| Saxophone | Formant-weighted reed harmonics, breath noise, vibrato that opens as the note holds |
+| Choir | Formant-synthesised /a/ vowel, three detuned voices, breath |
+| Strings | Four detuned saw stacks with slow bloom and vibrato |
+| Congas | Pitched membrane with fast bend + skin slap, three tunings |
+| Kalimba | FM at a 3.01 ratio, A major pentatonic |
+| Bell / tambourine | Inharmonic partial stack / offset metallic noise bursts |
 
-The choir is the spiritual centre. It enters in the intro like a hymn and holds
-*through* the drops rather than hooking on top of them — it behaves like a bed,
-not a lead. If you drop a vocal on this record, that is the layer to duck.
+The **piano is the melodic centre** and the **choir is the spiritual one** — it
+enters early and holds *through* the grooves rather than hooking on top of
+them. If you add a vocal, that is the layer to duck.
 
 ## Mix
 
-- Kick, bass and log drum are the low end; bass and pads duck under every kick
-  (55% and 30% depth respectively) so the sub stays readable.
-- Keys and choir go through stereo delay into a synthetic plate; drums stay
-  mostly dry with a short room.
-- Master chain: high shelf at 1.3 kHz, a bell cut at 700 Hz to keep the low mids
-  from boxing up, a bell cut at 115 Hz where the kick and log drum pile up, a low
-  shelf for weight, then glue saturation and a soft-clip limit.
-- Lands at −0.7 dBFS peak, ≈ −13.6 dBFS RMS, with roughly 6 dB between the quiet
-  sections and the drops.
+- Log drum and kick own the low end; the sub and pads duck under every kick.
+- Piano, sax, choir and kalimba go through stereo delay into a synthetic plate;
+  the log drum stays nearly dry so it keeps working as a bassline.
+- Master: high shelf at 1.3 kHz, bell cut at 700 Hz (low-mid boxiness), bell
+  cut at 115 Hz (where kick and log drum pile up), low shelf for weight, glue
+  saturation, soft-clip limit.
 
 ## Files
 
-- `out/umoya.mp3` — full mix (committed)
-- `out/umoya.wav` — full mix, 16-bit/44.1k
-- `out/stems/*.wav` — ten stems at matched levels, ready to import
-- `out/midi/umoya_full.mid` — all parts as separate tracks
-- `out/midi/umoya_<part>.mid` — keys, bass, log, choir, pad, kalimba individually
+- `out/isibani.mp3` — full mix (committed)
+- `out/isibani.wav` — 16-bit/44.1k
+- `out/stems/*.wav` — 15 stems at mix levels
+- `out/midi/isibani_full.mid` — all parts as separate tracks
+- `out/midi/isibani_<part>.mid` — piano, sax, log, choir, pad, strings, kalimba, sub
 
-The WAV and stems are gitignored (large and regenerable); the MP3 and MIDI are
-committed.
+WAV and stems are gitignored (large, regenerable); MP3 and MIDI are committed.
+
+## A note on the render
+
+Every frequency-domain filter runs a full-length FFT, and numpy is drastically
+slower on lengths with large prime factors. At this tempo the natural buffer
+length factors as `2² × 7 × 573007`, which sent every filter down a Bluestein
+fallback path — the first render of this arrangement took over eleven minutes
+and had not finished the master chain. Rounding the buffer up to the nearest
+5-smooth length fixed it.
 
 ## Where to take it
 
-The obvious next move is a vocal — the style is built around one, and the
-arrangement leaves the bridge and the break open for it. The MIDI export is there
-so the harmony can move into a DAW with real instruments: a sampled Rhodes and a
-proper log drum sample will beat these synthesised voices, while the chords,
-groove and arrangement carry over unchanged.
+A vocal is the obvious next move — the style is built around one, and the
+bridge and both breaks are left open for it. The MIDI export is there so the
+harmony can move into a DAW: a sampled grand, a real log drum one-shot and live
+percussion will beat these synthesised voices, while the chords, groove and
+arrangement carry over unchanged.
+
+## Sources
+
+Research that informed the rebuild:
+
+- [How to Make Amapiano Music — BeatKey](https://beatkey.app/how-to-make-amapiano-music)
+- [Beatmakers Guide: How to make an Amapiano Beat — RouteNote](http://create.routenote.com/blog/beatmakers-guide-how-to-make-an-amapiano-beat/)
+- [Production Hacks: Creating Amapiano Tracks — Roland](https://articles.roland.com/production-hacks-creating-amapiano-tracks/)
+- [What Is Amapiano? The Sound, Origins, and Production — Orphiq](https://orphiq.com/resources/what-is-amapiano)
+- [Amapiano Production: How the Log Drum Sound is Created](https://www.inspiredbybeatz.com/en/amapiano-production-how-the-log-drum-sound-is-created/)
+- [Kabza De Small — KOA II Part 1 (The Native)](https://thenativemag.com/kabza-de-small-koa-ii-part-1-essentials/)
+- [Kabza De Small: The King of Amapiano and South Africa's Soul](https://blackpimpernel.com/kabza-de-small-king-of-amapiano/)
+- [BPM/key for "Imithandazo" — Tunebat](https://tunebat.com/Info/Imithandazo-feat-Young-Stunna-DJ-Maphorisa-Sizwe-Alakine-Umthakathi-Kush-Kabza-De-Small-Mthunzi-DJ-Maphorisa-Young-Stunna-Sizwe-Alakine-Umthakathi-Kush/6Kijtp0DB6VwcoJIw7PJ9W)
