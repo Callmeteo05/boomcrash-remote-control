@@ -53,6 +53,9 @@ These are properties of the code, not a claim on a banner:
   bar cannot duplicate swings, gaps or signals.
 - The journal records **live signals only**. History rows are deliberately excluded, so
   the CSV can be diffed against a recalculated chart as an actual non-repaint audit.
+- With the default dot anchor, the marker is drawn at a past bar — but it is written
+  once, after that bar closed, and never moved. See *Where the dots are placed*: the dot
+  is a confirmed turn, the entry line is the tradeable price.
 
 The honest cost: signals arrive with a structural confirmation lag. That lag is what
 buys the non-repainting. Any tool without it is choosing to lie to you instead.
@@ -154,6 +157,7 @@ Read the blocker, then loosen that one input rather than everything at once:
 | Biggest blocker | Loosen this |
 |---|---|
 | `no sweep` | raise `Sweep scan depth` (3 → 5) or `Reclaim bars` (2 → 3), or lower the preset's swing lookback |
+| `against the EMA trend` | switch the EMA filter to score-only, or shorten the periods |
 | `displacement too weak` | lower `Displacement ATR` (1.5 → 1.2) |
 | `no FVG in the impulse` | lower `Min FVG ATR` (0.15 → 0.08) or raise `MSS grace bars` |
 | `draw too close (Min RR)` | lower `Min RR` (2.0 → 1.5) |
@@ -178,7 +182,7 @@ Read the blocker, then loosen that one input rather than everything at once:
 Advanced ICT sets *where* — the sweep, the shift, the gap, the premium/discount side.
 The EMA sets *whether the tide is with you*.
 
-- Fast/slow EMA (default **50/200**) computed inline from the chart's own bars — one
+- Fast/slow EMA (default **21/50**) computed inline from the chart's own bars — one
   multiply per bar, no indicator handle to fall out of sync, so it stays fast on any
   timeframe.
 - Trend is called only when the stack agrees **and** price sits on the same side of the
@@ -191,11 +195,28 @@ The EMA sets *whether the tide is with you*.
 Turn the hard filter off if you want counter-trend reversals at range extremes; leave it
 on for trend continuation only.
 
-## Where the dots are placed
+## Where the dots are placed — read this once
 
-A dot marks the bar whose **close filled the entry** — the moment the setup became
-tradeable. Buy dots print below the bar, sell dots above, with `BUY` / `SELL` in the
-signal colour and the grade beside it.
+By default (`Dot anchor = At the swing extreme`) the dot is drawn **back at the bar that
+made the turn** — the low of the leg for a buy, the high for a sell. That is what a
+classic signal chart shows, and it is why those charts look flawless.
+
+Understand exactly what it means, because it is the one thing worth being precise about:
+
+- The dot is written **once and never moved**. Nothing repaints.
+- But it *appears* several bars after that candle closed, because a swing low is not
+  knowable at the swing low — you only know it was the low once enough bars have passed
+  without a lower one.
+- So the dot marks a **confirmed turn**, not a price you could have bought at in real
+  time. The price you could actually have taken is the **entry line**, and the alert
+  fires at that moment, not at the dot.
+
+Set `Dot anchor = At the bar whose close filled the entry` if you want the dot to sit
+strictly where the trade was takeable. The chart looks less perfect and is a truer
+picture of live execution.
+
+Either way the alerts, the journal and the statistics are driven by the entry, never by
+the dot — so nothing downstream inherits the flattering view.
 
 The location logic is the ICT stack, not decoration:
 
@@ -216,6 +237,7 @@ of the pattern merely existing.
 | Component | Max | Earned by |
 |---|---|---|
 | Structure alignment | 25 | major trend agrees (18), both tiers agree (+7) |
+| EMA trend | 15 | 21/50 stack aligned, scaling with separation in ATR |
 | Premium / discount | 15 | scales with how deep into the correct half the entry sits |
 | Displacement | 20 | saturates at twice the required strength |
 | Gap quality | 12 | scales with FVG size in ATR |

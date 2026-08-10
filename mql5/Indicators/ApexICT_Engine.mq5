@@ -52,6 +52,12 @@ enum ENUM_ENTRY_MODE
    ENTRY_FVG_FAR      // Far edge of the FVG (best price, fills least)
   };
 
+enum ENUM_DOT_ANCHOR
+  {
+   DOT_SWING_EXTREME, // At the swing extreme the setup turned from
+   DOT_ENTRY_BAR      // At the bar whose close filled the entry
+  };
+
 enum ENUM_MARKER
   {
    MARK_DOT,          // Dot  (as in a classic signal system)
@@ -127,8 +133,8 @@ input ENUM_ENTRY_MODE  InpEntryMode         = ENTRY_FVG_CE;    // Where in the F
 
 input group "=== EMA trend filter ==="
 input bool             InpUseEMA            = true;            // Use the EMA trend filter
-input int              InpEmaFast           = 50;              // Fast EMA period
-input int              InpEmaSlow           = 200;             // Slow EMA period
+input int              InpEmaFast           = 21;              // Fast EMA period
+input int              InpEmaSlow           = 50;              // Slow EMA period
 input bool             InpEmaHardFilter     = true;            // Block signals against the EMA trend
 input int              InpEmaScore          = 15;              // Grade points for EMA alignment
 
@@ -185,6 +191,7 @@ input bool             InpShowDiagnostics   = true;            // Show which fil
 
 input group "=== Visuals ==="
 input ENUM_MARKER      InpMarker            = MARK_DOT;        // Signal marker style
+input ENUM_DOT_ANCHOR  InpDotAnchor         = DOT_SWING_EXTREME; // Where the dot is drawn
 input bool             InpLabelShowGrade    = true;            // Put the grade next to BUY / SELL
 input bool             InpShowZones         = false;           // Shade the risk and reward zones
 input bool             InpShowEntryTag      = true;            // "BUY 0.05 at 1.23456" tag on the entry line
@@ -240,6 +247,7 @@ struct SweepEvent
    datetime time;
    double   level;          // the level that was taken
    double   extreme;        // the wick extreme of the sweep - the stop reference
+   int      extremeBar;     // the bar that actually made that extreme
    int      dir;            // +1 sell-side swept (bullish bias), -1 buy-side swept
    int      age;            // how long the swept level had been resting, in bars
   };
@@ -255,6 +263,7 @@ struct Setup
    double   tp3;
    int      mssBar;
    int      expiryBar;
+   int      dotBar;         // bar the marker is drawn on
    double   sweepExtreme;
    int      grade;
    string   gradeText;
@@ -638,7 +647,7 @@ void ApplyPreset()
 void ClearSweep(SweepEvent &s)
   {
    s.valid = false; s.bar = -1; s.time = 0;
-   s.level = 0.0;   s.extreme = 0.0; s.dir = 0; s.age = 0;
+   s.level = 0.0;   s.extreme = 0.0; s.extremeBar = -1; s.dir = 0; s.age = 0;
   }
 
 void ResetState()
@@ -863,17 +872,22 @@ void ScanSweepSide(const int i, const bool wantHigh, const datetime &time[],
          if(close[i] <= lvl) continue;
 
          double deepest = 0.0;
+         int    deepBar = -1;
          bool   pierced = false;
          for(int b = i; b >= i - InpSweepReclaimBars && b > g_major[k].bar; b--)
             if(low[b] < lvl)
-              { pierced = true; if(deepest == 0.0 || low[b] < deepest) deepest = low[b]; }
+              {
+               pierced = true;
+               if(deepest == 0.0 || low[b] < deepest) { deepest = low[b]; deepBar = b; }
+              }
          if(!pierced) continue;
 
          g_sweepBull.valid   = true;
          g_sweepBull.bar     = i;
          g_sweepBull.time    = time[i];
          g_sweepBull.level   = lvl;
-         g_sweepBull.extreme = deepest;
+         g_sweepBull.extreme    = deepest;
+         g_sweepBull.extremeBar = deepBar;
          g_sweepBull.dir     = 1;
          g_sweepBull.age     = i - g_major[k].bar;
          return;
@@ -883,17 +897,22 @@ void ScanSweepSide(const int i, const bool wantHigh, const datetime &time[],
          if(close[i] >= lvl) continue;
 
          double highest = 0.0;
+         int    highBar = -1;
          bool   pierced = false;
          for(int b = i; b >= i - InpSweepReclaimBars && b > g_major[k].bar; b--)
             if(high[b] > lvl)
-              { pierced = true; if(high[b] > highest) highest = high[b]; }
+              {
+               pierced = true;
+               if(high[b] > highest) { highest = high[b]; highBar = b; }
+              }
          if(!pierced) continue;
 
          g_sweepBear.valid   = true;
          g_sweepBear.bar     = i;
          g_sweepBear.time    = time[i];
          g_sweepBear.level   = lvl;
-         g_sweepBear.extreme = highest;
+         g_sweepBear.extreme    = highest;
+         g_sweepBear.extremeBar = highBar;
          g_sweepBear.dir     = -1;
          g_sweepBear.age     = i - g_major[k].bar;
          return;
@@ -1245,14 +1264,15 @@ void DrawBox(const string name, const datetime t1, const double p1,
 void DrawSignalLevels(const int idx, const int dir, const datetime t1, const datetime t2,
                       const double entry, const double sl,
                       const double tp1, const double tp2, const double tp3,
-                      const string gradeTxt, const double arrowPrice, const double lots)
+                      const string gradeTxt, const double arrowPrice, const double lots,
+                      const datetime tDot)
   {
    color dirColor = (dir > 0) ? InpBuyColor : InpSellColor;
 
-   //--- the BUY / SELL word at the arrow, as in a classic arrow system
+   //--- the BUY / SELL word sits with the dot, as in a classic signal chart
    string word = (dir > 0) ? "BUY" : "SELL";
    if(InpLabelShowGrade) word += " " + gradeTxt;
-   DrawText(ObjName("SIG", idx), t1, arrowPrice, word, dirColor, 10);
+   DrawText(ObjName("SIG", idx), tDot, arrowPrice, word, dirColor, 10);
 
    if(!InpShowLevels) return;
 
@@ -1632,6 +1652,7 @@ bool TryArmFromMSS(const int dir, const int i, const double &close[])
    g_pending[slot].tp3          = tp3;
    g_pending[slot].mssBar       = i;
    g_pending[slot].expiryBar    = i + InpMSSValidBars;
+   g_pending[slot].dotBar       = (sw.extremeBar >= 0) ? sw.extremeBar : i;
    g_pending[slot].sweepExtreme = sw.extreme;
    g_pending[slot].grade        = score;
    g_pending[slot].gradeText    = GradeText(score);
@@ -1684,10 +1705,23 @@ void TryTriggerSetups(const int i, const int rates_total, const datetime &time[]
       int idx = g_signalCount;
 
       double atr = BufATR[i];
-      double arrowPrice = (g_pending[k].dir > 0) ? (low[i] - 0.6 * atr)
-                                                 : (high[i] + 0.6 * atr);
-      if(g_pending[k].dir > 0) BufBuy[i]  = arrowPrice;
-      else                     BufSell[i] = arrowPrice;
+
+      //--- Where the dot goes.
+      //--- DOT_SWING_EXTREME anchors it back to the bar that actually made the
+      //--- turn, which is what a classic signal chart shows. That bar is long
+      //--- closed and the dot is written once and never moved, so nothing
+      //--- repaints - but the dot appears only now, several bars after that
+      //--- candle printed. It marks a confirmed turn, not a price you could
+      //--- have bought at in real time. The entry line is that price.
+      int dotBar = (InpDotAnchor == DOT_SWING_EXTREME &&
+                    g_pending[k].dotBar >= 0 && g_pending[k].dotBar <= i)
+                   ? g_pending[k].dotBar : i;
+
+      double dotAtr = (BufATR[dotBar] > 0.0) ? BufATR[dotBar] : atr;
+      double arrowPrice = (g_pending[k].dir > 0) ? (low[dotBar]  - 0.6 * dotAtr)
+                                                 : (high[dotBar] + 0.6 * dotAtr);
+      if(g_pending[k].dir > 0) BufBuy[dotBar]  = arrowPrice;
+      else                     BufSell[dotBar] = arrowPrice;
 
       double lots = SuggestLots(g_pending[k].entry, g_pending[k].sl);
       double risk = MathAbs(g_pending[k].entry - g_pending[k].sl);
@@ -1696,7 +1730,7 @@ void TryTriggerSetups(const int i, const int rates_total, const datetime &time[]
       DrawSignalLevels(idx, g_pending[k].dir, time[i], time[lastIdx],
                        g_pending[k].entry, g_pending[k].sl, g_pending[k].tp1,
                        g_pending[k].tp2, g_pending[k].tp3,
-                       g_pending[k].gradeText, arrowPrice, lots);
+                       g_pending[k].gradeText, arrowPrice, lots, time[dotBar]);
 
       if(InpTrackOutcomes)
         {
