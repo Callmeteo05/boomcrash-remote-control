@@ -19,16 +19,16 @@
 #property description "Sweep -> MSS -> FVG. Structure-derived SL/TP, graded setups, WATCH/TRIGGER alerts."
 
 #property indicator_chart_window
-#property indicator_buffers 3
+#property indicator_buffers 5
 #property indicator_plots   2
 
-//--- plot 0 : buy arrows
+//--- plot 0 : buy dots
 #property indicator_label1  "Apex BUY"
 #property indicator_type1   DRAW_ARROW
 #property indicator_color1  clrLime
 #property indicator_width1  2
 
-//--- plot 1 : sell arrows
+//--- plot 1 : sell dots
 #property indicator_label2  "Apex SELL"
 #property indicator_type2   DRAW_ARROW
 #property indicator_color2  clrRed
@@ -50,6 +50,12 @@ enum ENUM_ENTRY_MODE
    ENTRY_FVG_EDGE,    // Near edge of the FVG (fills more often)
    ENTRY_FVG_CE,      // Consequent encroachment - 50% of the FVG
    ENTRY_FVG_FAR      // Far edge of the FVG (best price, fills least)
+  };
+
+enum ENUM_MARKER
+  {
+   MARK_DOT,          // Dot  (as in a classic signal system)
+   MARK_ARROW         // Arrow
   };
 
 enum ENUM_GRADE_FILTER
@@ -119,6 +125,13 @@ input int              InpMaxPending        = 4;               // Max setups arm
 input double           InpMinFVGatr         = 0.15;            // Ignore FVGs smaller than x * ATR
 input ENUM_ENTRY_MODE  InpEntryMode         = ENTRY_FVG_CE;    // Where in the FVG to enter
 
+input group "=== EMA trend filter ==="
+input bool             InpUseEMA            = true;            // Use the EMA trend filter
+input int              InpEmaFast           = 50;              // Fast EMA period
+input int              InpEmaSlow           = 200;             // Slow EMA period
+input bool             InpEmaHardFilter     = true;            // Block signals against the EMA trend
+input int              InpEmaScore          = 15;              // Grade points for EMA alignment
+
 input group "=== Risk engine ==="
 input double           InpSLbufferATR       = 0.25;            // SL buffer beyond the swept wick (x * ATR)
 input double           InpSpreadMult        = 2.0;             // Extra SL room = spread * x
@@ -129,7 +142,7 @@ input double           InpRiskPercent       = 1.0;             // Risk % of bala
 
 input group "=== Quality filter ==="
 input ENUM_GRADE_FILTER InpMinGrade         = GRADE_ALL;       // Minimum grade to show and alert
-input bool             InpRequireDiscount   = false;           // Longs only in discount / shorts only in premium
+input bool             InpRequireDiscount   = true;            // Buy only in discount / sell only in premium
 
 input group "=== Synthetic indices (Boom / Crash / Step) ==="
 input ENUM_SYNTH_MODE  InpSynthMode         = SYNTH_AUTO;      // Synthetic handling
@@ -171,6 +184,8 @@ input bool             InpShowStats         = true;            // Live win rate 
 input bool             InpShowDiagnostics   = true;            // Show which filter is rejecting candidates
 
 input group "=== Visuals ==="
+input ENUM_MARKER      InpMarker            = MARK_DOT;        // Signal marker style
+input bool             InpLabelShowGrade    = true;            // Put the grade next to BUY / SELL
 input bool             InpShowZones         = false;           // Shade the risk and reward zones
 input bool             InpShowEntryTag      = true;            // "BUY 0.05 at 1.23456" tag on the entry line
 input bool             InpShowStructure     = true;            // Draw BOS / CHoCH / MSS labels
@@ -192,6 +207,8 @@ input color            InpFVGBearColor      = clrIndianRed;    // Bearish FVG
 double BufBuy[];
 double BufSell[];
 double BufATR[];
+double BufEmaF[];
+double BufEmaS[];
 
 //+------------------------------------------------------------------+
 //| Types                                                            |
@@ -302,6 +319,8 @@ int          g_rejRR         = 0;
 int          g_rejPD         = 0;
 int          g_rejSynth      = 0;
 int          g_rejGrade      = 0;
+int          g_rejEMA        = 0;
+int          g_lastEmaTrend  = 0;
 int          g_armed         = 0;
 int          g_expired       = 0;
 int          g_slBeforeEntry = 0;
@@ -641,7 +660,7 @@ void ResetState()
    ArrayResize(g_pending, 0);
 
    g_rejNoSweep = 0; g_rejDisp = 0; g_rejNoFVG = 0; g_rejRR = 0;
-   g_rejPD = 0; g_rejSynth = 0; g_rejGrade = 0;
+   g_rejPD = 0; g_rejSynth = 0; g_rejGrade = 0; g_rejEMA = 0;
    g_armed = 0; g_expired = 0; g_slBeforeEntry = 0;
 
    g_trendMajor    = 0;
@@ -975,9 +994,39 @@ void DetectSpike(const int i, const datetime &time[], const double &open[],
 //+------------------------------------------------------------------+
 //| Grade a candidate setup                                          |
 //+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| EMA trend filter.                                                |
+//|                                                                   |
+//| Computed inline from the chart's own bars rather than through an  |
+//| indicator handle, so there is nothing to fall out of sync with    |
+//| the array being iterated, and it costs one multiply per bar. That |
+//| keeps the whole pass fast on any timeframe.                       |
+//|                                                                   |
+//| Returns +1 bullish, -1 bearish, 0 undecided.                      |
+//+------------------------------------------------------------------+
+int EMATrend(const int i, const double &close[])
+  {
+   if(!InpUseEMA) return 0;
+   if(BufEmaF[i] <= 0.0 || BufEmaS[i] <= 0.0) return 0;
+
+   //--- stack: fast above slow AND price on the same side of the fast line.
+   //--- Requiring both removes the chop that a bare crossover produces.
+   if(BufEmaF[i] > BufEmaS[i] && close[i] > BufEmaF[i]) return  1;
+   if(BufEmaF[i] < BufEmaS[i] && close[i] < BufEmaF[i]) return -1;
+   return 0;
+  }
+
+//--- how far the fast EMA is separated from the slow one, in ATR.
+//--- A wide, cleanly separated stack is a stronger trend than a tangle.
+double EMASeparation(const int i)
+  {
+   if(BufATR[i] <= 0.0 || BufEmaF[i] <= 0.0 || BufEmaS[i] <= 0.0) return 0.0;
+   return MathAbs(BufEmaF[i] - BufEmaS[i]) / BufATR[i];
+  }
+
 int GradeSetup(const int dir, const double entry, const double sl, const double dol,
                const double disp, const int fvgIdx, const SweepEvent &sw,
-               string &reason)
+               const int i, const double &close[], string &reason)
   {
 //--- Continuous scoring, and no free base score.
 //--- The earlier version handed out 25 points simply for the pattern existing,
@@ -1000,6 +1049,22 @@ int GradeSetup(const int dir, const double entry, const double sl, const double 
      }
    else
       parts += "counter-trend; ";
+
+//--- 1b. EMA trend filter, up to InpEmaScore, scaled by how clean the stack is
+   if(InpUseEMA)
+     {
+      int et = EMATrend(i, close);
+      if(et == dir)
+        {
+         double sep = MathMin(1.0, EMASeparation(i) / 1.5);
+         score += InpEmaScore * (0.6 + 0.4 * sep);
+         parts += StringFormat("EMA %d/%d aligned; ", InpEmaFast, InpEmaSlow);
+        }
+      else if(et == 0)
+         parts += "EMA flat; ";
+      else
+         parts += "EMA opposes; ";
+     }
 
 //--- 2. premium / discount, up to 15, scaled by depth into the correct half
    double lo, hi;
@@ -1185,8 +1250,9 @@ void DrawSignalLevels(const int idx, const int dir, const datetime t1, const dat
    color dirColor = (dir > 0) ? InpBuyColor : InpSellColor;
 
    //--- the BUY / SELL word at the arrow, as in a classic arrow system
-   DrawText(ObjName("SIG", idx), t1, arrowPrice,
-            StringFormat("%s %s", (dir > 0 ? "BUY" : "SELL"), gradeTxt), dirColor, 10);
+   string word = (dir > 0) ? "BUY" : "SELL";
+   if(InpLabelShowGrade) word += " " + gradeTxt;
+   DrawText(ObjName("SIG", idx), t1, arrowPrice, word, dirColor, 10);
 
    if(!InpShowLevels) return;
 
@@ -1516,6 +1582,13 @@ bool TryArmFromMSS(const int dir, const int i, const double &close[])
    tp2 = NormalizePrice(tp2);
    tp3 = NormalizePrice(tp3);
 
+   //--- EMA trend hard filter: never take a signal into the trend's teeth
+   if(InpUseEMA && InpEmaHardFilter)
+     {
+      int et = EMATrend(i, close);
+      if(et != 0 && et != dir) { g_rejEMA++; return false; }
+     }
+
    //--- premium / discount hard filter
    if(InpRequireDiscount)
      {
@@ -1537,7 +1610,7 @@ bool TryArmFromMSS(const int dir, const int i, const double &close[])
      }
 
    string reason;
-   int score = GradeSetup(dir, entry, sl, dol, disp, f, sw, reason);
+   int score = GradeSetup(dir, entry, sl, dol, disp, f, sw, i, close, reason);
    if(!GradePasses(score)) { g_rejGrade++; return false; }
 
    //--- take a free slot
@@ -1742,6 +1815,13 @@ void UpdatePanel()
 
    string trend = (g_trendMajor > 0) ? "BULLISH" : (g_trendMajor < 0 ? "BEARISH" : "RANGING");
 
+   string ema = "";
+   if(InpUseEMA && g_lastEmaTrend != 0)
+      ema = StringFormat(" | EMA %d/%d %s", InpEmaFast, InpEmaSlow,
+                         (g_lastEmaTrend > 0 ? "up" : "down"));
+   else if(InpUseEMA)
+      ema = " | EMA flat";
+
    //--- synthetic classification, plus what the bars actually show
    string synth = "";
    if(g_family != FAM_NONE)
@@ -1803,7 +1883,7 @@ void UpdatePanel()
    ObjectSetString(0, name, OBJPROP_TEXT,
                    StringFormat("Apex ICT | %s %s | structure %s | signals %d%s | %s%s",
                                 _Symbol, EnumToString((ENUM_TIMEFRAMES)_Period),
-                                trend, g_signalCount, stats, g_lastSignalTxt, synth));
+                                trend, g_signalCount, stats, g_lastSignalTxt, synth + ema));
    ObjectSetInteger(0, name, OBJPROP_COLOR,
                     (g_trendMajor > 0) ? InpBuyColor : (g_trendMajor < 0 ? InpSellColor : clrGray));
 
@@ -1836,7 +1916,7 @@ void UpdateDiagnostics()
      }
 
    int rejected = g_rejNoSweep + g_rejDisp + g_rejNoFVG + g_rejRR
-                + g_rejPD + g_rejSynth + g_rejGrade;
+                + g_rejPD + g_rejSynth + g_rejGrade + g_rejEMA;
 
    //--- name the stage that is doing the most damage
    string worst = "none";
@@ -1848,12 +1928,13 @@ void UpdateDiagnostics()
    if(g_rejPD      > worstN) { worstN = g_rejPD;      worst = "premium/discount filter"; }
    if(g_rejSynth   > worstN) { worstN = g_rejSynth;   worst = "spike-direction filter"; }
    if(g_rejGrade   > worstN) { worstN = g_rejGrade;   worst = "below minimum grade"; }
+   if(g_rejEMA     > worstN) { worstN = g_rejEMA;     worst = "against the EMA trend"; }
 
    ObjectSetString(0, name, OBJPROP_TEXT,
-                   StringFormat("candidates rejected %d  [sweep %d | disp %d | fvg %d | RR %d | PD %d | spike %d | grade %d]"
+                   StringFormat("candidates rejected %d  [sweep %d | disp %d | fvg %d | RR %d | PD %d | spike %d | grade %d | ema %d]"
                                 "   armed %d  expired %d  stopped-pre-entry %d   biggest blocker: %s",
                                 rejected, g_rejNoSweep, g_rejDisp, g_rejNoFVG, g_rejRR,
-                                g_rejPD, g_rejSynth, g_rejGrade,
+                                g_rejPD, g_rejSynth, g_rejGrade, g_rejEMA,
                                 g_armed, g_expired, g_slBeforeEntry, worst));
   }
 
@@ -1865,13 +1946,26 @@ int OnInit()
    SetIndexBuffer(0, BufBuy,  INDICATOR_DATA);
    SetIndexBuffer(1, BufSell, INDICATOR_DATA);
    SetIndexBuffer(2, BufATR,  INDICATOR_CALCULATIONS);
+   SetIndexBuffer(3, BufEmaF, INDICATOR_CALCULATIONS);
+   SetIndexBuffer(4, BufEmaS, INDICATOR_CALCULATIONS);
 
    ArraySetAsSeries(BufBuy,  false);
    ArraySetAsSeries(BufSell, false);
    ArraySetAsSeries(BufATR,  false);
+   ArraySetAsSeries(BufEmaF, false);
+   ArraySetAsSeries(BufEmaS, false);
 
-   PlotIndexSetInteger(0, PLOT_ARROW, 233);        // up arrow
-   PlotIndexSetInteger(1, PLOT_ARROW, 234);        // down arrow
+   //--- Wingdings 108 is a filled circle: the dot of a classic signal system
+   if(InpMarker == MARK_DOT)
+     {
+      PlotIndexSetInteger(0, PLOT_ARROW, 108);
+      PlotIndexSetInteger(1, PLOT_ARROW, 108);
+     }
+   else
+     {
+      PlotIndexSetInteger(0, PLOT_ARROW, 233);     // up arrow
+      PlotIndexSetInteger(1, PLOT_ARROW, 234);     // down arrow
+     }
    //--- arrows are already offset in price by the plotting code, so no pixel shift
    PlotIndexSetInteger(0, PLOT_ARROW_SHIFT, 0);
    PlotIndexSetInteger(1, PLOT_ARROW_SHIFT, 0);
@@ -1943,6 +2037,7 @@ int OnCalculate(const int rates_total,
    ArraySetAsSeries(close,  false);
 
    int warmup = MathMax(g_swingLB, g_intLB) * 2 + 20;
+   if(InpUseEMA) warmup = MathMax(warmup, InpEmaSlow + 10);
    if(rates_total < warmup + 10) return 0;
 
    g_liveMode = (prev_calculated > 0);
@@ -1954,6 +2049,8 @@ int OnCalculate(const int rates_total,
       ArrayInitialize(BufBuy,  EMPTY_VALUE);
       ArrayInitialize(BufSell, EMPTY_VALUE);
       ArrayInitialize(BufATR,  0.0);
+      ArrayInitialize(BufEmaF, 0.0);
+      ArrayInitialize(BufEmaS, 0.0);
       ObjectsDeleteAll(0, PREFIX);
       ResetState();
 
@@ -1984,6 +2081,21 @@ int OnCalculate(const int rates_total,
          n++;
         }
       BufATR[i] = (n > 0) ? sum / n : 0.0;
+     }
+
+   //--- EMAs, recursive so each bar costs one multiply. Seeded from the first
+   //--- bar we touch; the seed washes out long before any signal is graded.
+   if(InpUseEMA)
+     {
+      double kF = 2.0 / (MathMax(1, InpEmaFast) + 1.0);
+      double kS = 2.0 / (MathMax(1, InpEmaSlow) + 1.0);
+      for(int i = start; i < rates_total; i++)
+        {
+         if(i == 0 || BufEmaF[i-1] <= 0.0)
+           { BufEmaF[i] = close[i]; BufEmaS[i] = close[i]; continue; }
+         BufEmaF[i] = close[i] * kF + BufEmaF[i-1] * (1.0 - kF);
+         BufEmaS[i] = close[i] * kS + BufEmaS[i-1] * (1.0 - kS);
+        }
      }
 
    //--- main pass: closed bars only, so the live bar never influences anything
@@ -2049,6 +2161,8 @@ int OnCalculate(const int rates_total,
       //--- follow already-emitted signals to their outcome before a new one fires,
       //--- so a signal never resolves itself on its own entry bar
       UpdateTrades(i, time, high, low);
+
+      g_lastEmaTrend = EMATrend(i, close);
 
       //--- entry fill
       MaybeWatchAlerts(i, rates_total, time, close);

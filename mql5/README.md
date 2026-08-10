@@ -173,6 +173,39 @@ Read the blocker, then loosen that one input rather than everything at once:
 | `Spike cycle style` | **Spike catch** (default) / Drip / Both — which side of the cycle you trade |
 | `Spike ATR` | Bar range that counts as a jump |
 
+## EMA trend filter
+
+Advanced ICT sets *where* — the sweep, the shift, the gap, the premium/discount side.
+The EMA sets *whether the tide is with you*.
+
+- Fast/slow EMA (default **50/200**) computed inline from the chart's own bars — one
+  multiply per bar, no indicator handle to fall out of sync, so it stays fast on any
+  timeframe.
+- Trend is called only when the stack agrees **and** price sits on the same side of the
+  fast line. Requiring both removes the chop a bare crossover produces.
+- Two ways it acts: a **hard filter** (default on) that refuses any signal taken into
+  the trend's teeth, and a **score component** worth up to 15 points that scales with
+  how cleanly the two lines are separated in ATR — a wide stack is a stronger trend
+  than a tangle.
+
+Turn the hard filter off if you want counter-trend reversals at range extremes; leave it
+on for trend continuation only.
+
+## Where the dots are placed
+
+A dot marks the bar whose **close filled the entry** — the moment the setup became
+tradeable. Buy dots print below the bar, sell dots above, with `BUY` / `SELL` in the
+signal colour and the grade beside it.
+
+The location logic is the ICT stack, not decoration:
+
+- **Buy dots only form in discount, sell dots only in premium** (hard filter, default
+  on) — measured against the live dealing range, not the visible chart
+- the swept wick sets the stop, so the dot always sits above its own invalidation
+- the nearest opposing liquidity pool sets TP2, and a setup is rejected outright if that
+  pool is closer than `Min RR`
+- the EMA trend must not oppose the direction
+
 ## Grading
 
 Scoring is **continuous, with no free base score**. Every point is earned by a measured
