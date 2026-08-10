@@ -164,14 +164,34 @@ the same setup's clothes. It is rejected, and counted as `chase` in the diagnost
 draw is also re-checked from the real fill, so a setup whose reward no longer clears
 `Min RR` after confirmation is dropped rather than taken.
 
-### Daily budget
+### Daily budget — and what it counts across
 
 - **Max signals per day** (default 3) — over-trading is a drawdown source in its own right.
 - **Daily loss limit** (default 2R) — once the day is down that much, the engine stops
   producing signals until tomorrow.
 
 Both reset on your calendar day, in your timezone. The panel shows
-`today 2/3 trades +1.4R`, and `DONE FOR TODAY` once the budget is spent.
+`today 2/3 trades +1.4R (all charts)`, and `DONE FOR TODAY` once spent.
+
+**Scope matters more than the number.** An indicator instance only sees its own chart, so
+a per-chart limit is barely a limit once you run several symbols — three trades each
+across five charts is fifteen trades a day, which is not drawdown control.
+
+| Scope | Counts across |
+|---|---|
+| `Per chart` | this symbol on this timeframe only |
+| `Per symbol` | one symbol, shared across all its timeframes |
+| **`Account-wide`** (default) | every chart in the terminal |
+
+Account-wide and per-symbol share their counters through terminal global variables, so
+every chart sees the same running total. Counters older than a week are cleared
+automatically.
+
+One limit worth knowing: global variables only exist live. **History always uses the
+per-chart counter**, because a backtest of one chart cannot know what the other charts
+would have done that day. So historical dots are budgeted per chart even when live
+trading is budgeted account-wide, and a multi-chart historical total will look more
+generous than live will actually be.
 
 ### Heat — the number that proves it
 
@@ -236,6 +256,31 @@ volume and liquidity raids genuinely cluster, and there the window is a real edg
 Rather than assert either, the engine measures it. If the two numbers stay close on your
 instruments, the window is organising your day, not improving your odds — and you should
 know which.
+
+## Are the past dots real?
+
+Yes, in the sense that matters: **the logic that produced every historical dot read only
+bars that had already closed at that moment.** There is no hindsight in the decision. That
+is what the non-repaint guarantees buy, and it is why the panel's statistics are a real
+backtest rather than a curve fit.
+
+Four honest qualifications, so you know exactly what you are reading:
+
+1. **The turn dot is a confirmed turn, not an entry.** It is drawn back at the swing
+   extreme and appears several bars later. The *entry* dot is the tradeable one. See
+   *Where the dots are placed*.
+2. **Fills are judged from bar highs and lows, not tick data.** When a single bar spans
+   both the stop and the target, the engine records **the loss**, because bar data cannot
+   say which came first. Results are a floor, not a best case.
+3. **Spread is today's, not that day's.** The stop buffer uses the current spread from
+   the symbol spec. Historical spread was different, and on synthetics it widens around
+   jumps. Live results will differ slightly for this reason alone.
+4. **No slippage is modelled.** Entry-on-confirmation uses the bar's close, which is
+   realistic, but a fast market fills worse than that.
+
+None of this is fixable from bar data — it is the honest ceiling on what any chart-based
+backtest can tell you. What it does establish is that the *decisions* were made without
+seeing the future, which is the part most tools quietly get wrong.
 
 ## Seeing past dots — how much history you get
 

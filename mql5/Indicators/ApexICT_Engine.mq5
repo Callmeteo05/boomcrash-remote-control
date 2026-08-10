@@ -77,6 +77,13 @@ enum ENUM_MARKER
    MARK_ARROW         // Arrow
   };
 
+enum ENUM_BUDGET_SCOPE
+  {
+   BUDGET_CHART,      // Per chart (this symbol + this timeframe)
+   BUDGET_SYMBOL,     // Per symbol, shared across its timeframes
+   BUDGET_ACCOUNT     // Account-wide, shared across every chart
+  };
+
 enum ENUM_CONFIRM
   {
    CONFIRM_TOUCH,     // Fire as soon as price touches the zone (resting limit)
@@ -163,6 +170,7 @@ input ENUM_CONFIRM     InpConfirm           = CONFIRM_CLOSE;   // How an entry m
 input double           InpMaxChaseR         = 0.35;            // Reject if confirming close is > x R past the zone
 input int              InpMaxTradesPerDay   = 3;               // Max signals per day (0 = unlimited)
 input double           InpDailyLossLimitR   = 2.0;             // Stop for the day after losing x R (0 = off)
+input ENUM_BUDGET_SCOPE InpBudgetScope      = BUDGET_ACCOUNT;  // What the daily budget counts across
 input bool             InpBudgetOnHistory   = true;            // Apply the daily budget to history too
 
 input group "=== Risk engine ==="
@@ -768,13 +776,72 @@ void RollDay(const datetime barTime)
    g_dayKey    = d;
    g_dayTrades = 0;
    g_dayR      = 0.0;
+
+   //--- drop counters older than a week so they do not accumulate
+   if(g_liveMode && InpBudgetScope != BUDGET_CHART)
+      GlobalVariablesDeleteAll("ApexICT_", TimeCurrent() - 7 * 86400);
+  }
+
+//+------------------------------------------------------------------+
+//| Shared daily budget.                                             |
+//|                                                                   |
+//| An indicator instance only sees its own chart, so a per-chart     |
+//| limit is no limit at all once you run several symbols: three      |
+//| trades each across five charts is fifteen trades. The counters are |
+//| therefore kept in terminal global variables, which every chart in  |
+//| the same terminal can read, so the budget can be genuinely         |
+//| account-wide.                                                     |
+//|                                                                   |
+//| Global variables only exist live, so history always uses the local |
+//| counter - a backtest of one chart cannot know what the others did. |
+//+------------------------------------------------------------------+
+string BudgetKey()
+  {
+   string scope;
+   if(InpBudgetScope == BUDGET_ACCOUNT)     scope = "ACC";
+   else if(InpBudgetScope == BUDGET_SYMBOL) scope = _Symbol;
+   else                                     scope = _Symbol + "_" + IntegerToString((int)_Period);
+
+   return "ApexICT_" + scope + "_" + IntegerToString((long)g_dayKey);
+  }
+
+int SharedDayTrades()
+  {
+   if(!g_liveMode || InpBudgetScope == BUDGET_CHART) return g_dayTrades;
+   string k = BudgetKey() + "_N";
+   if(!GlobalVariableCheck(k)) return 0;
+   return (int)GlobalVariableGet(k);
+  }
+
+double SharedDayR()
+  {
+   if(!g_liveMode || InpBudgetScope == BUDGET_CHART) return g_dayR;
+   string k = BudgetKey() + "_R";
+   if(!GlobalVariableCheck(k)) return 0.0;
+   return GlobalVariableGet(k);
+  }
+
+void SharedAddTrade()
+  {
+   g_dayTrades++;
+   if(!g_liveMode || InpBudgetScope == BUDGET_CHART) return;
+   string k = BudgetKey() + "_N";
+   GlobalVariableSet(k, SharedDayTrades() + 1);
+  }
+
+void SharedAddR(const double r)
+  {
+   g_dayR += r;
+   if(!g_liveMode || InpBudgetScope == BUDGET_CHART) return;
+   string k = BudgetKey() + "_R";
+   GlobalVariableSet(k, SharedDayR() + r);
   }
 
 //--- has the day already used up its budget
 bool DayBudgetSpent()
   {
-   if(InpMaxTradesPerDay > 0 && g_dayTrades >= InpMaxTradesPerDay) return true;
-   if(InpDailyLossLimitR > 0.0 && g_dayR <= -InpDailyLossLimitR)   return true;
+   if(InpMaxTradesPerDay > 0 && SharedDayTrades() >= InpMaxTradesPerDay) return true;
+   if(InpDailyLossLimitR > 0.0 && SharedDayR() <= -InpDailyLossLimitR)   return true;
    return false;
   }
 
@@ -1545,7 +1612,7 @@ void UpdateTrades(const int i, const datetime &time[],
          if(g_trades[k].inSession) g_inSessResolved++;
          else                      g_outSessResolved++;
          g_maeSumAll += MathMin(1.0, g_trades[k].mae / risk);
-         if(g_trades[k].entryDay == g_dayKey) g_dayR -= 1.0;
+         if(g_trades[k].entryDay == g_dayKey) SharedAddR(-1.0);
 
          if(InpShowOutcomeMarks)
             DrawText(ObjName("XSL", g_trades[k].idx), time[i], g_trades[k].sl,
@@ -1585,7 +1652,7 @@ void UpdateTrades(const int i, const datetime &time[],
          double heat = g_trades[k].mae / risk;
          g_maeSumAll += heat;
          g_maeSumWin += heat;
-         if(g_trades[k].entryDay == g_dayKey) g_dayR += g_trades[k].rMultiple;
+         if(g_trades[k].entryDay == g_dayKey) SharedAddR(g_trades[k].rMultiple);
 
          if(InpShowOutcomeMarks)
             DrawText(ObjName("XT2", g_trades[k].idx), time[i], g_trades[k].tp2,
@@ -2281,7 +2348,7 @@ void TryTriggerSetups(const int i, const int rates_total, const datetime &time[]
                                 g_pending[k].reason));
         }
 
-      g_dayTrades++;
+      SharedAddTrade();
       g_pending[k].active = false;
      }
   }
@@ -2430,9 +2497,11 @@ void UpdatePanel()
    string today = "";
    if(InpMaxTradesPerDay > 0 || InpDailyLossLimitR > 0.0)
      {
-      today = StringFormat(" | today %d", g_dayTrades);
+      string scope = (InpBudgetScope == BUDGET_ACCOUNT) ? "all charts"
+                   : (InpBudgetScope == BUDGET_SYMBOL)  ? "this symbol" : "this chart";
+      today = StringFormat(" | today %d", SharedDayTrades());
       if(InpMaxTradesPerDay > 0) today += StringFormat("/%d", InpMaxTradesPerDay);
-      today += StringFormat(" trades %+.1fR", g_dayR);
+      today += StringFormat(" trades %+.1fR (%s)", SharedDayR(), scope);
       if(DayBudgetSpent()) today += " - DONE FOR TODAY";
      }
 
