@@ -77,6 +77,13 @@ enum ENUM_MARKER
    MARK_ARROW         // Arrow
   };
 
+enum ENUM_CONFIRM
+  {
+   CONFIRM_TOUCH,     // Fire as soon as price touches the zone (resting limit)
+   CONFIRM_CLOSE,     // Wait for a bar to close back out of the zone
+   CONFIRM_REJECT     // Wait for a close-out AND a rejection candle
+  };
+
 enum ENUM_GRADE_FILTER
   {
    GRADE_ALL,         // B and better
@@ -150,6 +157,12 @@ input int              InpEmaFast           = 21;              // Fast EMA perio
 input int              InpEmaSlow           = 50;              // Slow EMA period
 input bool             InpEmaHardFilter     = true;            // Block signals against the EMA trend
 input int              InpEmaScore          = 15;              // Grade points for EMA alignment
+
+input group "=== Entry confirmation & drawdown control ==="
+input ENUM_CONFIRM     InpConfirm           = CONFIRM_CLOSE;   // How an entry must confirm
+input double           InpMaxChaseR         = 0.35;            // Reject if confirming close is > x R past the zone
+input int              InpMaxTradesPerDay   = 3;               // Max signals per day (0 = unlimited)
+input double           InpDailyLossLimitR   = 2.0;             // Stop for the day after losing x R (0 = off)
 
 input group "=== Risk engine ==="
 input double           InpSLbufferATR       = 0.25;            // SL buffer beyond the swept wick (x * ATR)
@@ -322,6 +335,9 @@ struct TradeRec
    int      result;          // 0 running, +1 target reached, -1 stopped
    double   rMultiple;
    bool     inSession;
+   double   mae;             // worst adverse excursion, price
+   double   mfe;             // best favourable excursion, price
+   datetime entryDay;
   };
 
 //+------------------------------------------------------------------+
@@ -367,6 +383,17 @@ int          g_rejGrade      = 0;
 int          g_rejEMA        = 0;
 int          g_lastEmaTrend  = 0;
 int          g_rejSession    = 0;
+int          g_rejChase      = 0;
+int          g_rejDaily      = 0;
+
+//--- heat: how far trades go against you before they resolve
+double       g_maeSumAll     = 0.0;
+double       g_maeSumWin     = 0.0;
+
+//--- daily discipline
+datetime     g_dayKey        = 0;
+int          g_dayTrades     = 0;
+double       g_dayR          = 0.0;
 int          g_brokerGmt     = 99;
 datetime     g_lastBriefDay  = 0;
 
@@ -722,6 +749,33 @@ bool InSession(const datetime serverTime)
    return (now >= from || now < until);           // window crosses midnight
   }
 
+//--- the user's calendar day for a bar, used to reset the daily limits
+datetime UserDay(const datetime serverTime)
+  {
+   MqlDateTime dt;
+   TimeToStruct(ToUserTime(serverTime), dt);
+   dt.hour = 0; dt.min = 0; dt.sec = 0;
+   return StructToTime(dt);
+  }
+
+//--- roll the daily counters when a new day starts
+void RollDay(const datetime barTime)
+  {
+   datetime d = UserDay(barTime);
+   if(d == g_dayKey) return;
+   g_dayKey    = d;
+   g_dayTrades = 0;
+   g_dayR      = 0.0;
+  }
+
+//--- has the day already used up its budget
+bool DayBudgetSpent()
+  {
+   if(InpMaxTradesPerDay > 0 && g_dayTrades >= InpMaxTradesPerDay) return true;
+   if(InpDailyLossLimitR > 0.0 && g_dayR <= -InpDailyLossLimitR)   return true;
+   return false;
+  }
+
 //+------------------------------------------------------------------+
 //| Apply the style preset                                           |
 //+------------------------------------------------------------------+
@@ -778,6 +832,9 @@ void ResetState()
    g_inSessResolved = 0; g_inSessWins = 0;
    g_outSessResolved = 0; g_outSessWins = 0;
    g_lastBriefDay = 0;
+   g_rejChase = 0; g_rejDaily = 0;
+   g_maeSumAll = 0.0; g_maeSumWin = 0.0;
+   g_dayKey = 0; g_dayTrades = 0; g_dayR = 0.0;
    g_armed = 0; g_expired = 0; g_slBeforeEntry = 0;
 
    g_trendMajor    = 0;
@@ -1457,6 +1514,17 @@ void UpdateTrades(const int i, const datetime &time[],
       double risk = g_trades[k].risk;
       if(risk <= 0.0) { g_trades[k].open = false; continue; }
 
+      //--- heat: how far this trade goes against the entry before it resolves.
+      //--- This is the number that says whether entries are actually refined,
+      //--- rather than whether they eventually won.
+      double adverse = (d > 0) ? (g_trades[k].entry - low[i])
+                               : (high[i] - g_trades[k].entry);
+      if(adverse > g_trades[k].mae) g_trades[k].mae = adverse;
+
+      double favour = (d > 0) ? (high[i] - g_trades[k].entry)
+                              : (g_trades[k].entry - low[i]);
+      if(favour > g_trades[k].mfe) g_trades[k].mfe = favour;
+
       bool slHit  = (d > 0) ? (low[i]  <= g_trades[k].sl) : (high[i] >= g_trades[k].sl);
       bool tp1Hit = (d > 0) ? (high[i] >= g_trades[k].tp1) : (low[i] <= g_trades[k].tp1);
       bool tp2Hit = (d > 0) ? (high[i] >= g_trades[k].tp2) : (low[i] <= g_trades[k].tp2);
@@ -1474,6 +1542,8 @@ void UpdateTrades(const int i, const datetime &time[],
          g_grossLossR += 1.0;
          if(g_trades[k].inSession) g_inSessResolved++;
          else                      g_outSessResolved++;
+         g_maeSumAll += MathMin(1.0, g_trades[k].mae / risk);
+         if(g_trades[k].entryDay == g_dayKey) g_dayR -= 1.0;
 
          if(InpShowOutcomeMarks)
             DrawText(ObjName("XSL", g_trades[k].idx), time[i], g_trades[k].sl,
@@ -1510,6 +1580,10 @@ void UpdateTrades(const int i, const datetime &time[],
          g_grossWinR += g_trades[k].rMultiple;
          if(g_trades[k].inSession) { g_inSessResolved++;  g_inSessWins++;  }
          else                      { g_outSessResolved++; g_outSessWins++; }
+         double heat = g_trades[k].mae / risk;
+         g_maeSumAll += heat;
+         g_maeSumWin += heat;
+         if(g_trades[k].entryDay == g_dayKey) g_dayR += g_trades[k].rMultiple;
 
          if(InpShowOutcomeMarks)
             DrawText(ObjName("XT2", g_trades[k].idx), time[i], g_trades[k].tp2,
@@ -1597,9 +1671,17 @@ void MaybeSessionBrief(const int i, const int rates_total, const datetime &time[
                           DoubleToString(g_pending[best].entry, g_digits));
      }
 
+   RollDay(time[i]);
+
+   string budget = "";
+   if(InpMaxTradesPerDay > 0)
+      budget = StringFormat(" | budget %d trades", InpMaxTradesPerDay);
+   if(InpDailyLossLimitR > 0.0)
+      budget += StringFormat(", stop at -%.1fR", InpDailyLossLimitR);
+
    FireAlert("SESSION",
-             StringFormat("window open | structure %s | %s | %s | %d armed | nearest: %s",
-                          trend, emaTx, zone, armed, near));
+             StringFormat("window open | structure %s | %s | %s | %d armed | nearest: %s%s",
+                          trend, emaTx, zone, armed, near, budget));
   }
 
 //+------------------------------------------------------------------+
@@ -1995,7 +2077,8 @@ void ProcessMSS(const int i, const double &close[], const datetime barTime)
 //| Emit signals when price fills an armed entry                     |
 //+------------------------------------------------------------------+
 void TryTriggerSetups(const int i, const int rates_total, const datetime &time[],
-                      const double &high[], const double &low[])
+                      const double &open[], const double &high[], const double &low[],
+                      const double &close[])
   {
    for(int k = 0; k < ArraySize(g_pending); k++)
      {
@@ -2010,9 +2093,73 @@ void TryTriggerSetups(const int i, const int rates_total, const datetime &time[]
       if(i > g_pending[k].expiryBar)
         { g_pending[k].active = false; g_expired++; continue; }
 
-      bool filled = (g_pending[k].dir > 0) ? (low[i]  <= g_pending[k].entry)
-                                           : (high[i] >= g_pending[k].entry);
-      if(!filled) continue;
+      //--- Entry confirmation.
+      //---
+      //--- CONFIRM_TOUCH assumes a resting limit order: you are filled at the
+      //--- zone, at the best possible price, but with no evidence the zone is
+      //--- holding. That is where most of the heat on a trade comes from.
+      //---
+      //--- CONFIRM_CLOSE and CONFIRM_REJECT wait for the bar to close back out
+      //--- of the zone, so you enter after the reaction has begun rather than
+      //--- into it. The price is worse and the fill is the close, not the zone -
+      //--- so the fill price is re-priced below and the trade is re-checked.
+      int dirp = g_pending[k].dir;
+      bool touched = (dirp > 0) ? (low[i]  <= g_pending[k].entry)
+                                : (high[i] >= g_pending[k].entry);
+      if(!touched) continue;
+
+      if(InpConfirm != CONFIRM_TOUCH)
+        {
+         //--- the bar must reclaim the zone in the trade's direction
+         bool reclaimed = (dirp > 0) ? (close[i] > g_pending[k].entry)
+                                     : (close[i] < g_pending[k].entry);
+         if(!reclaimed) continue;
+
+         if(InpConfirm == CONFIRM_REJECT)
+           {
+            //--- and it must look like rejection: right-way body, and the close
+            //--- in the far third of the bar's range
+            double rng = high[i] - low[i];
+            if(rng <= 0.0) continue;
+            bool body = (dirp > 0) ? (close[i] > open[i]) : (close[i] < open[i]);
+            double posInBar = (close[i] - low[i]) / rng;
+            bool tail = (dirp > 0) ? (posInBar >= 0.66) : (posInBar <= 0.34);
+            if(!body || !tail) continue;
+           }
+        }
+
+      //--- daily budget
+      RollDay(time[i]);
+      if(DayBudgetSpent()) { g_rejDaily++; continue; }
+
+      //--- Re-price to the fill that actually happens.
+      //--- With confirmation on you are filled at the close, not at the zone,
+      //--- and pretending otherwise would flatter every statistic below.
+      double fill = (InpConfirm == CONFIRM_TOUCH) ? g_pending[k].entry
+                                                  : NormalizePrice(close[i]);
+      double fillRisk = MathAbs(fill - g_pending[k].sl);
+      if(fillRisk <= 0.0) { g_pending[k].active = false; continue; }
+
+      //--- anti-chase: if the confirming close has already run past the zone,
+      //--- the good price is gone and what is left is a worse trade wearing the
+      //--- same setup's clothes
+      double planRisk = MathAbs(g_pending[k].entry - g_pending[k].sl);
+      if(planRisk > 0.0)
+        {
+         double chased = MathAbs(fill - g_pending[k].entry) / planRisk;
+         if(chased > InpMaxChaseR) { g_rejChase++; g_pending[k].active = false; continue; }
+        }
+
+      //--- and the draw must still be worth reaching from the real fill
+      if((MathAbs(g_pending[k].tp2 - fill) / fillRisk) < InpMinRR)
+        { g_rejRR++; g_pending[k].active = false; continue; }
+
+      //--- R-based targets move with the fill; TP2 is structural and does not
+      g_pending[k].entry = fill;
+      g_pending[k].tp1   = NormalizePrice((dirp > 0) ? fill + InpTP1_R * fillRisk
+                                                     : fill - InpTP1_R * fillRisk);
+      g_pending[k].tp3   = NormalizePrice((dirp > 0) ? fill + InpTP3_R * fillRisk
+                                                     : fill - InpTP3_R * fillRisk);
 
       //--- fired on the close of this bar and never revised
       g_signalCount++;
@@ -2089,6 +2236,9 @@ void TryTriggerSetups(const int i, const int rates_total, const datetime &time[]
          g_trades[n].result    = 0;
          g_trades[n].rMultiple = 0.0;
          g_trades[n].inSession = InSession(time[i]);
+         g_trades[n].mae       = 0.0;
+         g_trades[n].mfe       = 0.0;
+         g_trades[n].entryDay  = UserDay(time[i]);
         }
 
       double rr2 = (risk > 0.0) ? MathAbs(g_pending[k].tp2 - g_pending[k].entry) / risk : 0.0;
@@ -2121,6 +2271,7 @@ void TryTriggerSetups(const int i, const int rates_total, const datetime &time[]
                                 g_pending[k].reason));
         }
 
+      g_dayTrades++;
       g_pending[k].active = false;
      }
   }
@@ -2248,6 +2399,14 @@ void UpdatePanel()
       stats = StringFormat(" | resolved %d  win %.1f%%  exp %.2fR  PF %.2f  TP1 hit %d",
                            g_resolved, winRate, expect, pf, g_tp1Hits);
 
+      //--- average heat: how much of the stop a trade typically eats before
+      //--- resolving. Winners' heat is the number to tune the stop against.
+      double heatAll = g_maeSumAll / g_resolved;
+      if(g_wins > 0)
+         stats += StringFormat("  heat %.2fR (winners %.2fR)", heatAll, g_maeSumWin / g_wins);
+      else
+         stats += StringFormat("  heat %.2fR", heatAll);
+
       //--- is your window actually better, or does it only feel better?
       if(InpUseSession && g_inSessResolved >= 5 && g_outSessResolved >= 5)
         {
@@ -2258,10 +2417,19 @@ void UpdatePanel()
         }
      }
 
+   string today = "";
+   if(InpMaxTradesPerDay > 0 || InpDailyLossLimitR > 0.0)
+     {
+      today = StringFormat(" | today %d", g_dayTrades);
+      if(InpMaxTradesPerDay > 0) today += StringFormat("/%d", InpMaxTradesPerDay);
+      today += StringFormat(" trades %+.1fR", g_dayR);
+      if(DayBudgetSpent()) today += " - DONE FOR TODAY";
+     }
+
    ObjectSetString(0, name, OBJPROP_TEXT,
-                   StringFormat("Apex ICT | %s %s | structure %s | signals %d%s | %s%s",
+                   StringFormat("Apex ICT | %s %s | structure %s | signals %d%s%s | %s%s",
                                 _Symbol, EnumToString((ENUM_TIMEFRAMES)_Period),
-                                trend, g_signalCount, stats, g_lastSignalTxt, synth + ema));
+                                trend, g_signalCount, stats, today, g_lastSignalTxt, synth + ema));
    ObjectSetInteger(0, name, OBJPROP_COLOR,
                     (g_trendMajor > 0) ? InpBuyColor : (g_trendMajor < 0 ? InpSellColor : clrGray));
 
@@ -2294,7 +2462,8 @@ void UpdateDiagnostics()
      }
 
    int rejected = g_rejNoSweep + g_rejDisp + g_rejNoFVG + g_rejRR
-                + g_rejPD + g_rejSynth + g_rejGrade + g_rejEMA + g_rejSession;
+                + g_rejPD + g_rejSynth + g_rejGrade + g_rejEMA + g_rejSession
+                + g_rejChase + g_rejDaily;
 
    //--- name the stage that is doing the most damage
    string worst = "none";
@@ -2308,12 +2477,15 @@ void UpdateDiagnostics()
    if(g_rejGrade   > worstN) { worstN = g_rejGrade;   worst = "below minimum grade"; }
    if(g_rejEMA     > worstN) { worstN = g_rejEMA;     worst = "against the EMA trend"; }
    if(g_rejSession > worstN) { worstN = g_rejSession; worst = "outside your session window"; }
+   if(g_rejChase   > worstN) { worstN = g_rejChase;   worst = "confirmation ran too far (chase)"; }
+   if(g_rejDaily   > worstN) { worstN = g_rejDaily;   worst = "daily trade / loss budget spent"; }
 
    ObjectSetString(0, name, OBJPROP_TEXT,
-                   StringFormat("candidates rejected %d  [sweep %d | disp %d | fvg %d | RR %d | PD %d | spike %d | grade %d | ema %d | sess %d]"
+                   StringFormat("candidates rejected %d  [sweep %d | disp %d | fvg %d | RR %d | PD %d | spike %d | grade %d | ema %d | sess %d | chase %d | daily %d]"
                                 "   armed %d  expired %d  stopped-pre-entry %d   biggest blocker: %s",
                                 rejected, g_rejNoSweep, g_rejDisp, g_rejNoFVG, g_rejRR,
                                 g_rejPD, g_rejSynth, g_rejGrade, g_rejEMA, g_rejSession,
+                                g_rejChase, g_rejDaily,
                                 g_armed, g_expired, g_slBeforeEntry, worst));
   }
 
@@ -2563,7 +2735,7 @@ int OnCalculate(const int rates_total,
       //--- entry fill
       MaybeSessionBrief(i, rates_total, time, close);
       MaybeWatchAlerts(i, rates_total, time, close);
-      TryTriggerSetups(i, rates_total, time, high, low);
+      TryTriggerSetups(i, rates_total, time, open, high, low, close);
      }
 
    //--- keep the live bar clean

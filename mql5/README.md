@@ -140,6 +140,56 @@ signal read only bars that had already closed at that moment.
 The panel shows resolved count, win rate, expectancy in R, profit factor and TP1 hits,
 updating live as trades resolve.
 
+## Confirmed entries and drawdown control
+
+Two separate things reduce heat on a trade: **how it confirms**, and **how much you are
+allowed to lose in a day**. Both are built in.
+
+### Entry confirmation
+
+| Mode | Behaviour |
+|---|---|
+| `Touch` | Fires the moment price reaches the zone — a resting limit order. Best price, but no evidence the zone is holding. This is where most of the heat on a trade comes from. |
+| `Close` **(default)** | Waits for the bar to **close back out of the zone** in the trade's direction. You enter after the reaction has started rather than into it. |
+| `Reject` | As above, plus the bar must be a genuine rejection candle — right-way body, close in the far third of its range. Strictest, fewest signals, least heat. |
+
+**The fill is re-priced honestly.** With confirmation on you are filled at the confirming
+bar's *close*, not at the zone — so that is what the engine records. R, TP1, TP3, the lot
+size and every statistic are recomputed from the real fill. Pretending you got the zone
+price would flatter every number below.
+
+**Anti-chase.** If the confirming close has already run more than `Max chase R` past the
+zone (default 0.35R), the good price is gone and what remains is a worse trade wearing
+the same setup's clothes. It is rejected, and counted as `chase` in the diagnostics. The
+draw is also re-checked from the real fill, so a setup whose reward no longer clears
+`Min RR` after confirmation is dropped rather than taken.
+
+### Daily budget
+
+- **Max signals per day** (default 3) — over-trading is a drawdown source in its own right.
+- **Daily loss limit** (default 2R) — once the day is down that much, the engine stops
+  producing signals until tomorrow.
+
+Both reset on your calendar day, in your timezone. The panel shows
+`today 2/3 trades +1.4R`, and `DONE FOR TODAY` once the budget is spent.
+
+### Heat — the number that proves it
+
+Every trade is followed bar by bar and its worst adverse excursion recorded. The panel
+reports it in R:
+
+```
+heat 0.42R (winners 0.31R)
+```
+
+That reads: the average trade goes 0.42R against you before resolving, and trades that
+eventually won only ever went 0.31R against you.
+
+**Winners' heat is the number to tune your stop against.** If it settles at 0.31R, a stop
+at 1R is carrying roughly three times the risk the winning trades actually needed — you
+can tighten it, or size up, on evidence instead of feel. If it climbs toward 1R, entries
+are not refined and the confirmation mode should go stricter.
+
 ## Your trading session
 
 Set your window once — defaults are **08:00–12:00 at UTC+2** — and the engine works
