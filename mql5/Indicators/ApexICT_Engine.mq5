@@ -201,6 +201,9 @@ input bool             InpTrackOutcomes     = true;            // Follow each si
 input bool             InpShowOutcomeMarks  = true;            // Print TP / SL marks where they were hit
 input bool             InpShowStats         = true;            // Live win rate / expectancy panel
 input bool             InpShowDiagnostics   = true;            // Show which filter is rejecting candidates
+input bool             InpShowPending       = true;            // Draw setups that are armed and waiting
+input color            InpPendingBuyColor   = clrDeepSkyBlue;  // Armed buy setup colour
+input color            InpPendingSellColor  = clrOrange;       // Armed sell setup colour
 
 input group "=== Visuals ==="
 input ENUM_MARKER      InpMarker            = MARK_DOT;        // Signal marker style
@@ -1433,6 +1436,128 @@ void DrawHeaderLine(const int line, const string txt, const color clr)
    ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
   }
 
+//+------------------------------------------------------------------+
+//| Armed setups, drawn live.                                        |
+//|                                                                   |
+//| These are the ONLY objects on the chart that move. They have to:  |
+//| they show a setup that is waiting for price, and it either fills, |
+//| expires or is invalidated. They are drawn dashed and in their own |
+//| colours so they can never be confused with a confirmed signal.    |
+//| Nothing here is a signal yet - the dot and the alert come when    |
+//| a bar actually closes into the entry.                             |
+//+------------------------------------------------------------------+
+void DrawPendingSetups(const int rates_total, const datetime &time[], const double &close[])
+  {
+   ObjectsDeleteAll(0, PREFIX + "LIVE");
+   if(!InpShowPending) return;
+   if(rates_total < 2) return;
+
+   datetime tNow  = time[rates_total-1];
+   double   price = close[rates_total-1];
+   double   atr   = BufATR[rates_total-2];
+   int      lastBar = rates_total - 2;
+
+   int shown = 0;
+   for(int k = 0; k < ArraySize(g_pending); k++)
+     {
+      if(!g_pending[k].active) continue;
+
+      int    dir  = g_pending[k].dir;
+      color  clr  = (dir > 0) ? InpPendingBuyColor : InpPendingSellColor;
+      string tag  = "LIVE" + IntegerToString(k);
+      datetime t1 = time[MathMax(0, MathMin(rates_total-1, g_pending[k].mssBar))];
+
+      //--- the zone price has to reach
+      string nEnt = PREFIX + tag + "_E";
+      if(ObjectCreate(0, nEnt, OBJ_TREND, 0, t1, g_pending[k].entry, tNow, g_pending[k].entry))
+        {
+         ObjectSetInteger(0, nEnt, OBJPROP_COLOR, clr);
+         ObjectSetInteger(0, nEnt, OBJPROP_STYLE, STYLE_DASH);
+         ObjectSetInteger(0, nEnt, OBJPROP_WIDTH, 2);
+         ObjectSetInteger(0, nEnt, OBJPROP_RAY_RIGHT, true);
+         ObjectSetInteger(0, nEnt, OBJPROP_BACK, true);
+         ObjectSetInteger(0, nEnt, OBJPROP_SELECTABLE, false);
+         ObjectSetInteger(0, nEnt, OBJPROP_HIDDEN, true);
+        }
+
+      string nSL = PREFIX + tag + "_S";
+      if(ObjectCreate(0, nSL, OBJ_TREND, 0, t1, g_pending[k].sl, tNow, g_pending[k].sl))
+        {
+         ObjectSetInteger(0, nSL, OBJPROP_COLOR, InpSLColor);
+         ObjectSetInteger(0, nSL, OBJPROP_STYLE, STYLE_DOT);
+         ObjectSetInteger(0, nSL, OBJPROP_WIDTH, 1);
+         ObjectSetInteger(0, nSL, OBJPROP_RAY_RIGHT, true);
+         ObjectSetInteger(0, nSL, OBJPROP_BACK, true);
+         ObjectSetInteger(0, nSL, OBJPROP_SELECTABLE, false);
+         ObjectSetInteger(0, nSL, OBJPROP_HIDDEN, true);
+        }
+
+      //--- how close, and how long it has left
+      double away  = (atr > 0.0) ? MathAbs(price - g_pending[k].entry) / atr : 0.0;
+      int    left  = g_pending[k].expiryBar - lastBar;
+      double risk  = MathAbs(g_pending[k].entry - g_pending[k].sl);
+      double rr2   = (risk > 0.0) ? MathAbs(g_pending[k].tp2 - g_pending[k].entry) / risk : 0.0;
+
+      string nTx = PREFIX + tag + "_T";
+      if(ObjectCreate(0, nTx, OBJ_TEXT, 0, tNow, g_pending[k].entry))
+        {
+         ObjectSetString(0, nTx, OBJPROP_TEXT,
+                         StringFormat("  %s %s ARMED - %.1f ATR away, %d bars left, %.1fR",
+                                      (dir > 0 ? "BUY" : "SELL"),
+                                      g_pending[k].gradeText, away, MathMax(0, left), rr2));
+         ObjectSetInteger(0, nTx, OBJPROP_COLOR, clr);
+         ObjectSetInteger(0, nTx, OBJPROP_FONTSIZE, 8);
+         ObjectSetInteger(0, nTx, OBJPROP_ANCHOR, ANCHOR_LEFT);
+         ObjectSetInteger(0, nTx, OBJPROP_SELECTABLE, false);
+         ObjectSetInteger(0, nTx, OBJPROP_HIDDEN, true);
+        }
+      shown++;
+     }
+
+   //--- one-line summary, always in the same place so it can be read at a glance
+   string nHud = PREFIX + "HUD";
+   if(ObjectFind(0, nHud) < 0)
+     {
+      ObjectCreate(0, nHud, OBJ_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, nHud, OBJPROP_CORNER, CORNER_RIGHT_UPPER);
+      ObjectSetInteger(0, nHud, OBJPROP_XDISTANCE, 12);
+      ObjectSetInteger(0, nHud, OBJPROP_YDISTANCE, 20);
+      ObjectSetInteger(0, nHud, OBJPROP_ANCHOR, ANCHOR_RIGHT_UPPER);
+      ObjectSetInteger(0, nHud, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, nHud, OBJPROP_HIDDEN, true);
+      ObjectSetInteger(0, nHud, OBJPROP_FONTSIZE, 10);
+      ObjectSetString (0, nHud, OBJPROP_FONT, "Arial Bold");
+     }
+
+   if(shown == 0)
+     {
+      ObjectSetString(0, nHud, OBJPROP_TEXT, "no setup armed");
+      ObjectSetInteger(0, nHud, OBJPROP_COLOR, clrGray);
+     }
+   else
+     {
+      //--- report the one closest to filling
+      int    best = -1;
+      double bestAway = 0.0;
+      for(int k = 0; k < ArraySize(g_pending); k++)
+        {
+         if(!g_pending[k].active) continue;
+         double a = MathAbs(price - g_pending[k].entry);
+         if(best < 0 || a < bestAway) { best = k; bestAway = a; }
+        }
+      double aAtr = (atr > 0.0) ? bestAway / atr : 0.0;
+      ObjectSetString(0, nHud, OBJPROP_TEXT,
+                      StringFormat("%d ARMED | nearest %s %s @ %s  (%.1f ATR away)",
+                                   shown,
+                                   (g_pending[best].dir > 0 ? "BUY" : "SELL"),
+                                   g_pending[best].gradeText,
+                                   DoubleToString(g_pending[best].entry, g_digits),
+                                   aAtr));
+      ObjectSetInteger(0, nHud, OBJPROP_COLOR,
+                       (g_pending[best].dir > 0) ? InpPendingBuyColor : InpPendingSellColor);
+     }
+  }
+
 void UpdateHeader()
   {
    if(!InpShowHeader) return;
@@ -2298,6 +2423,7 @@ int OnCalculate(const int rates_total,
         }
      }
 
+   DrawPendingSetups(rates_total, time, close);
    UpdateHeader();
    UpdatePanel();
    return rates_total;

@@ -140,6 +140,37 @@ signal read only bars that had already closed at that moment.
 The panel shows resolved count, win rate, expectancy in R, profit factor and TP1 hits,
 updating live as trades resolve.
 
+## Seeing what is armed right now
+
+A dot only prints once a bar closes into the entry. Before that, a setup can be fully
+built and simply waiting for price — and you want to know that *before* it fires, not
+after.
+
+Top right of the chart, always in the same place:
+
+```
+2 ARMED | nearest BUY A+ @ 7947.60  (0.4 ATR away)
+```
+
+and on the chart itself, each armed setup draws a dashed entry line and a dotted stop,
+rayed to the right edge, labelled:
+
+```
+  BUY A+ ARMED - 0.4 ATR away, 12 bars left, 3.2R
+```
+
+So one glance tells you: how many setups are live, which is closest to triggering, how
+far price has to travel, how long before it expires, and what it pays.
+
+**These are the only objects on the chart that move.** They have to — an armed setup
+either fills, expires or is invalidated. They are drawn dashed and in their own colours
+so they can never be mistaken for a confirmed signal. Nothing here is a signal yet: the
+dot, the alert and the journal entry all wait for a bar to close into the entry.
+
+If you would rather work purely from alerts, the **WATCH** alert fires the moment price
+comes within 1.5 ATR of an armed entry, and `Draw setups that are armed and waiting`
+turns the visuals off.
+
 ## Too few signals? Read the diagnostics line
 
 The signal chain is a long AND: sweep, then displacement, then a gap, then room to the
