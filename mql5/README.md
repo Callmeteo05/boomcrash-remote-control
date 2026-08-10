@@ -237,6 +237,36 @@ Rather than assert either, the engine measures it. If the two numbers stay close
 instruments, the window is organising your day, not improving your odds — and you should
 know which.
 
+## Seeing past dots — how much history you get
+
+Dots print across **all analysed history**, not just recent bars. They are buffer plots,
+so thousands of them cost nothing.
+
+Three settings control how far back that goes, and one of them is not in this indicator:
+
+| Setting | Where | Effect |
+|---|---|---|
+| `Bars of history to analyse` | indicator inputs, default **5000** | how far back the engine runs. Set **0** for everything available. |
+| **Max bars in chart** | MT5 → Tools → Options → Charts | the hard ceiling. If this is set to 5000, no indicator can see more. Set it to *Unlimited* if history looks short. |
+| `Draw SL/TP lines only on the last x bars` | indicator inputs, default **800** | dots and BUY/SELL labels always print for all history; the full entry/SL/TP line set is drawn only on recent bars |
+
+That last one matters for speed. One signal is about ten chart objects — a few hundred
+historical signals means thousands of objects and a chart that crawls. The dots carry the
+history; the lines only need to be readable where you are actually trading.
+
+If you want the complete picture, set `Bars of history` to 0 and
+`Draw SL/TP lines` to 0 — just expect the chart to be slower.
+
+### The daily budget shapes history too
+
+By default the 3-trades-a-day and −2R limits are applied to history as well, so the dots
+you see are the trades you would actually have been **allowed** to take, not every setup
+the strategy ever found. That keeps the win rate on the panel honest.
+
+Turn off `Apply the daily budget to history too` to see every setup the strategy located,
+which is useful for judging the raw strategy — but then the statistics describe a version
+of you with no discipline limits.
+
 ## Seeing what is armed right now
 
 A dot only prints once a bar closes into the entry. Before that, a setup can be fully

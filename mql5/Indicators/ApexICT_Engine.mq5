@@ -163,6 +163,7 @@ input ENUM_CONFIRM     InpConfirm           = CONFIRM_CLOSE;   // How an entry m
 input double           InpMaxChaseR         = 0.35;            // Reject if confirming close is > x R past the zone
 input int              InpMaxTradesPerDay   = 3;               // Max signals per day (0 = unlimited)
 input double           InpDailyLossLimitR   = 2.0;             // Stop for the day after losing x R (0 = off)
+input bool             InpBudgetOnHistory   = true;            // Apply the daily budget to history too
 
 input group "=== Risk engine ==="
 input double           InpSLbufferATR       = 0.25;            // SL buffer beyond the swept wick (x * ATR)
@@ -247,6 +248,7 @@ input bool             InpShowRange         = true;            // Draw dealing r
 input bool             InpShowLevels        = true;            // Draw entry / SL / TP for each signal
 input bool             InpShowPanel         = true;            // On-chart info panel
 input int              InpLevelBars         = 30;              // Length of the level lines in bars
+input int              InpLevelsRecentBars  = 800;             // Draw SL/TP lines only on the last x bars (0 = all)
 input color            InpBuyColor          = clrLime;         // Buy colour
 input color            InpSellColor         = clrRed;          // Sell colour
 input color            InpSLColor           = clrCrimson;      // Stop loss colour
@@ -1443,7 +1445,7 @@ void DrawSignalLevels(const int idx, const int dir, const datetime t1, const dat
                       const double entry, const double sl,
                       const double tp1, const double tp2, const double tp3,
                       const string gradeTxt, const double arrowPrice, const double lots,
-                      const datetime tDot)
+                      const datetime tDot, const bool drawLevels)
   {
    color dirColor = (dir > 0) ? InpBuyColor : InpSellColor;
 
@@ -1452,7 +1454,7 @@ void DrawSignalLevels(const int idx, const int dir, const datetime t1, const dat
    if(InpLabelShowGrade) word += " " + gradeTxt;
    DrawText(ObjName("SIG", idx), tDot, arrowPrice, word, dirColor, 10);
 
-   if(!InpShowLevels) return;
+   if(!InpShowLevels || !drawLevels) return;
 
    //--- shaded risk / reward zones
    if(InpShowZones)
@@ -2128,9 +2130,11 @@ void TryTriggerSetups(const int i, const int rates_total, const datetime &time[]
            }
         }
 
-      //--- daily budget
+      //--- daily budget. Applied to history as well by default, so the dots on
+      //--- the chart are the trades you would actually have been allowed to
+      //--- take, not every setup the strategy ever found.
       RollDay(time[i]);
-      if(DayBudgetSpent()) { g_rejDaily++; continue; }
+      if(InpBudgetOnHistory && DayBudgetSpent()) { g_rejDaily++; continue; }
 
       //--- Re-price to the fill that actually happens.
       //--- With confirmation on you are filled at the close, not at the zone,
@@ -2207,11 +2211,17 @@ void TryTriggerSetups(const int i, const int rates_total, const datetime &time[]
       double lots = SuggestLots(g_pending[k].entry, g_pending[k].sl);
       double risk = MathAbs(g_pending[k].entry - g_pending[k].sl);
 
+      //--- Every signal in history gets its dots and its BUY / SELL word, which
+      //--- are buffer plots and cost nothing. The full entry/SL/TP line set is
+      //--- drawn only on recent bars - one signal is ten chart objects, and a
+      //--- few hundred of them will bog the chart down for no benefit.
+      bool drawLevels = (InpLevelsRecentBars <= 0) || (i >= rates_total - InpLevelsRecentBars);
+
       int lastIdx = MathMin(rates_total - 1, i + InpLevelBars);
       DrawSignalLevels(idx, g_pending[k].dir, time[i], time[lastIdx],
                        g_pending[k].entry, g_pending[k].sl, g_pending[k].tp1,
                        g_pending[k].tp2, g_pending[k].tp3,
-                       g_pending[k].gradeText, arrowPrice, lots, time[labelBar]);
+                       g_pending[k].gradeText, arrowPrice, lots, time[labelBar], drawLevels);
 
       if(InpTrackOutcomes)
         {
