@@ -111,7 +111,11 @@ input double           InpDisplacementATR   = 1.5;             // Displacement: 
 
 input group "=== Model: Sweep -> MSS -> FVG ==="
 input int              InpSweepValidBars    = 25;              // Sweep stays valid for x bars
+input int              InpSweepScanDepth    = 3;               // Scan this many recent resting swings per side
+input int              InpSweepReclaimBars  = 2;               // Reclaim may take up to x bars
 input int              InpMSSValidBars      = 20;              // Entry must fill within x bars of the MSS
+input int              InpMSSGraceBars      = 3;               // Keep trying to arm for x bars after the shift
+input int              InpMaxPending        = 4;               // Max setups armed at once
 input double           InpMinFVGatr         = 0.15;            // Ignore FVGs smaller than x * ATR
 input ENUM_ENTRY_MODE  InpEntryMode         = ENTRY_FVG_CE;    // Where in the FVG to enter
 
@@ -164,6 +168,7 @@ input group "=== Outcome tracking ==="
 input bool             InpTrackOutcomes     = true;            // Follow each signal to TP or SL
 input bool             InpShowOutcomeMarks  = true;            // Print TP / SL marks where they were hit
 input bool             InpShowStats         = true;            // Live win rate / expectancy panel
+input bool             InpShowDiagnostics   = true;            // Show which filter is rejecting candidates
 
 input group "=== Visuals ==="
 input bool             InpShowZones         = false;           // Shade the risk and reward zones
@@ -279,7 +284,27 @@ int          g_tp1Hits       = 0;
 SweepEvent   g_sweepBull;      // sell-side liquidity taken -> looking for longs
 SweepEvent   g_sweepBear;      // buy-side liquidity taken  -> looking for shorts
 
-Setup        g_setup;
+//--- a recorded structure shift, waiting for its arming window
+struct MSSEvent
+  {
+   int  bar;
+   int  dir;
+   bool done;
+  };
+MSSEvent     g_mss[];
+Setup        g_pending[];
+
+//--- where candidates die, so the panel can show what is starving the output
+int          g_rejNoSweep    = 0;
+int          g_rejDisp       = 0;
+int          g_rejNoFVG      = 0;
+int          g_rejRR         = 0;
+int          g_rejPD         = 0;
+int          g_rejSynth      = 0;
+int          g_rejGrade      = 0;
+int          g_armed         = 0;
+int          g_expired       = 0;
+int          g_slBeforeEntry = 0;
 
 int          g_trendMajor    = 0;   // +1 / -1 / 0
 int          g_trendInternal = 0;
@@ -597,16 +622,6 @@ void ClearSweep(SweepEvent &s)
    s.level = 0.0;   s.extreme = 0.0; s.dir = 0; s.age = 0;
   }
 
-//--- explicit field reset: ZeroMemory must not be used on a struct that
-//--- contains strings, it corrupts the string references
-void ClearSetup(Setup &s)
-  {
-   s.active = false; s.dir = 0;
-   s.entry = 0.0; s.sl = 0.0; s.tp1 = 0.0; s.tp2 = 0.0; s.tp3 = 0.0;
-   s.mssBar = -1; s.expiryBar = -1; s.sweepExtreme = 0.0;
-   s.grade = 0; s.gradeText = ""; s.reason = ""; s.watchAlerted = false;
-  }
-
 void ResetState()
   {
    ArrayResize(g_major, 0);
@@ -622,7 +637,12 @@ void ResetState()
 
    ClearSweep(g_sweepBull);
    ClearSweep(g_sweepBear);
-   ClearSetup(g_setup);
+   ArrayResize(g_mss, 0);
+   ArrayResize(g_pending, 0);
+
+   g_rejNoSweep = 0; g_rejDisp = 0; g_rejNoFVG = 0; g_rejRR = 0;
+   g_rejPD = 0; g_rejSynth = 0; g_rejGrade = 0;
+   g_armed = 0; g_expired = 0; g_slBeforeEntry = 0;
 
    g_trendMajor    = 0;
    g_trendInternal = 0;
@@ -794,47 +814,79 @@ int FindFVGInLeg(const int dir, const int barFrom, const int barTo)
 
 //+------------------------------------------------------------------+
 //| Sweep detection.                                                 |
-//| A sweep = price trades through a resting swing and closes back    |
-//| on the original side within the same bar. On synthetics this is   |
-//| a failed-breakout geometry rather than a real stop raid, but the  |
-//| statistical shape is the same.                                    |
+//| A sweep = price trades through a resting swing and then reclaims  |
+//| it. On synthetics this is failed-breakout geometry rather than a  |
+//| real stop raid, but the statistical shape is the same.            |
+//|                                                                   |
+//| Two deliberate looseners, because the strict version starves the  |
+//| engine of candidates:                                             |
+//|   * several recent resting swings are scanned, not only the last  |
+//|   * the reclaim may take a few bars rather than closing back       |
+//|     inside on the sweeping bar itself                             |
 //+------------------------------------------------------------------+
-void DetectSweeps(const int i, const datetime &time[], const double &high[],
-                  const double &low[], const double &close[])
+void ScanSweepSide(const int i, const bool wantHigh, const datetime &time[],
+                   const double &high[], const double &low[], const double &close[])
   {
-   //--- sell-side taken: wick below a swing low, close back above it
-   int il = LastUnbroken(g_major, false);
-   if(il >= 0 && g_major[il].bar < i)
+   int checked = 0;
+   for(int k = ArraySize(g_major) - 1; k >= 0 && checked < InpSweepScanDepth; k--)
      {
-      double lvl = g_major[il].price;
-      if(low[i] < lvl && close[i] > lvl)
+      if(g_major[k].isHigh != wantHigh) continue;
+      if(g_major[k].broken)             continue;
+      if(g_major[k].bar >= i)           continue;
+      checked++;
+
+      double lvl = g_major[k].price;
+
+      if(!wantHigh)
         {
+         //--- sell-side: price must have traded below the level within the
+         //--- reclaim window, and this bar must close back above it
+         if(close[i] <= lvl) continue;
+
+         double deepest = 0.0;
+         bool   pierced = false;
+         for(int b = i; b >= i - InpSweepReclaimBars && b > g_major[k].bar; b--)
+            if(low[b] < lvl)
+              { pierced = true; if(deepest == 0.0 || low[b] < deepest) deepest = low[b]; }
+         if(!pierced) continue;
+
          g_sweepBull.valid   = true;
          g_sweepBull.bar     = i;
          g_sweepBull.time    = time[i];
          g_sweepBull.level   = lvl;
-         g_sweepBull.extreme = low[i];
+         g_sweepBull.extreme = deepest;
          g_sweepBull.dir     = 1;
-         g_sweepBull.age     = i - g_major[il].bar;
+         g_sweepBull.age     = i - g_major[k].bar;
+         return;
         }
-     }
-
-   //--- buy-side taken: wick above a swing high, close back below it
-   int ih = LastUnbroken(g_major, true);
-   if(ih >= 0 && g_major[ih].bar < i)
-     {
-      double lvl = g_major[ih].price;
-      if(high[i] > lvl && close[i] < lvl)
+      else
         {
+         if(close[i] >= lvl) continue;
+
+         double highest = 0.0;
+         bool   pierced = false;
+         for(int b = i; b >= i - InpSweepReclaimBars && b > g_major[k].bar; b--)
+            if(high[b] > lvl)
+              { pierced = true; if(high[b] > highest) highest = high[b]; }
+         if(!pierced) continue;
+
          g_sweepBear.valid   = true;
          g_sweepBear.bar     = i;
          g_sweepBear.time    = time[i];
          g_sweepBear.level   = lvl;
-         g_sweepBear.extreme = high[i];
+         g_sweepBear.extreme = highest;
          g_sweepBear.dir     = -1;
-         g_sweepBear.age     = i - g_major[ih].bar;
+         g_sweepBear.age     = i - g_major[k].bar;
+         return;
         }
      }
+  }
+
+void DetectSweeps(const int i, const datetime &time[], const double &high[],
+                  const double &low[], const double &close[])
+  {
+   ScanSweepSide(i, false, time, high, low, close);   // sell-side -> longs
+   ScanSweepSide(i, true,  time, high, low, close);   // buy-side  -> shorts
 
    //--- expire stale sweeps
    if(g_sweepBull.valid && (i - g_sweepBull.bar) > InpSweepValidBars) g_sweepBull.valid = false;
@@ -927,52 +979,84 @@ int GradeSetup(const int dir, const double entry, const double sl, const double 
                const double disp, const int fvgIdx, const SweepEvent &sw,
                string &reason)
   {
-   int score = 25;                       // base: sweep + MSS + FVG all present
+//--- Continuous scoring, and no free base score.
+//--- The earlier version handed out 25 points simply for the pattern existing,
+//--- which let a mediocre setup coast to a passing grade. Here every point has
+//--- to be earned by a measurable property, and each component scales with how
+//--- good it actually is instead of stepping over a threshold.
+   double score = 0.0;
    string parts = "";
 
-   //--- major trend alignment
-   if(g_trendMajor == dir) { score += 20; parts += "HTF trend aligned; "; }
-   else                    { parts += "counter-trend; "; }
-
-   //--- premium / discount
-   double lo, hi;
-   if(DealingRange(lo, hi))
-     {
-      double eq = (lo + hi) * 0.5;
-      bool good = (dir > 0) ? (entry < eq) : (entry > eq);
-      if(good) { score += 15; parts += (dir > 0 ? "entry in discount; " : "entry in premium; "); }
-      else     { parts += (dir > 0 ? "entry in premium; " : "entry in discount; "); }
-     }
-
-   //--- displacement quality
-   if(disp >= g_dispATR * 1.5)      { score += 15; parts += "strong displacement; "; }
-   else if(disp >= g_dispATR)       { score += 8;  parts += "displacement ok; "; }
-
-   //--- gap quality
-   if(fvgIdx >= 0)
-     {
-      double atr  = (BufATR[g_fvg[fvgIdx].bar] > 0.0) ? BufATR[g_fvg[fvgIdx].bar] : 0.0;
-      double size = g_fvg[fvgIdx].top - g_fvg[fvgIdx].bottom;
-      if(atr > 0.0 && size >= atr * 0.5) { score += 10; parts += "clean FVG; "; }
-      else                               { score += 5; }
-     }
-
-   //--- room to the draw
+   double atr = (fvgIdx >= 0 && BufATR[g_fvg[fvgIdx].bar] > 0.0)
+                ? BufATR[g_fvg[fvgIdx].bar] : 0.0;
    double risk = MathAbs(entry - sl);
+
+//--- 1. structure alignment, up to 25
+   if(g_trendMajor == dir)
+     {
+      score += 18.0;
+      parts += "HTF trend aligned; ";
+      if(g_trendInternal == dir) { score += 7.0; parts += "both tiers agree; "; }
+     }
+   else
+      parts += "counter-trend; ";
+
+//--- 2. premium / discount, up to 15, scaled by depth into the correct half
+   double lo, hi;
+   if(DealingRange(lo, hi) && hi > lo)
+     {
+      double pos  = (entry - lo) / (hi - lo);          // 0 = low, 1 = high
+      double edge = (dir > 0) ? (0.5 - pos) : (pos - 0.5);
+      if(edge > 0.0)
+        {
+         score += MathMin(15.0, edge * 30.0);
+         parts += StringFormat("%s %.0f%%; ", (dir > 0 ? "discount" : "premium"),
+                               edge * 200.0);
+        }
+      else
+         parts += (dir > 0 ? "entry in premium; " : "entry in discount; ");
+     }
+
+//--- 3. displacement, up to 20, saturating at twice the required strength
+   if(g_dispATR > 0.0)
+     {
+      double q = MathMin(1.0, disp / (g_dispATR * 2.0));
+      score += 20.0 * q;
+      parts += StringFormat("displacement %.1fATR; ", disp);
+     }
+
+//--- 4. gap quality, up to 12
+   if(fvgIdx >= 0 && atr > 0.0)
+     {
+      double size = (g_fvg[fvgIdx].top - g_fvg[fvgIdx].bottom) / atr;
+      score += MathMin(12.0, size * 16.0);
+      parts += StringFormat("FVG %.2fATR; ", size);
+     }
+
+//--- 5. room to the draw, up to 15
    if(risk > 0.0 && dol > 0.0)
      {
       double rr = MathAbs(dol - entry) / risk;
-      if(rr >= InpMinRR * 1.5) { score += 10; parts += StringFormat("%.1fR to draw; ", rr); }
-      else if(rr >= InpMinRR)  { score += 5;  parts += StringFormat("%.1fR to draw; ", rr); }
+      score += MathMin(15.0, (rr / 4.0) * 15.0);
+      parts += StringFormat("%.1fR to draw; ", rr);
+     }
+   else
+      parts += "no resting draw above; ";
+
+//--- 6. sweep decisiveness, up to 8: how far past the level the wick reached
+   if(atr > 0.0 && sw.level != 0.0)
+     {
+      double depth = MathAbs(sw.level - sw.extreme) / atr;
+      score += MathMin(8.0, depth * 16.0);
+      parts += StringFormat("swept %.2fATR deep; ", depth);
      }
 
-   //--- how long the swept level had been resting
-   if(sw.age >= InpSweepValidBars) { score += 5; parts += "old level swept; "; }
+//--- 7. how long the taken level had been resting, up to 5
+   score += MathMin(5.0, (double)sw.age / (double)MathMax(1, InpSweepValidBars) * 5.0);
 
-   //--- synthetic spike asymmetry.
-   //--- Spike style trades the jump itself; drip style trades the grind between
-   //--- jumps, which runs the other way. They are opposite trades, so the bias
-   //--- has to follow whichever the trader has chosen.
+//--- 8. synthetic spike asymmetry.
+//--- Spike style trades the jump; drip style trades the grind between jumps.
+//--- They are opposite trades, so the bias follows whichever the trader chose.
    int spikeDir = EffectiveSpikeDir();
    if(spikeDir != 0 && InpSynthStyle != STYLE_BOTH)
      {
@@ -984,19 +1068,19 @@ int GradeSetup(const int dir, const double entry, const double sl, const double 
         { score -= InpSynthBiasScore; parts += (drip ? "against the grind; " : "against spike direction; "); }
      }
 
-   //--- post-spike continuation: after the spike, the instrument returns to its grind
+//--- post-spike continuation: after a jump the instrument returns to its grind
    if(spikeDir != 0 && g_lastSpikeBar >= 0 &&
       (fvgIdx < 0 || (g_fvg[fvgIdx].bar - g_lastSpikeBar) <= InpSweepValidBars) &&
       dir == -g_lastSpikeDir)
-     { score += 5; parts += "post-spike continuation; "; }
+     { score += 5.0; parts += "post-spike continuation; "; }
 
-   //--- a driftless random walk (Step Index, FlipX) offers no directional edge
+//--- a driftless random walk (Step Index, FlipX) offers no directional edge
    if(g_family == FAM_RANDOM)
-     { score -= 15; parts += g_familyName + " - random walk, no directional edge; "; }
+     { score -= 15.0; parts += g_familyName + " - random walk, no directional edge; "; }
 
-   score = (int)MathMax(0, MathMin(100, score));
+   int final = (int)MathRound(MathMax(0.0, MathMin(100.0, score)));
    reason = parts;
-   return score;
+   return final;
   }
 
 string GradeText(const int score)
@@ -1328,27 +1412,57 @@ void FireAlert(const string kind, const string text)
   }
 
 //+------------------------------------------------------------------+
-//| Arm a setup once the MSS is confirmed                            |
+//| Setup pipeline.                                                  |
+//|                                                                   |
+//| A structure shift is recorded as an MSS event, and arming is then |
+//| attempted on that bar AND for a few bars afterwards, because the  |
+//| fair value gap of an impulse frequently completes one or two bars |
+//| after the break itself. Several setups may be armed at once - the |
+//| earlier single-slot version silently discarded every opportunity  |
+//| that appeared while one setup was waiting to fill, which is the   |
+//| main reason a strict chain like this produces almost no signals.  |
+//|                                                                   |
+//| Every rejection is counted so the panel can show exactly which    |
+//| filter is starving the output.                                    |
 //+------------------------------------------------------------------+
-void TryArmSetup(const int i, const int dir, const double &close[])
+void PushMSS(const int bar, const int dir)
   {
-   //--- one armed setup at a time; a live one is not discarded for a newer idea
-   if(g_setup.active && i <= g_setup.expiryBar) return;
+   int n = ArraySize(g_mss);
+   ArrayResize(g_mss, n + 1);
+   g_mss[n].bar  = bar;
+   g_mss[n].dir  = dir;
+   g_mss[n].done = false;
+
+   if(ArraySize(g_mss) > 64) ArrayRemove(g_mss, 0, ArraySize(g_mss) - 64);
+  }
+
+int CountActivePending()
+  {
+   int c = 0;
+   for(int k = 0; k < ArraySize(g_pending); k++)
+      if(g_pending[k].active) c++;
+   return c;
+  }
+
+//--- attempt to build a setup from one MSS event, evaluated at bar i
+bool TryArmFromMSS(const int dir, const int i, const double &close[])
+  {
+   if(CountActivePending() >= InpMaxPending) return false;
 
    SweepEvent sw;
    if(dir > 0) sw = g_sweepBull;
    else        sw = g_sweepBear;
 
-   if(!sw.valid) return;
-   if(i <= sw.bar) return;
+   if(!sw.valid)   { g_rejNoSweep++; return false; }
+   if(i <= sw.bar) { g_rejNoSweep++; return false; }
 
    //--- the impulse away from the swept wick
    double disp = DisplacementStrength(i, sw.extreme, close);
-   if(disp < g_dispATR) return;
+   if(disp < g_dispATR) { g_rejDisp++; return false; }
 
    //--- the gap the displacement left behind
    int f = FindFVGInLeg(dir, sw.bar, i);
-   if(f < 0) return;
+   if(f < 0) { g_rejNoFVG++; return false; }
 
    //--- entry inside that gap
    double top   = g_fvg[f].top, bot = g_fvg[f].bottom;
@@ -1358,12 +1472,11 @@ void TryArmSetup(const int i, const int dir, const double &close[])
 
    //--- stop beyond the wick that did the sweeping
    double atr = BufATR[i];
-   if(atr <= 0.0) return;
+   if(atr <= 0.0) return false;
    double buffer = InpSLbufferATR * atr + InpSpreadMult * SpreadPrice();
    double sl     = (dir > 0) ? (sw.extreme - buffer) : (sw.extreme + buffer);
 
-   //--- respect the broker's minimum stop distance for this symbol.
-   //--- Without this the level is structurally correct and untradeable.
+   //--- respect the broker's minimum stop distance for this symbol
    double minDist = MinStopDistance();
    if(minDist > 0.0 && MathAbs(entry - sl) < minDist)
       sl = (dir > 0) ? (entry - minDist) : (entry + minDist);
@@ -1372,22 +1485,18 @@ void TryArmSetup(const int i, const int dir, const double &close[])
    sl    = NormalizePrice(sl);
 
    double risk = MathAbs(entry - sl);
-   if(risk <= 0.0) return;
+   if(risk <= 0.0) return false;
 
    //--- the draw: nearest opposing resting liquidity
    double dol = NearestOpposingLiquidity(dir, entry);
-   if(dol > 0.0)
-     {
-      double rr = MathAbs(dol - entry) / risk;
-      if(rr < InpMinRR) return;         // no room to run before the next pool
-     }
+   if(dol > 0.0 && (MathAbs(dol - entry) / risk) < InpMinRR)
+     { g_rejRR++; return false; }
 
    double tp1 = (dir > 0) ? entry + InpTP1_R * risk : entry - InpTP1_R * risk;
    double tp2 = (dol > 0.0) ? dol
                             : ((dir > 0) ? entry + 2.0 * risk : entry - 2.0 * risk);
    double tp3 = (dir > 0) ? entry + InpTP3_R * risk : entry - InpTP3_R * risk;
 
-   //--- targets must clear the same minimum distance, and sit on the tick grid
    if(minDist > 0.0)
      {
       if(dir > 0)
@@ -1414,8 +1523,8 @@ void TryArmSetup(const int i, const int dir, const double &close[])
       if(DealingRange(lo, hi))
         {
          double eq = (lo + hi) * 0.5;
-         if(dir > 0 && entry >= eq) return;
-         if(dir < 0 && entry <= eq) return;
+         if((dir > 0 && entry >= eq) || (dir < 0 && entry <= eq))
+           { g_rejPD++; return false; }
         }
      }
 
@@ -1424,162 +1533,195 @@ void TryArmSetup(const int i, const int dir, const double &close[])
    if(InpSynthBiasFilter && sdir != 0 && InpSynthStyle != STYLE_BOTH)
      {
       int favored = (InpSynthStyle == STYLE_DRIP) ? -sdir : sdir;
-      if(dir != favored) return;
+      if(dir != favored) { g_rejSynth++; return false; }
      }
 
    string reason;
    int score = GradeSetup(dir, entry, sl, dol, disp, f, sw, reason);
-   if(!GradePasses(score)) return;
+   if(!GradePasses(score)) { g_rejGrade++; return false; }
 
-   g_setup.active       = true;
-   g_setup.dir          = dir;
-   g_setup.entry        = entry;
-   g_setup.sl           = sl;
-   g_setup.tp1          = tp1;
-   g_setup.tp2          = tp2;
-   g_setup.tp3          = tp3;
-   g_setup.mssBar       = i;
-   g_setup.expiryBar    = i + InpMSSValidBars;
-   g_setup.sweepExtreme = sw.extreme;
-   g_setup.grade        = score;
-   g_setup.gradeText    = GradeText(score);
-   g_setup.reason       = reason;
-   g_setup.watchAlerted = false;
+   //--- take a free slot
+   int slot = -1;
+   for(int k = 0; k < ArraySize(g_pending); k++)
+      if(!g_pending[k].active) { slot = k; break; }
+   if(slot < 0)
+     {
+      slot = ArraySize(g_pending);
+      ArrayResize(g_pending, slot + 1);
+     }
+
+   g_pending[slot].active       = true;
+   g_pending[slot].dir          = dir;
+   g_pending[slot].entry        = entry;
+   g_pending[slot].sl           = sl;
+   g_pending[slot].tp1          = tp1;
+   g_pending[slot].tp2          = tp2;
+   g_pending[slot].tp3          = tp3;
+   g_pending[slot].mssBar       = i;
+   g_pending[slot].expiryBar    = i + InpMSSValidBars;
+   g_pending[slot].sweepExtreme = sw.extreme;
+   g_pending[slot].grade        = score;
+   g_pending[slot].gradeText    = GradeText(score);
+   g_pending[slot].reason       = reason;
+   g_pending[slot].watchAlerted = false;
+
+   g_armed++;
+   return true;
+  }
+
+//--- work the MSS queue: each event gets its arming window, not just one bar
+void ProcessMSS(const int i, const double &close[])
+  {
+   for(int k = ArraySize(g_mss) - 1; k >= 0; k--)
+     {
+      if(g_mss[k].done) continue;
+      if(i < g_mss[k].bar) continue;
+      if(i > g_mss[k].bar + InpMSSGraceBars) { g_mss[k].done = true; continue; }
+
+      if(TryArmFromMSS(g_mss[k].dir, i, close))
+         g_mss[k].done = true;
+     }
   }
 
 //+------------------------------------------------------------------+
-//| Emit a signal when price fills the armed entry                   |
+//| Emit signals when price fills an armed entry                     |
 //+------------------------------------------------------------------+
-void TryTriggerSetup(const int i, const int rates_total, const datetime &time[],
-                     const double &high[], const double &low[])
+void TryTriggerSetups(const int i, const int rates_total, const datetime &time[],
+                      const double &high[], const double &low[])
   {
-   if(!g_setup.active) return;
-   if(i <= g_setup.mssBar) return;
-
-   //--- invalidated: stop taken out before the entry ever filled
-   if((g_setup.dir > 0 && low[i]  <= g_setup.sl) ||
-      (g_setup.dir < 0 && high[i] >= g_setup.sl))
-     { g_setup.active = false; return; }
-
-   //--- expired
-   if(i > g_setup.expiryBar) { g_setup.active = false; return; }
-
-   bool filled = (g_setup.dir > 0) ? (low[i] <= g_setup.entry)
-                                   : (high[i] >= g_setup.entry);
-   if(!filled) return;
-
-   //--- fired on the close of this bar and never revised
-   g_signalCount++;
-   int idx = g_signalCount;
-
-   double atr = BufATR[i];
-   double arrowPrice = (g_setup.dir > 0) ? (low[i] - 0.6 * atr) : (high[i] + 0.6 * atr);
-   if(g_setup.dir > 0) BufBuy[i]  = arrowPrice;
-   else                BufSell[i] = arrowPrice;
-
-   double lots = SuggestLots(g_setup.entry, g_setup.sl);
-   double risk = MathAbs(g_setup.entry - g_setup.sl);
-
-   int lastIdx = MathMin(rates_total - 1, i + InpLevelBars);
-   DrawSignalLevels(idx, g_setup.dir, time[i], time[lastIdx],
-                    g_setup.entry, g_setup.sl, g_setup.tp1, g_setup.tp2, g_setup.tp3,
-                    g_setup.gradeText, arrowPrice, lots);
-
-   //--- register the signal so the outcome tracker can follow it forward
-   if(InpTrackOutcomes)
+   for(int k = 0; k < ArraySize(g_pending); k++)
      {
-      int n = ArraySize(g_trades);
-      ArrayResize(g_trades, n + 1);
-      g_trades[n].idx       = idx;
-      g_trades[n].dir       = g_setup.dir;
-      g_trades[n].entryBar  = i;
-      g_trades[n].entryTime = time[i];
-      g_trades[n].entry     = g_setup.entry;
-      g_trades[n].sl        = g_setup.sl;
-      g_trades[n].tp1       = g_setup.tp1;
-      g_trades[n].tp2       = g_setup.tp2;
-      g_trades[n].tp3       = g_setup.tp3;
-      g_trades[n].risk      = risk;
-      g_trades[n].grade     = g_setup.grade;
-      g_trades[n].gradeText = g_setup.gradeText;
-      g_trades[n].open      = true;
-      g_trades[n].hitTP1    = false;
-      g_trades[n].hitTP2    = false;
-      g_trades[n].hitTP3    = false;
-      g_trades[n].result    = 0;
-      g_trades[n].rMultiple = 0.0;
+      if(!g_pending[k].active) continue;
+      if(i <= g_pending[k].mssBar) continue;
+
+      //--- invalidated: stop taken out before the entry ever filled
+      if((g_pending[k].dir > 0 && low[i]  <= g_pending[k].sl) ||
+         (g_pending[k].dir < 0 && high[i] >= g_pending[k].sl))
+        { g_pending[k].active = false; g_slBeforeEntry++; continue; }
+
+      if(i > g_pending[k].expiryBar)
+        { g_pending[k].active = false; g_expired++; continue; }
+
+      bool filled = (g_pending[k].dir > 0) ? (low[i]  <= g_pending[k].entry)
+                                           : (high[i] >= g_pending[k].entry);
+      if(!filled) continue;
+
+      //--- fired on the close of this bar and never revised
+      g_signalCount++;
+      int idx = g_signalCount;
+
+      double atr = BufATR[i];
+      double arrowPrice = (g_pending[k].dir > 0) ? (low[i] - 0.6 * atr)
+                                                 : (high[i] + 0.6 * atr);
+      if(g_pending[k].dir > 0) BufBuy[i]  = arrowPrice;
+      else                     BufSell[i] = arrowPrice;
+
+      double lots = SuggestLots(g_pending[k].entry, g_pending[k].sl);
+      double risk = MathAbs(g_pending[k].entry - g_pending[k].sl);
+
+      int lastIdx = MathMin(rates_total - 1, i + InpLevelBars);
+      DrawSignalLevels(idx, g_pending[k].dir, time[i], time[lastIdx],
+                       g_pending[k].entry, g_pending[k].sl, g_pending[k].tp1,
+                       g_pending[k].tp2, g_pending[k].tp3,
+                       g_pending[k].gradeText, arrowPrice, lots);
+
+      if(InpTrackOutcomes)
+        {
+         int n = ArraySize(g_trades);
+         ArrayResize(g_trades, n + 1);
+         g_trades[n].idx       = idx;
+         g_trades[n].dir       = g_pending[k].dir;
+         g_trades[n].entryBar  = i;
+         g_trades[n].entryTime = time[i];
+         g_trades[n].entry     = g_pending[k].entry;
+         g_trades[n].sl        = g_pending[k].sl;
+         g_trades[n].tp1       = g_pending[k].tp1;
+         g_trades[n].tp2       = g_pending[k].tp2;
+         g_trades[n].tp3       = g_pending[k].tp3;
+         g_trades[n].risk      = risk;
+         g_trades[n].grade     = g_pending[k].grade;
+         g_trades[n].gradeText = g_pending[k].gradeText;
+         g_trades[n].open      = true;
+         g_trades[n].hitTP1    = false;
+         g_trades[n].hitTP2    = false;
+         g_trades[n].hitTP3    = false;
+         g_trades[n].result    = 0;
+         g_trades[n].rMultiple = 0.0;
+        }
+
+      double rr2 = (risk > 0.0) ? MathAbs(g_pending[k].tp2 - g_pending[k].entry) / risk : 0.0;
+      g_lastSignalTxt = StringFormat("%s %s @ %s  SL %s  TP2 %s  (%.1fR)",
+                                     (g_pending[k].dir > 0 ? "BUY" : "SELL"),
+                                     g_pending[k].gradeText,
+                                     DoubleToString(g_pending[k].entry, g_digits),
+                                     DoubleToString(g_pending[k].sl,    g_digits),
+                                     DoubleToString(g_pending[k].tp2,   g_digits),
+                                     rr2);
+
+      bool isLive = (g_liveMode && i == rates_total - 2);
+      if(isLive)
+         JournalSignal(time[i], g_pending[k].dir, g_pending[k].gradeText, g_pending[k].grade,
+                       g_pending[k].entry, g_pending[k].sl, g_pending[k].tp1,
+                       g_pending[k].tp2, g_pending[k].tp3, g_pending[k].reason);
+
+      if(InpAlertTrigger && isLive && time[i] != g_lastAlertBar)
+        {
+         g_lastAlertBar = time[i];
+         FireAlert("TRIGGER",
+                   StringFormat("%s | entry %s | SL %s | TP1 %s | TP2 %s | TP3 %s | lots %s | %s",
+                                g_lastSignalTxt,
+                                DoubleToString(g_pending[k].entry, g_digits),
+                                DoubleToString(g_pending[k].sl,    g_digits),
+                                DoubleToString(g_pending[k].tp1,   g_digits),
+                                DoubleToString(g_pending[k].tp2,   g_digits),
+                                DoubleToString(g_pending[k].tp3,   g_digits),
+                                DoubleToString(lots, 2),
+                                g_pending[k].reason));
+        }
+
+      g_pending[k].active = false;
      }
-
-   double rr2  = (risk > 0.0) ? MathAbs(g_setup.tp2 - g_setup.entry) / risk : 0.0;
-
-   g_lastSignalTxt = StringFormat("%s %s @ %s  SL %s  TP2 %s  (%.1fR)",
-                                  (g_setup.dir > 0 ? "BUY" : "SELL"),
-                                  g_setup.gradeText,
-                                  DoubleToString(g_setup.entry, g_digits),
-                                  DoubleToString(g_setup.sl,    g_digits),
-                                  DoubleToString(g_setup.tp2,   g_digits),
-                                  rr2);
-
-   //--- the journal records live signals only. Writing history rows too would
-   //--- re-append the whole file on every reload and destroy its value as proof.
-   bool isLive = (g_liveMode && i == rates_total - 2);
-   if(isLive)
-      JournalSignal(time[i], g_setup.dir, g_setup.gradeText, g_setup.grade,
-                    g_setup.entry, g_setup.sl, g_setup.tp1, g_setup.tp2, g_setup.tp3,
-                    g_setup.reason);
-
-   //--- alert only for the bar that just closed in real time, never for history
-   if(InpAlertTrigger && isLive && time[i] != g_lastAlertBar)
-     {
-      g_lastAlertBar = time[i];
-      FireAlert("TRIGGER",
-                StringFormat("%s | entry %s | SL %s | TP1 %s | TP2 %s | TP3 %s | lots %s | %s",
-                             g_lastSignalTxt,
-                             DoubleToString(g_setup.entry, g_digits),
-                             DoubleToString(g_setup.sl,    g_digits),
-                             DoubleToString(g_setup.tp1,   g_digits),
-                             DoubleToString(g_setup.tp2,   g_digits),
-                             DoubleToString(g_setup.tp3,   g_digits),
-                             DoubleToString(lots, 2),
-                             g_setup.reason));
-     }
-
-   g_setup.active = false;
   }
 
 //+------------------------------------------------------------------+
-//| WATCH alert: setup armed and price approaching the entry         |
+//| WATCH alerts: a setup is armed and price is approaching it       |
 //+------------------------------------------------------------------+
-void MaybeWatchAlert(const int i, const int rates_total, const datetime &time[],
-                     const double &close[])
+void MaybeWatchAlerts(const int i, const int rates_total, const datetime &time[],
+                      const double &close[])
   {
-   if(!InpAlertWatch)        return;
-   if(!g_liveMode)           return;          // never alert while rebuilding history
-   if(!g_setup.active)       return;
-   if(g_setup.watchAlerted)  return;
-   if(i != rates_total - 2)  return;          // only the freshly closed bar
-   if(time[i] == g_lastWatchBar) return;
+   if(!InpAlertWatch)       return;
+   if(!g_liveMode)          return;
+   if(i != rates_total - 2) return;
 
    double atr = BufATR[i];
    if(atr <= 0.0) return;
-   if(MathAbs(close[i] - g_setup.entry) > 1.5 * atr) return;
 
-   g_setup.watchAlerted = true;
-   g_lastWatchBar = time[i];
+   for(int k = 0; k < ArraySize(g_pending); k++)
+     {
+      if(!g_pending[k].active)      continue;
+      if(g_pending[k].watchAlerted) continue;
+      if(MathAbs(close[i] - g_pending[k].entry) > 1.5 * atr) continue;
 
-   FireAlert("WATCH",
-             StringFormat("%s %s setup armed - entry %s | SL %s | TP2 %s | %s",
-                          (g_setup.dir > 0 ? "BUY" : "SELL"),
-                          g_setup.gradeText,
-                          DoubleToString(g_setup.entry, g_digits),
-                          DoubleToString(g_setup.sl,    g_digits),
-                          DoubleToString(g_setup.tp2,   g_digits),
-                          g_setup.reason));
+      g_pending[k].watchAlerted = true;
+      g_lastWatchBar = time[i];
+
+      FireAlert("WATCH",
+                StringFormat("%s %s setup armed - entry %s | SL %s | TP2 %s | %s",
+                             (g_pending[k].dir > 0 ? "BUY" : "SELL"),
+                             g_pending[k].gradeText,
+                             DoubleToString(g_pending[k].entry, g_digits),
+                             DoubleToString(g_pending[k].sl,    g_digits),
+                             DoubleToString(g_pending[k].tp2,   g_digits),
+                             g_pending[k].reason));
+     }
   }
+
 
 //+------------------------------------------------------------------+
 //| Panel                                                            |
 //+------------------------------------------------------------------+
+void UpdateDiagnostics();
+
 void UpdatePanel()
   {
    if(!InpShowPanel) return;
@@ -1664,6 +1806,55 @@ void UpdatePanel()
                                 trend, g_signalCount, stats, g_lastSignalTxt, synth));
    ObjectSetInteger(0, name, OBJPROP_COLOR,
                     (g_trendMajor > 0) ? InpBuyColor : (g_trendMajor < 0 ? InpSellColor : clrGray));
+
+   UpdateDiagnostics();
+  }
+
+//+------------------------------------------------------------------+
+//| Diagnostics line.                                                |
+//|                                                                   |
+//| When the engine prints nothing, the useful question is not "why   |
+//| is it broken" but "which filter ate the candidates". This counts  |
+//| every rejection by stage, so the answer is on the chart.          |
+//+------------------------------------------------------------------+
+void UpdateDiagnostics()
+  {
+   if(!InpShowDiagnostics) return;
+
+   string name = PREFIX + "DIAG";
+   if(ObjectFind(0, name) < 0)
+     {
+      ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+      ObjectSetInteger(0, name, OBJPROP_XDISTANCE, 12);
+      ObjectSetInteger(0, name, OBJPROP_YDISTANCE,
+                       (InpShowHeader ? (26 + 4 * (InpHdrFontSize + 6)) : 20) + 16);
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+      ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 8);
+      ObjectSetInteger(0, name, OBJPROP_COLOR, clrGray);
+     }
+
+   int rejected = g_rejNoSweep + g_rejDisp + g_rejNoFVG + g_rejRR
+                + g_rejPD + g_rejSynth + g_rejGrade;
+
+   //--- name the stage that is doing the most damage
+   string worst = "none";
+   int    worstN = 0;
+   if(g_rejNoSweep > worstN) { worstN = g_rejNoSweep; worst = "no sweep"; }
+   if(g_rejDisp    > worstN) { worstN = g_rejDisp;    worst = "displacement too weak"; }
+   if(g_rejNoFVG   > worstN) { worstN = g_rejNoFVG;   worst = "no FVG in the impulse"; }
+   if(g_rejRR      > worstN) { worstN = g_rejRR;      worst = "draw too close (Min RR)"; }
+   if(g_rejPD      > worstN) { worstN = g_rejPD;      worst = "premium/discount filter"; }
+   if(g_rejSynth   > worstN) { worstN = g_rejSynth;   worst = "spike-direction filter"; }
+   if(g_rejGrade   > worstN) { worstN = g_rejGrade;   worst = "below minimum grade"; }
+
+   ObjectSetString(0, name, OBJPROP_TEXT,
+                   StringFormat("candidates rejected %d  [sweep %d | disp %d | fvg %d | RR %d | PD %d | spike %d | grade %d]"
+                                "   armed %d  expired %d  stopped-pre-entry %d   biggest blocker: %s",
+                                rejected, g_rejNoSweep, g_rejDisp, g_rejNoFVG, g_rejRR,
+                                g_rejPD, g_rejSynth, g_rejGrade,
+                                g_armed, g_expired, g_slBeforeEntry, worst));
   }
 
 //+------------------------------------------------------------------+
@@ -1849,17 +2040,19 @@ int OnCalculate(const int rates_total,
                   tag, (majBreak > 0 ? InpBuyColor : InpSellColor), 7);
         }
 
-      //--- the model: an internal shift in the direction opposite the sweep
-      if(intBreak > 0) TryArmSetup(i,  1, close);
-      if(intBreak < 0) TryArmSetup(i, -1, close);
+      //--- the model: an internal shift in the direction opposite the sweep.
+      //--- The shift is queued, then arming is retried across a grace window,
+      //--- because the impulse FVG often completes a bar or two after the break.
+      if(intBreak != 0) PushMSS(i, intBreak);
+      ProcessMSS(i, close);
 
       //--- follow already-emitted signals to their outcome before a new one fires,
       //--- so a signal never resolves itself on its own entry bar
       UpdateTrades(i, time, high, low);
 
       //--- entry fill
-      MaybeWatchAlert(i, rates_total, time, close);
-      TryTriggerSetup(i, rates_total, time, high, low);
+      MaybeWatchAlerts(i, rates_total, time, close);
+      TryTriggerSetups(i, rates_total, time, high, low);
      }
 
    //--- keep the live bar clean

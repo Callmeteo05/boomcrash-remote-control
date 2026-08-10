@@ -137,6 +137,29 @@ signal read only bars that had already closed at that moment.
 The panel shows resolved count, win rate, expectancy in R, profit factor and TP1 hits,
 updating live as trades resolve.
 
+## Too few signals? Read the diagnostics line
+
+The signal chain is a long AND: sweep, then displacement, then a gap, then room to the
+draw, then grade. Any one link can silently eat everything, and "the indicator prints
+nothing" is not a useful diagnosis. So every rejection is counted by stage and shown
+under the panel:
+
+```
+candidates rejected 812  [sweep 640 | disp 92 | fvg 61 | RR 14 | PD 0 | spike 5 | grade 0]
+   armed 23  expired 9  stopped-pre-entry 4   biggest blocker: no sweep
+```
+
+Read the blocker, then loosen that one input rather than everything at once:
+
+| Biggest blocker | Loosen this |
+|---|---|
+| `no sweep` | raise `Sweep scan depth` (3 → 5) or `Reclaim bars` (2 → 3), or lower the preset's swing lookback |
+| `displacement too weak` | lower `Displacement ATR` (1.5 → 1.2) |
+| `no FVG in the impulse` | lower `Min FVG ATR` (0.15 → 0.08) or raise `MSS grace bars` |
+| `draw too close (Min RR)` | lower `Min RR` (2.0 → 1.5) |
+| `below minimum grade` | drop `Minimum grade` to `B and better` |
+| high `expired` | raise `MSS valid bars`, or use `FVG near edge` entry so it fills more often |
+
 ## Key inputs
 
 | Input | Effect |
@@ -152,10 +175,21 @@ updating live as trades resolve.
 
 ## Grading
 
-Points accumulate from: HTF trend alignment, premium/discount side, displacement
-strength, gap cleanliness, room to the draw, age of the swept level, and — on
-synthetics — whether the trade runs with or against the side of the spike cycle you
-chose to trade.
+Scoring is **continuous, with no free base score**. Every point is earned by a measured
+property, and each component scales with how good it actually is rather than stepping
+over a threshold — so a mediocre setup cannot coast to a passing grade on the strength
+of the pattern merely existing.
+
+| Component | Max | Earned by |
+|---|---|---|
+| Structure alignment | 25 | major trend agrees (18), both tiers agree (+7) |
+| Premium / discount | 15 | scales with how deep into the correct half the entry sits |
+| Displacement | 20 | saturates at twice the required strength |
+| Gap quality | 12 | scales with FVG size in ATR |
+| Room to the draw | 15 | scales with R:R to the nearest opposing pool, saturating at 4R |
+| Sweep decisiveness | 8 | how far past the level the wick actually reached |
+| Level age | 5 | how long the taken level had been resting |
+| Spike-cycle side | ±10 | trading with or against your chosen side |
 
 **A+ ≥ 85 · A ≥ 70 · B ≥ 55.** Below 55 is discarded.
 
