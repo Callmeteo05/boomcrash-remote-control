@@ -170,6 +170,19 @@ input double           InpSpikeATR          = 4.0;             // Spike bar: ran
 input bool             InpSynthBiasFilter   = false;           // Hard-block signals on the unfavoured side
 input int              InpSynthBiasScore    = 10;              // Grade points for the favoured side
 
+input group "=== Your trading session ==="
+input bool             InpUseSession        = true;            // Focus on your trading window
+input int              InpSessStartHour     = 8;               // Window start hour (your local time)
+input int              InpSessStartMin      = 0;               // Window start minute
+input int              InpSessEndHour       = 12;              // Window end hour (your local time)
+input int              InpSessEndMin        = 0;               // Window end minute
+input int              InpUserGmtOffset     = 2;               // Your UTC offset (UTC+2 = 2)
+input int              InpBrokerGmtOffset   = 99;              // Broker UTC offset (99 = auto-detect)
+input bool             InpSessionHardFilter = false;           // Show setups ONLY inside the window
+input int              InpSessionScore      = 10;              // Grade points for being in the window
+input bool             InpSessionBrief      = true;            // Push a briefing when the window opens
+input bool             InpShadeSession      = true;            // Shade the window on the chart
+
 input group "=== Alerts ==="
 input bool             InpAlertWatch        = true;            // WATCH alert when a setup arms
 input bool             InpAlertTrigger      = true;            // TRIGGER alert when entry fills
@@ -308,6 +321,7 @@ struct TradeRec
    bool     hitTP1, hitTP2, hitTP3;
    int      result;          // 0 running, +1 target reached, -1 stopped
    double   rMultiple;
+   bool     inSession;
   };
 
 //+------------------------------------------------------------------+
@@ -352,6 +366,13 @@ int          g_rejSynth      = 0;
 int          g_rejGrade      = 0;
 int          g_rejEMA        = 0;
 int          g_lastEmaTrend  = 0;
+int          g_rejSession    = 0;
+int          g_brokerGmt     = 99;
+datetime     g_lastBriefDay  = 0;
+
+//--- does the window actually perform differently? measured, not assumed
+int          g_inSessResolved = 0, g_inSessWins = 0;
+int          g_outSessResolved = 0, g_outSessWins = 0;
 int          g_armed         = 0;
 int          g_expired       = 0;
 int          g_slBeforeEntry = 0;
@@ -403,6 +424,14 @@ int          g_digits        = 5;
 //+------------------------------------------------------------------+
 //| Helpers                                                          |
 //+------------------------------------------------------------------+
+double TrueRange(const int k, const double &high[], const double &low[], const double &close[])
+  {
+   if(k < 1) return (high[k] - low[k]);
+   return MathMax(high[k] - low[k],
+          MathMax(MathAbs(high[k] - close[k-1]),
+                  MathAbs(low[k]  - close[k-1])));
+  }
+
 string ObjName(const string tag, const int idx)
   {
    return StringFormat("%s%s_%d", PREFIX, tag, idx);
@@ -606,6 +635,8 @@ void RecordSpike(const int bar, const datetime t, const int dir, const double ex
 //| Everything the risk engine does is derived from these numbers, so |
 //| this line is the first thing to check on an unfamiliar broker.    |
 //+------------------------------------------------------------------+
+int BrokerGmtOffset();
+
 void ReportSymbolSpec()
   {
    double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
@@ -633,10 +664,62 @@ void ReportSymbolSpec()
       Print("ApexICT WARNING: trading is disabled for this symbol on this account. "
             "Signals will still print - they just cannot be executed here.");
 
+   if(InpUseSession)
+      PrintFormat("ApexICT session | your window %02d:%02d-%02d:%02d at UTC%+d | "
+                  "broker clock detected as UTC%+d | check this line if the window looks shifted",
+                  InpSessStartHour, InpSessStartMin, InpSessEndHour, InpSessEndMin,
+                  InpUserGmtOffset, BrokerGmtOffset());
+
    if(stopsLvl > 0)
       PrintFormat("ApexICT: broker requires stops at least %s away from price; "
                   "levels closer than that are pushed out automatically.",
                   DoubleToString(stopsLvl * _Point, _Digits));
+  }
+
+//+------------------------------------------------------------------+
+//| Session window.                                                  |
+//|                                                                   |
+//| Bar times are BROKER server time, which is almost never the same  |
+//| as yours - most MT5 brokers run EET, some run UTC. Getting this   |
+//| wrong silently shifts the whole window by hours, and it is the    |
+//| single most common bug in session filters. So the broker offset   |
+//| is auto-detected from the terminal rather than assumed, and the   |
+//| detected value is printed on attach so you can check it.          |
+//+------------------------------------------------------------------+
+int BrokerGmtOffset()
+  {
+   if(InpBrokerGmtOffset != 99) return InpBrokerGmtOffset;
+   if(g_brokerGmt != 99)        return g_brokerGmt;
+
+   datetime srv = TimeCurrent();
+   datetime gmt = TimeGMT();
+   if(srv <= 0 || gmt <= 0) return 0;
+
+   g_brokerGmt = (int)MathRound((double)((long)srv - (long)gmt) / 3600.0);
+   return g_brokerGmt;
+  }
+
+//--- convert a bar's server time into the user's wall clock
+datetime ToUserTime(const datetime serverTime)
+  {
+   int shift = (InpUserGmtOffset - BrokerGmtOffset()) * 3600;
+   return (datetime)((long)serverTime + shift);
+  }
+
+bool InSession(const datetime serverTime)
+  {
+   if(!InpUseSession) return true;
+
+   MqlDateTime dt;
+   TimeToStruct(ToUserTime(serverTime), dt);
+
+   int now   = dt.hour * 60 + dt.min;
+   int from  = InpSessStartHour * 60 + InpSessStartMin;
+   int until = InpSessEndHour   * 60 + InpSessEndMin;
+
+   if(from == until) return true;                 // 24h
+   if(from <  until) return (now >= from && now < until);
+   return (now >= from || now < until);           // window crosses midnight
   }
 
 //+------------------------------------------------------------------+
@@ -691,7 +774,10 @@ void ResetState()
    ArrayResize(g_pending, 0);
 
    g_rejNoSweep = 0; g_rejDisp = 0; g_rejNoFVG = 0; g_rejRR = 0;
-   g_rejPD = 0; g_rejSynth = 0; g_rejGrade = 0; g_rejEMA = 0;
+   g_rejPD = 0; g_rejSynth = 0; g_rejGrade = 0; g_rejEMA = 0; g_rejSession = 0;
+   g_inSessResolved = 0; g_inSessWins = 0;
+   g_outSessResolved = 0; g_outSessWins = 0;
+   g_lastBriefDay = 0;
    g_armed = 0; g_expired = 0; g_slBeforeEntry = 0;
 
    g_trendMajor    = 0;
@@ -743,6 +829,10 @@ void PushSwing(SwingPoint &arr[], const int bar, const datetime t, const double 
    arr[n].isHigh     = isHigh;
    arr[n].broken     = false;
    arr[n].confirmBar = confirmBar;
+
+   //--- keep the history bounded; ancient swings are never referenced again
+   int size = ArraySize(arr);
+   if(size > 400) ArrayRemove(arr, 0, size - 400);
   }
 
 //--- most recent unbroken swing of the requested side, -1 if none
@@ -770,9 +860,11 @@ int LastAny(const SwingPoint &arr[], const bool wantHigh)
 double NearestOpposingLiquidity(const int dir, const double from)
   {
    double best = 0.0;
-   for(int i = ArraySize(g_major) - 1; i >= 0; i--)
+   int    scanned = 0;
+   for(int i = ArraySize(g_major) - 1; i >= 0 && scanned < 60; i--)
      {
       if(g_major[i].broken) continue;      // a level already traded through is not a pool
+      scanned++;
       if(dir > 0 && g_major[i].isHigh && g_major[i].price > from)
         {
          if(best == 0.0 || g_major[i].price < best) best = g_major[i].price;
@@ -1067,7 +1159,7 @@ double EMASeparation(const int i)
 
 int GradeSetup(const int dir, const double entry, const double sl, const double dol,
                const double disp, const int fvgIdx, const SweepEvent &sw,
-               const int i, const double &close[], string &reason)
+               const int i, const double &close[], const datetime barTime, string &reason)
   {
 //--- Continuous scoring, and no free base score.
 //--- The earlier version handed out 25 points simply for the pattern existing,
@@ -1105,6 +1197,13 @@ int GradeSetup(const int dir, const double entry, const double sl, const double 
          parts += "EMA flat; ";
       else
          parts += "EMA opposes; ";
+     }
+
+//--- 1c. inside your trading window
+   if(InpUseSession)
+     {
+      if(InSession(barTime)) { score += InpSessionScore; parts += "in your session; "; }
+      else                    parts += "outside your session; ";
      }
 
 //--- 2. premium / discount, up to 15, scaled by depth into the correct half
@@ -1373,6 +1472,8 @@ void UpdateTrades(const int i, const datetime &time[],
          g_resolved++; g_losses++;
          g_sumR       -= 1.0;
          g_grossLossR += 1.0;
+         if(g_trades[k].inSession) g_inSessResolved++;
+         else                      g_outSessResolved++;
 
          if(InpShowOutcomeMarks)
             DrawText(ObjName("XSL", g_trades[k].idx), time[i], g_trades[k].sl,
@@ -1407,6 +1508,8 @@ void UpdateTrades(const int i, const datetime &time[],
          g_resolved++; g_wins++;
          g_sumR      += g_trades[k].rMultiple;
          g_grossWinR += g_trades[k].rMultiple;
+         if(g_trades[k].inSession) { g_inSessResolved++;  g_inSessWins++;  }
+         else                      { g_outSessResolved++; g_outSessWins++; }
 
          if(InpShowOutcomeMarks)
             DrawText(ObjName("XT2", g_trades[k].idx), time[i], g_trades[k].tp2,
@@ -1434,6 +1537,69 @@ void DrawHeaderLine(const int line, const string txt, const color clr)
      }
    ObjectSetString (0, name, OBJPROP_TEXT, txt);
    ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
+  }
+
+//+------------------------------------------------------------------+
+//| Session briefing.                                                |
+//|                                                                   |
+//| Fires once, on the first closed bar inside your window each day,  |
+//| so that when you sit down the state of the market is already      |
+//| summarised rather than something you have to reconstruct.         |
+//+------------------------------------------------------------------+
+void MaybeSessionBrief(const int i, const int rates_total, const datetime &time[],
+                       const double &close[])
+  {
+   if(!InpSessionBrief || !InpUseSession) return;
+   if(!g_liveMode)          return;
+   if(i != rates_total - 2) return;
+   if(!InSession(time[i]))  return;
+
+   //--- once per day, keyed on the user's calendar day
+   MqlDateTime dt;
+   TimeToStruct(ToUserTime(time[i]), dt);
+   dt.hour = 0; dt.min = 0; dt.sec = 0;
+   datetime day = StructToTime(dt);
+   if(day == g_lastBriefDay) return;
+   g_lastBriefDay = day;
+
+   string trend = (g_trendMajor > 0) ? "bullish" : (g_trendMajor < 0 ? "bearish" : "ranging");
+   int    et    = EMATrend(i, close);
+   string emaTx = (et > 0) ? "EMA up" : (et < 0 ? "EMA down" : "EMA flat");
+
+   string zone = "range unknown";
+   double lo, hi;
+   if(DealingRange(lo, hi) && hi > lo)
+     {
+      double pos = (close[i] - lo) / (hi - lo) * 100.0;
+      zone = StringFormat("%.0f%% of range (%s)", pos,
+                          (pos < 50.0 ? "discount - longs favoured"
+                                      : "premium - shorts favoured"));
+     }
+
+   int armed = 0;
+   for(int k = 0; k < ArraySize(g_pending); k++)
+      if(g_pending[k].active) armed++;
+
+   string near = "none armed yet";
+   if(armed > 0)
+     {
+      int    best = -1;
+      double bestAway = 0.0;
+      for(int k = 0; k < ArraySize(g_pending); k++)
+        {
+         if(!g_pending[k].active) continue;
+         double a = MathAbs(close[i] - g_pending[k].entry);
+         if(best < 0 || a < bestAway) { best = k; bestAway = a; }
+        }
+      near = StringFormat("%s %s @ %s",
+                          (g_pending[best].dir > 0 ? "BUY" : "SELL"),
+                          g_pending[best].gradeText,
+                          DoubleToString(g_pending[best].entry, g_digits));
+     }
+
+   FireAlert("SESSION",
+             StringFormat("window open | structure %s | %s | %s | %d armed | nearest: %s",
+                          trend, emaTx, zone, armed, near));
   }
 
 //+------------------------------------------------------------------+
@@ -1675,7 +1841,7 @@ int CountActivePending()
   }
 
 //--- attempt to build a setup from one MSS event, evaluated at bar i
-bool TryArmFromMSS(const int dir, const int i, const double &close[])
+bool TryArmFromMSS(const int dir, const int i, const double &close[], const datetime barTime)
   {
    if(CountActivePending() >= InpMaxPending) return false;
 
@@ -1746,6 +1912,10 @@ bool TryArmFromMSS(const int dir, const int i, const double &close[])
    tp2 = NormalizePrice(tp2);
    tp3 = NormalizePrice(tp3);
 
+   //--- only inside your trading window, when asked
+   if(InpUseSession && InpSessionHardFilter && !InSession(barTime))
+     { g_rejSession++; return false; }
+
    //--- EMA trend hard filter: never take a signal into the trend's teeth
    if(InpUseEMA && InpEmaHardFilter)
      {
@@ -1774,7 +1944,7 @@ bool TryArmFromMSS(const int dir, const int i, const double &close[])
      }
 
    string reason;
-   int score = GradeSetup(dir, entry, sl, dol, disp, f, sw, i, close, reason);
+   int score = GradeSetup(dir, entry, sl, dol, disp, f, sw, i, close, barTime, reason);
    if(!GradePasses(score)) { g_rejGrade++; return false; }
 
    //--- take a free slot
@@ -1808,7 +1978,7 @@ bool TryArmFromMSS(const int dir, const int i, const double &close[])
   }
 
 //--- work the MSS queue: each event gets its arming window, not just one bar
-void ProcessMSS(const int i, const double &close[])
+void ProcessMSS(const int i, const double &close[], const datetime barTime)
   {
    for(int k = ArraySize(g_mss) - 1; k >= 0; k--)
      {
@@ -1816,7 +1986,7 @@ void ProcessMSS(const int i, const double &close[])
       if(i < g_mss[k].bar) continue;
       if(i > g_mss[k].bar + InpMSSGraceBars) { g_mss[k].done = true; continue; }
 
-      if(TryArmFromMSS(g_mss[k].dir, i, close))
+      if(TryArmFromMSS(g_mss[k].dir, i, close, barTime))
          g_mss[k].done = true;
      }
   }
@@ -1918,6 +2088,7 @@ void TryTriggerSetups(const int i, const int rates_total, const datetime &time[]
          g_trades[n].hitTP3    = false;
          g_trades[n].result    = 0;
          g_trades[n].rMultiple = 0.0;
+         g_trades[n].inSession = InSession(time[i]);
         }
 
       double rr2 = (risk > 0.0) ? MathAbs(g_pending[k].tp2 - g_pending[k].entry) / risk : 0.0;
@@ -2076,6 +2247,15 @@ void UpdatePanel()
       double pf      = (g_grossLossR > 0.0) ? g_grossWinR / g_grossLossR : 0.0;
       stats = StringFormat(" | resolved %d  win %.1f%%  exp %.2fR  PF %.2f  TP1 hit %d",
                            g_resolved, winRate, expect, pf, g_tp1Hits);
+
+      //--- is your window actually better, or does it only feel better?
+      if(InpUseSession && g_inSessResolved >= 5 && g_outSessResolved >= 5)
+        {
+         double inW  = 100.0 * g_inSessWins  / g_inSessResolved;
+         double outW = 100.0 * g_outSessWins / g_outSessResolved;
+         stats += StringFormat("  ||  in-session %.0f%% (%d)  vs  outside %.0f%% (%d)",
+                               inW, g_inSessResolved, outW, g_outSessResolved);
+        }
      }
 
    ObjectSetString(0, name, OBJPROP_TEXT,
@@ -2114,7 +2294,7 @@ void UpdateDiagnostics()
      }
 
    int rejected = g_rejNoSweep + g_rejDisp + g_rejNoFVG + g_rejRR
-                + g_rejPD + g_rejSynth + g_rejGrade + g_rejEMA;
+                + g_rejPD + g_rejSynth + g_rejGrade + g_rejEMA + g_rejSession;
 
    //--- name the stage that is doing the most damage
    string worst = "none";
@@ -2127,12 +2307,13 @@ void UpdateDiagnostics()
    if(g_rejSynth   > worstN) { worstN = g_rejSynth;   worst = "spike-direction filter"; }
    if(g_rejGrade   > worstN) { worstN = g_rejGrade;   worst = "below minimum grade"; }
    if(g_rejEMA     > worstN) { worstN = g_rejEMA;     worst = "against the EMA trend"; }
+   if(g_rejSession > worstN) { worstN = g_rejSession; worst = "outside your session window"; }
 
    ObjectSetString(0, name, OBJPROP_TEXT,
-                   StringFormat("candidates rejected %d  [sweep %d | disp %d | fvg %d | RR %d | PD %d | spike %d | grade %d | ema %d]"
+                   StringFormat("candidates rejected %d  [sweep %d | disp %d | fvg %d | RR %d | PD %d | spike %d | grade %d | ema %d | sess %d]"
                                 "   armed %d  expired %d  stopped-pre-entry %d   biggest blocker: %s",
                                 rejected, g_rejNoSweep, g_rejDisp, g_rejNoFVG, g_rejRR,
-                                g_rejPD, g_rejSynth, g_rejGrade, g_rejEMA,
+                                g_rejPD, g_rejSynth, g_rejGrade, g_rejEMA, g_rejSession,
                                 g_armed, g_expired, g_slBeforeEntry, worst));
   }
 
@@ -2278,21 +2459,22 @@ int OnCalculate(const int rates_total,
 
    //--- ATR (simple rolling true range average, computed inline so there is
    //--- no handle to fall out of sync with the bars we are iterating)
+   //--- rolling true-range sum: one add and one subtract per bar instead of
+   //--- re-summing the whole window, which is where the old pass burned its time
    const int atrPeriod = 14;
-   for(int i = start; i < rates_total; i++)
+   if(start >= atrPeriod + 1)
      {
-      double sum = 0.0;
-      int n = 0;
-      for(int k = i - atrPeriod + 1; k <= i; k++)
+      double trSum = 0.0;
+      for(int k = start - atrPeriod + 1; k <= start; k++)
+         trSum += TrueRange(k, high, low, close);
+      BufATR[start] = trSum / atrPeriod;
+
+      for(int i = start + 1; i < rates_total; i++)
         {
-         if(k < 1) continue;
-         double tr = MathMax(high[k] - low[k],
-                     MathMax(MathAbs(high[k] - close[k-1]),
-                             MathAbs(low[k]  - close[k-1])));
-         sum += tr;
-         n++;
+         trSum += TrueRange(i, high, low, close)
+                - TrueRange(i - atrPeriod, high, low, close);
+         BufATR[i] = trSum / atrPeriod;
         }
-      BufATR[i] = (n > 0) ? sum / n : 0.0;
      }
 
    //--- EMAs, recursive so each bar costs one multiply. Seeded from the first
@@ -2370,7 +2552,7 @@ int OnCalculate(const int rates_total,
       //--- The shift is queued, then arming is retried across a grace window,
       //--- because the impulse FVG often completes a bar or two after the break.
       if(intBreak != 0) PushMSS(i, intBreak);
-      ProcessMSS(i, close);
+      ProcessMSS(i, close, time[i]);
 
       //--- follow already-emitted signals to their outcome before a new one fires,
       //--- so a signal never resolves itself on its own entry bar
@@ -2379,6 +2561,7 @@ int OnCalculate(const int rates_total,
       g_lastEmaTrend = EMATrend(i, close);
 
       //--- entry fill
+      MaybeSessionBrief(i, rates_total, time, close);
       MaybeWatchAlerts(i, rates_total, time, close);
       TryTriggerSetups(i, rates_total, time, high, low);
      }
@@ -2420,6 +2603,37 @@ int OnCalculate(const int rates_total,
                  time[endBar], g_fvg[k].bottom,
                  (g_fvg[k].dir > 0 ? InpFVGBullColor : InpFVGBearColor));
          drawn++;
+        }
+     }
+
+   //--- shade your window so it is obvious which bars it covers
+   if(InpUseSession && InpShadeSession)
+     {
+      ObjectsDeleteAll(0, PREFIX + "SESS");
+      int from = MathMax(1, rates_total - 400);
+      int band = 0;
+      int runStart = -1;
+      for(int i = from; i <= rates_total - 2 && band < 40; i++)
+        {
+         bool in = InSession(time[i]);
+         if(in && runStart < 0) runStart = i;
+         if((!in || i == rates_total - 2) && runStart >= 0)
+           {
+            int runEnd = (in ? i : i - 1);
+            string nm = StringFormat("%sSESS%d", PREFIX, band++);
+            double top = high[runStart], bot = low[runStart];
+            for(int b = runStart; b <= runEnd; b++)
+              { if(high[b] > top) top = high[b]; if(low[b] < bot) bot = low[b]; }
+            if(ObjectCreate(0, nm, OBJ_RECTANGLE, 0, time[runStart], top, time[runEnd], bot))
+              {
+               ObjectSetInteger(0, nm, OBJPROP_COLOR, clrGainsboro);
+               ObjectSetInteger(0, nm, OBJPROP_FILL, true);
+               ObjectSetInteger(0, nm, OBJPROP_BACK, true);
+               ObjectSetInteger(0, nm, OBJPROP_SELECTABLE, false);
+               ObjectSetInteger(0, nm, OBJPROP_HIDDEN, true);
+              }
+            runStart = -1;
+           }
         }
      }
 
