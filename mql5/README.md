@@ -53,9 +53,9 @@ These are properties of the code, not a claim on a banner:
   bar cannot duplicate swings, gaps or signals.
 - The journal records **live signals only**. History rows are deliberately excluded, so
   the CSV can be diffed against a recalculated chart as an actual non-repaint audit.
-- With the default dot anchor, the marker is drawn at a past bar — but it is written
-  once, after that bar closed, and never moved. See *Where the dots are placed*: the dot
-  is a confirmed turn, the entry line is the tradeable price.
+- The turn dot is drawn at a past bar, but written once after that bar closed and never
+  moved. See *Where the dots are placed* — the turn dot is a confirmed turn, the entry
+  dot is the tradeable price, and everything downstream uses the entry.
 
 The honest cost: signals arrive with a structural confirmation lag. That lag is what
 buys the non-repainting. Any tool without it is choosing to lie to you instead.
@@ -197,26 +197,24 @@ on for trend continuation only.
 
 ## Where the dots are placed — read this once
 
-By default (`Dot anchor = At the swing extreme`) the dot is drawn **back at the bar that
-made the turn** — the low of the leg for a buy, the high for a sell. That is what a
-classic signal chart shows, and it is why those charts look flawless.
+Two dots print per signal, and they mean different things. This is deliberate — the pair
+gives you the clean look of a classic signal chart *and* the truth, side by side.
 
-Understand exactly what it means, because it is the one thing worth being precise about:
+**Turn dot** — small, dim, sits on the bar that actually made the high or low. That is
+the picture those flawless screenshots show. It is written once, after that bar closed,
+and never moved, so nothing repaints. But it *appears* several bars later, because a
+swing low is not knowable at the swing low — you only know it was the low once enough
+bars have passed without a lower one. It marks a **confirmed turn**.
 
-- The dot is written **once and never moved**. Nothing repaints.
-- But it *appears* several bars after that candle closed, because a swing low is not
-  knowable at the swing low — you only know it was the low once enough bars have passed
-  without a lower one.
-- So the dot marks a **confirmed turn**, not a price you could have bought at in real
-  time. The price you could actually have taken is the **entry line**, and the alert
-  fires at that moment, not at the dot.
+**Entry dot** — large, bright, sits on the bar whose close filled the entry. That is the
+price that was genuinely takeable in real time, and it is what the **alert, the journal
+and every statistic** are driven by.
 
-Set `Dot anchor = At the bar whose close filled the entry` if you want the dot to sit
-strictly where the trade was takeable. The chart looks less perfect and is a truer
-picture of live execution.
+The gap between the two dots is the honest cost of non-repainting, drawn on the chart
+where you can see it instead of hidden. A tool showing only the turn dot is showing you
+the first without the second.
 
-Either way the alerts, the journal and the statistics are driven by the entry, never by
-the dot — so nothing downstream inherits the flattering view.
+`Dot anchor` switches to either one alone if you prefer a cleaner chart.
 
 The location logic is the ICT stack, not decoration:
 

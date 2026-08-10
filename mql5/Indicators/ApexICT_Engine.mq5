@@ -19,8 +19,8 @@
 #property description "Sweep -> MSS -> FVG. Structure-derived SL/TP, graded setups, WATCH/TRIGGER alerts."
 
 #property indicator_chart_window
-#property indicator_buffers 5
-#property indicator_plots   2
+#property indicator_buffers 7
+#property indicator_plots   4
 
 //--- plot 0 : buy dots
 #property indicator_label1  "Apex BUY"
@@ -33,6 +33,18 @@
 #property indicator_type2   DRAW_ARROW
 #property indicator_color2  clrRed
 #property indicator_width2  2
+
+//--- plot 2 : the confirmed turn a buy came from
+#property indicator_label3  "Apex BUY turn"
+#property indicator_type3   DRAW_ARROW
+#property indicator_color3  clrMediumSeaGreen
+#property indicator_width3  1
+
+//--- plot 3 : the confirmed turn a sell came from
+#property indicator_label4  "Apex SELL turn"
+#property indicator_type4   DRAW_ARROW
+#property indicator_color4  clrIndianRed
+#property indicator_width4  1
 
 //+------------------------------------------------------------------+
 //| Enums                                                            |
@@ -54,8 +66,9 @@ enum ENUM_ENTRY_MODE
 
 enum ENUM_DOT_ANCHOR
   {
-   DOT_SWING_EXTREME, // At the swing extreme the setup turned from
-   DOT_ENTRY_BAR      // At the bar whose close filled the entry
+   DOT_BOTH,          // Both: turn dot at the extreme + entry dot where it filled
+   DOT_SWING_EXTREME, // Turn dot only - at the swing extreme
+   DOT_ENTRY_BAR      // Entry dot only - where the trade was takeable
   };
 
 enum ENUM_MARKER
@@ -191,7 +204,11 @@ input bool             InpShowDiagnostics   = true;            // Show which fil
 
 input group "=== Visuals ==="
 input ENUM_MARKER      InpMarker            = MARK_DOT;        // Signal marker style
-input ENUM_DOT_ANCHOR  InpDotAnchor         = DOT_SWING_EXTREME; // Where the dot is drawn
+input ENUM_DOT_ANCHOR  InpDotAnchor         = DOT_BOTH;        // Which dots to draw
+input int              InpDotCodeEntry      = 108;             // Entry dot symbol (Wingdings)
+input int              InpDotCodeTurn       = 159;             // Turn dot symbol (Wingdings)
+input color            InpTurnBuyColor      = clrMediumSeaGreen; // Buy turn dot colour
+input color            InpTurnSellColor     = clrIndianRed;    // Sell turn dot colour
 input bool             InpLabelShowGrade    = true;            // Put the grade next to BUY / SELL
 input bool             InpShowZones         = false;           // Shade the risk and reward zones
 input bool             InpShowEntryTag      = true;            // "BUY 0.05 at 1.23456" tag on the entry line
@@ -214,6 +231,8 @@ input color            InpFVGBearColor      = clrIndianRed;    // Bearish FVG
 double BufBuy[];
 double BufSell[];
 double BufATR[];
+double BufBuyTurn[];
+double BufSellTurn[];
 double BufEmaF[];
 double BufEmaS[];
 
@@ -1705,23 +1724,43 @@ void TryTriggerSetups(const int i, const int rates_total, const datetime &time[]
       int idx = g_signalCount;
 
       double atr = BufATR[i];
+      int    dir = g_pending[k].dir;
 
-      //--- Where the dot goes.
-      //--- DOT_SWING_EXTREME anchors it back to the bar that actually made the
-      //--- turn, which is what a classic signal chart shows. That bar is long
-      //--- closed and the dot is written once and never moved, so nothing
-      //--- repaints - but the dot appears only now, several bars after that
-      //--- candle printed. It marks a confirmed turn, not a price you could
-      //--- have bought at in real time. The entry line is that price.
-      int dotBar = (InpDotAnchor == DOT_SWING_EXTREME &&
-                    g_pending[k].dotBar >= 0 && g_pending[k].dotBar <= i)
-                   ? g_pending[k].dotBar : i;
+      //--- Two markers, and they mean different things.
+      //---
+      //--- TURN dot (small, dim) sits on the bar that actually made the high or
+      //--- low. That is the picture a classic signal chart shows. It is written
+      //--- once, after that bar closed, and never moved - so nothing repaints -
+      //--- but it appears only now, several bars later, because a swing low is
+      //--- not knowable at the swing low.
+      //---
+      //--- ENTRY dot (large, bright) sits on the bar whose close filled the
+      //--- entry. That is the price that was genuinely takeable, and it is what
+      //--- the alert, the journal and every statistic are driven by.
+      int turnBar = (g_pending[k].dotBar >= 0 && g_pending[k].dotBar <= i)
+                    ? g_pending[k].dotBar : i;
 
-      double dotAtr = (BufATR[dotBar] > 0.0) ? BufATR[dotBar] : atr;
-      double arrowPrice = (g_pending[k].dir > 0) ? (low[dotBar]  - 0.6 * dotAtr)
-                                                 : (high[dotBar] + 0.6 * dotAtr);
-      if(g_pending[k].dir > 0) BufBuy[dotBar]  = arrowPrice;
-      else                     BufSell[dotBar] = arrowPrice;
+      double turnAtr = (BufATR[turnBar] > 0.0) ? BufATR[turnBar] : atr;
+      double turnPrice = (dir > 0) ? (low[turnBar]  - 0.5 * turnAtr)
+                                   : (high[turnBar] + 0.5 * turnAtr);
+      double entryPrice = (dir > 0) ? (low[i]  - 0.9 * atr)
+                                    : (high[i] + 0.9 * atr);
+
+      if(InpDotAnchor == DOT_BOTH || InpDotAnchor == DOT_SWING_EXTREME)
+        {
+         if(dir > 0) BufBuyTurn[turnBar]  = turnPrice;
+         else        BufSellTurn[turnBar] = turnPrice;
+        }
+      if(InpDotAnchor == DOT_BOTH || InpDotAnchor == DOT_ENTRY_BAR)
+        {
+         if(dir > 0) BufBuy[i]  = entryPrice;
+         else        BufSell[i] = entryPrice;
+        }
+
+      //--- the BUY / SELL word rides with the turn dot, as in a signal chart
+      int    labelBar   = (InpDotAnchor == DOT_ENTRY_BAR) ? i : turnBar;
+      double labelPrice = (InpDotAnchor == DOT_ENTRY_BAR) ? entryPrice : turnPrice;
+      double arrowPrice = labelPrice;
 
       double lots = SuggestLots(g_pending[k].entry, g_pending[k].sl);
       double risk = MathAbs(g_pending[k].entry - g_pending[k].sl);
@@ -1730,7 +1769,7 @@ void TryTriggerSetups(const int i, const int rates_total, const datetime &time[]
       DrawSignalLevels(idx, g_pending[k].dir, time[i], time[lastIdx],
                        g_pending[k].entry, g_pending[k].sl, g_pending[k].tp1,
                        g_pending[k].tp2, g_pending[k].tp3,
-                       g_pending[k].gradeText, arrowPrice, lots, time[dotBar]);
+                       g_pending[k].gradeText, arrowPrice, lots, time[labelBar]);
 
       if(InpTrackOutcomes)
         {
@@ -1977,35 +2016,47 @@ void UpdateDiagnostics()
 //+------------------------------------------------------------------+
 int OnInit()
   {
-   SetIndexBuffer(0, BufBuy,  INDICATOR_DATA);
-   SetIndexBuffer(1, BufSell, INDICATOR_DATA);
-   SetIndexBuffer(2, BufATR,  INDICATOR_CALCULATIONS);
-   SetIndexBuffer(3, BufEmaF, INDICATOR_CALCULATIONS);
-   SetIndexBuffer(4, BufEmaS, INDICATOR_CALCULATIONS);
+   SetIndexBuffer(0, BufBuy,      INDICATOR_DATA);
+   SetIndexBuffer(1, BufSell,     INDICATOR_DATA);
+   SetIndexBuffer(2, BufBuyTurn,  INDICATOR_DATA);
+   SetIndexBuffer(3, BufSellTurn, INDICATOR_DATA);
+   SetIndexBuffer(4, BufATR,      INDICATOR_CALCULATIONS);
+   SetIndexBuffer(5, BufEmaF,     INDICATOR_CALCULATIONS);
+   SetIndexBuffer(6, BufEmaS,     INDICATOR_CALCULATIONS);
 
-   ArraySetAsSeries(BufBuy,  false);
-   ArraySetAsSeries(BufSell, false);
-   ArraySetAsSeries(BufATR,  false);
-   ArraySetAsSeries(BufEmaF, false);
-   ArraySetAsSeries(BufEmaS, false);
+   ArraySetAsSeries(BufBuy,      false);
+   ArraySetAsSeries(BufSell,     false);
+   ArraySetAsSeries(BufBuyTurn,  false);
+   ArraySetAsSeries(BufSellTurn, false);
+   ArraySetAsSeries(BufATR,      false);
+   ArraySetAsSeries(BufEmaF,     false);
+   ArraySetAsSeries(BufEmaS,     false);
 
-   //--- Wingdings 108 is a filled circle: the dot of a classic signal system
+   //--- entry dots: the price that was actually takeable
    if(InpMarker == MARK_DOT)
      {
-      PlotIndexSetInteger(0, PLOT_ARROW, 108);
-      PlotIndexSetInteger(1, PLOT_ARROW, 108);
+      PlotIndexSetInteger(0, PLOT_ARROW, InpDotCodeEntry);
+      PlotIndexSetInteger(1, PLOT_ARROW, InpDotCodeEntry);
      }
    else
      {
       PlotIndexSetInteger(0, PLOT_ARROW, 233);     // up arrow
       PlotIndexSetInteger(1, PLOT_ARROW, 234);     // down arrow
      }
-   //--- arrows are already offset in price by the plotting code, so no pixel shift
-   PlotIndexSetInteger(0, PLOT_ARROW_SHIFT, 0);
-   PlotIndexSetInteger(1, PLOT_ARROW_SHIFT, 0);
-   PlotIndexSetDouble(0, PLOT_EMPTY_VALUE, EMPTY_VALUE);
-   PlotIndexSetDouble(1, PLOT_EMPTY_VALUE, EMPTY_VALUE);
 
+   //--- turn dots: smaller and dimmer, so the takeable dot stays the loud one
+   PlotIndexSetInteger(2, PLOT_ARROW, InpDotCodeTurn);
+   PlotIndexSetInteger(3, PLOT_ARROW, InpDotCodeTurn);
+   PlotIndexSetInteger(2, PLOT_LINE_COLOR, 0, InpTurnBuyColor);
+   PlotIndexSetInteger(3, PLOT_LINE_COLOR, 0, InpTurnSellColor);
+   PlotIndexSetInteger(0, PLOT_LINE_COLOR, 0, InpBuyColor);
+   PlotIndexSetInteger(1, PLOT_LINE_COLOR, 0, InpSellColor);
+
+   for(int pl = 0; pl < 4; pl++)
+     {
+      PlotIndexSetInteger(pl, PLOT_ARROW_SHIFT, 0);
+      PlotIndexSetDouble(pl, PLOT_EMPTY_VALUE, EMPTY_VALUE);
+     }
    IndicatorSetString(INDICATOR_SHORTNAME, "Apex ICT Engine");
    IndicatorSetInteger(INDICATOR_DIGITS, _Digits);
 
@@ -2080,8 +2131,10 @@ int OnCalculate(const int rates_total,
 
    if(prev_calculated == 0)
      {
-      ArrayInitialize(BufBuy,  EMPTY_VALUE);
-      ArrayInitialize(BufSell, EMPTY_VALUE);
+      ArrayInitialize(BufBuy,      EMPTY_VALUE);
+      ArrayInitialize(BufSell,     EMPTY_VALUE);
+      ArrayInitialize(BufBuyTurn,  EMPTY_VALUE);
+      ArrayInitialize(BufSellTurn, EMPTY_VALUE);
       ArrayInitialize(BufATR,  0.0);
       ArrayInitialize(BufEmaF, 0.0);
       ArrayInitialize(BufEmaS, 0.0);
@@ -2142,8 +2195,10 @@ int OnCalculate(const int rates_total,
       if(time[i] <= g_lastProcessed) continue;
       g_lastProcessed = time[i];
 
-      BufBuy[i]  = EMPTY_VALUE;
-      BufSell[i] = EMPTY_VALUE;
+      BufBuy[i]      = EMPTY_VALUE;
+      BufSell[i]     = EMPTY_VALUE;
+      BufBuyTurn[i]  = EMPTY_VALUE;
+      BufSellTurn[i] = EMPTY_VALUE;
 
       //--- publish swings whose confirmation window has now closed
       int pMaj = i - g_swingLB;
@@ -2206,8 +2261,10 @@ int OnCalculate(const int rates_total,
    //--- keep the live bar clean
    if(rates_total >= 1)
      {
-      BufBuy[rates_total-1]  = EMPTY_VALUE;
-      BufSell[rates_total-1] = EMPTY_VALUE;
+      BufBuy[rates_total-1]      = EMPTY_VALUE;
+      BufSell[rates_total-1]     = EMPTY_VALUE;
+      BufBuyTurn[rates_total-1]  = EMPTY_VALUE;
+      BufSellTurn[rates_total-1] = EMPTY_VALUE;
      }
 
    //--- current dealing range
